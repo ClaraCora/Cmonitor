@@ -387,7 +387,12 @@ async fn github_login(app: &App, code: &str) -> Result<()> {
 /// A second trusted proxy in front of the local one places its own address at
 /// the tail instead. No single value in this header identifies the client, so
 /// such a deployment must have its edge write the client address.
+///
+/// Both addresses are canonicalized: the default dual-stack `[::]` listener
+/// reports IPv4 peers, 127.0.0.1 included, as `::ffff:a.b.c.d`, which no IPv6
+/// range below recognizes as local.
 pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+    let peer = peer.to_canonical();
     if !behind_local_proxy(peer) {
         return peer;
     }
@@ -395,8 +400,8 @@ pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.rsplit(',').next())
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(peer)
+        .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        .map_or(peer, |ip| ip.to_canonical())
 }
 
 /// Loopback or a private network, where a reverse proxy resides.
@@ -560,6 +565,11 @@ mod tests {
         for peer in ["127.0.0.1", "10.0.0.1", "::1", "fd00::1"] {
             assert_eq!(client_ip(&forged, ip(peer)).to_string(), "198.51.100.9", "{peer}");
         }
+
+        // A dual-stack `[::]` listener reports an IPv4 proxy as `::ffff:a.b.c.d`,
+        // which is the same local peer.
+        assert_eq!(client_ip(&forged, ip("::ffff:172.18.0.4")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(&HeaderMap::new(), ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
 
         // Directly from the internet the entire header is caller-supplied, and
         // honouring any part of it bypasses the lockout.
