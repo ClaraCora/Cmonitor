@@ -71,7 +71,11 @@ pub const DEFAULT_TEXT: &str = "{{title}}\n{{message}}";
 const NUMBERS: [(&str, i64, i64, i64); 3] = [
     // Minutes a node may stay away before it is reported. Agents reconnect within
     // seconds of a network or hub interruption, which one minute already covers.
-    ("notify_grace", 1, 1_440, 3),
+    // Capped at FLAP_GRACE: a longer grace would outwait a flapping node too, and
+    // the absence clock, kept in memory, restarts with the hub, so every restart
+    // during an outage would delay its alert by up to one more grace period.
+    // Nodes expected to stay down for hours have their alerts switched off.
+    ("notify_grace", 1, FLAP_GRACE / 60, 3),
     // Percent of the allowance that raises the first traffic alert; 0 disables
     // traffic alerts.
     ("notify_traffic", 0, 100, 80),
@@ -549,7 +553,7 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
         }
         let since = *watch.absent.entry(node.id).or_insert(now);
         let flapping = watch.returned.get(&node.id).is_some_and(|back| since - back < FLAP_WINDOW);
-        let wait = if flapping { grace.max(FLAP_GRACE) } else { grace };
+        let wait = if flapping { FLAP_GRACE } else { grace };
         if armed && node.notify && node.down_since == 0 && now - since >= wait {
             app.db.set_down_since(node.id, node.last_seen)?;
             down.push((node.name.as_str(), format!("最后上报 {}", clock(node.last_seen))));
