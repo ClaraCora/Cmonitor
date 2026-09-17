@@ -147,8 +147,11 @@ fn node_view(
             json!({
                 "id": task.id,
                 "name": task.name,
-                "latency": reading.map(|value| value.0),
-                "updated_at": reading.map(|value| value.1),
+                "latency": reading.map(|value| value.latency),
+                "updated_at": reading.map(|value| value.updated_at),
+                "samples": reading
+                    .map(|value| value.samples.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
             })
         }).collect::<Vec<_>>(),
     });
@@ -2055,7 +2058,13 @@ mod tests {
             json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0,
                    "hostname": "db-prod-01", "ip": "203.0.113.7"}),
         );
-        app.agents.write().unwrap().get_mut(&open).unwrap().pings.insert(probe, (7, 1_700_000_000));
+        app.agents
+            .write()
+            .unwrap()
+            .get_mut(&open)
+            .unwrap()
+            .pings
+            .insert(probe, crate::agent_ws::PingReading::new(7, 1_700_000_000));
 
         let public = visible_nodes(&app, false).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
@@ -2063,6 +2072,7 @@ mod tests {
         assert_eq!(public[0]["tags"], "二网精品;1Gbps<green>");
         assert_eq!(public[0]["pings"][0]["name"], "probe");
         assert_eq!(public[0]["pings"][0]["latency"], 7);
+        assert_eq!(public[0]["pings"][0]["samples"], json!([7]));
         // Disclosing the token would let any visitor impersonate the node.
         for hidden in ["ip", "remark", "hostname", "token"] {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");

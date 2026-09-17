@@ -2,7 +2,7 @@
 //! notifications. A single long-lived connection on which either end may speak
 //! first, with self-describing frames readable via curl or a browser console.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -25,6 +25,32 @@ use crate::{App, Shared};
 /// before abandoning the connection.
 const HEARTBEAT: Duration = Duration::from_secs(30);
 const SILENCE: Duration = Duration::from_secs(120);
+const LIVE_PING_SAMPLES: usize = 20;
+
+/// One probe's small live window. Historical chart data remains in SQLite; this
+/// window exists only so a status card can show recent jitter and packet loss
+/// without opening the node detail page.
+#[derive(Debug)]
+pub struct PingReading {
+    pub latency: i64,
+    pub updated_at: i64,
+    pub samples: VecDeque<i64>,
+}
+
+impl PingReading {
+    pub(crate) fn new(latency: i64, updated_at: i64) -> Self {
+        Self { latency, updated_at, samples: VecDeque::from([latency]) }
+    }
+
+    fn record(&mut self, latency: i64, updated_at: i64) {
+        self.latency = latency;
+        self.updated_at = updated_at;
+        if self.samples.len() == LIVE_PING_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(latency);
+    }
+}
 
 /// Distinguishes one agent session on a node from the next. A connection can
 /// remain nominally open for up to SILENCE, long enough for the agent to have
@@ -49,9 +75,9 @@ pub struct Agent {
     pub tx: mpsc::Sender<String>,
     /// The latest report, or `Null` between connecting and the first one.
     pub metrics: serde_json::Value,
-    /// Latest accepted probe result by task id: `(latency_ms, unix_seconds)`.
-    /// It is live state, repopulated by the next probe after a hub restart.
-    pub pings: HashMap<i64, (i64, i64)>,
+    /// Latest accepted probe result and its last 20 samples by task id.
+    /// It is live state, repopulated by probes after a hub restart.
+    pub pings: HashMap<i64, PingReading>,
     pub last_seen: i64,
     /// Wall-clock minute this session has already accounted for. A history row
     /// is written when a report arrives past it.
@@ -319,7 +345,11 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
                 if app.db.insert_ping(node_id, task_id, now, latency)? {
                     let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
                     if let Some(agent) = agents.get_mut(&node_id) {
-                        agent.pings.insert(task_id, (latency, now));
+                        agent
+                            .pings
+                            .entry(task_id)
+                            .and_modify(|reading| reading.record(latency, now))
+                            .or_insert_with(|| PingReading::new(latency, now));
                     }
                 }
             }
@@ -866,9 +896,22 @@ mod tests {
         {
             let agents = app.agents.read().unwrap();
             let live = &agents[&id].pings;
-            assert_eq!(live[&one].0, 42);
-            assert_eq!(live[&two].0, 15);
+            assert_eq!(live[&one].latency, 42);
+            assert_eq!(live[&two].latency, 15);
             assert_eq!(live.len(), 2, "rejected task ids never reach the live snapshot");
+        }
+
+        for latency in 100..=121 {
+            dispatch(&app, id, "ip", &result(one, latency)).unwrap();
+        }
+        {
+            let agents = app.agents.read().unwrap();
+            let reading = &agents[&id].pings[&one];
+            assert_eq!(reading.latency, 121);
+            assert_eq!(
+                reading.samples.iter().copied().collect::<Vec<_>>(),
+                (102..=121).collect::<Vec<_>>()
+            );
         }
 
         push_ping_tasks(&app);
