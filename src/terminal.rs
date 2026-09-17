@@ -14,7 +14,6 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tracing::debug;
 
 use crate::auth::{authed, current_session, random_token};
 use crate::{App, Shared};
@@ -136,45 +135,42 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
     }
 
     let mut check = tokio::time::interval(TERMINAL_IDLE_CHECK);
-    let result = loop {
+    loop {
         tokio::select! {
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(text))) => {
-                    if !authed_hash(&app, &session) { break Ok(()) }
+                    if !authed_hash(&app, &session) { break }
                     if let Some(message) = to_agent(&terminal_id, &text) {
-                        if agent.send(message).await.is_err() { break Ok(()) }
+                        if agent.send(message).await.is_err() { break }
                     }
                 }
                 Some(Ok(Message::Binary(data))) if data.len() <= MAX_INPUT => {
-                    if agent.send(rpc("terminal.input", json!({"terminal_id": terminal_id, "data": String::from_utf8_lossy(&data)}))).await.is_err() { break Ok(()) }
+                    if agent.send(rpc("terminal.input", json!({"terminal_id": terminal_id, "data": String::from_utf8_lossy(&data)}))).await.is_err() { break }
                 }
-                Some(Ok(Message::Close(_))) | None => break Ok(()),
-                Some(Ok(Message::Ping(data))) => { if socket.send(Message::Pong(data)).await.is_err() { break Ok(()) } }
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Ping(data))) => { if socket.send(Message::Pong(data)).await.is_err() { break } }
                 Some(Ok(Message::Pong(_))) => {}
-                Some(Err(_)) => break Ok(()),
+                Some(Err(_)) => break,
                 _ => {}
             },
             message = browser_rx.recv() => match message {
                 Some(message) => {
                     let terminal_event = event_type(&message);
-                    if socket.send(Message::Text(message.into())).await.is_err() { break Ok(()) }
+                    if socket.send(Message::Text(message.into())).await.is_err() { break }
                     if matches!(terminal_event.as_deref(), Some("terminal.exit" | "terminal.error")) {
-                        break Ok(());
+                        break;
                     }
                 }
-                None => break Ok(()),
+                None => break,
             },
             _ = check.tick() => {
-                if !authed_hash(&app, &session) { break Ok(()) }
+                if !authed_hash(&app, &session) { break }
             }
         }
-    };
+    }
 
     app.terminals.remove(&terminal_id);
     let _ = agent.send(rpc("terminal.close", json!({"terminal_id": terminal_id}))).await;
-    if let Err(error) = result {
-        debug!("terminal session ended: {error}");
-    }
 }
 
 fn authed_hash(app: &App, session: &str) -> bool {
