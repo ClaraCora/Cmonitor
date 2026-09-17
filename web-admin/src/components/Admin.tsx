@@ -69,7 +69,7 @@ function Addresses({ node }: { node: Node }) {
   )
 }
 
-function Field({ label, hint, className = "", children }: { label: string; hint?: string; className?: string; children: React.ReactNode }) {
+function Field({ label, hint, className = "", children }: { label: string; hint?: React.ReactNode; className?: string; children: React.ReactNode }) {
   return (
     <div className={`space-y-2 ${className}`}>
       <Label className="text-sm font-medium">{label}</Label>
@@ -173,6 +173,7 @@ function NodeForm({ node, onClose, onSaved }: {
       name: form.name.trim(),
       public: form.public,
       remark: form.remark,
+      tags: form.tags,
       traffic_mode: form.traffic_mode,
       traffic_limit: Math.round(Number(limitGib) * GIB),
       traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.traffic_reset_day) || 1))),
@@ -214,6 +215,17 @@ function NodeForm({ node, onClose, onSaved }: {
         <div className="space-y-5">
           <Field label="名称">
             <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
+          </Field>
+          <Field
+            label="标签"
+            hint={<>多个标签使用分号（;）分隔；在标签末尾添加颜色，例如 1Gbps&lt;green&gt;。<a className="underline underline-offset-2 hover:text-foreground" href="https://www.radix-ui.com/themes/docs/theme/color" target="_blank" rel="noreferrer">查看可用颜色</a></>}
+          >
+            <Input
+              value={form.tags ?? ""}
+              maxLength={512}
+              onChange={(e) => set("tags", e.target.value)}
+              placeholder="二网精品; 1Gbps<green>"
+            />
           </Field>
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="每月流量额度 (GB)" hint="留空或 0 不限">

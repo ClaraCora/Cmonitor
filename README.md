@@ -14,7 +14,7 @@
 |---|---|
 | [Cmonitor](https://github.com/ClaraCora/Cmonitor) | hub：后台、API、公开页宿主 |
 | [Cagent](https://github.com/ClaraCora/Cagent) | Linux agent |
-| [monitor-theme-default](https://github.com/monitor-probe/monitor-theme-default) | 内置默认主题 |
+| [Cmonitor-theme-default](https://github.com/ClaraCora/Cmonitor-theme-default) | 内置默认主题 |
 
 ```
 Cagent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  Cmonitor hub  ──▶  后台 + 状态页

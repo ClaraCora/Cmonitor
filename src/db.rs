@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS node (
   billing_cycle TEXT    NOT NULL DEFAULT 'monthly',
   expires_at    TEXT,
   remark        TEXT    NOT NULL DEFAULT '',
+  tags          TEXT    NOT NULL DEFAULT '',
   traffic_limit INTEGER NOT NULL DEFAULT 0,
   traffic_mode  TEXT    NOT NULL DEFAULT 'sum',
   traffic_reset_day INTEGER NOT NULL DEFAULT 1,
@@ -130,7 +131,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -255,6 +256,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
         add_column(conn, "session", "kind TEXT NOT NULL DEFAULT 'legacy'")?;
         add_column(conn, "session", "identity TEXT NOT NULL DEFAULT ''")?;
     }
+    if from < 6 {
+        add_column(conn, "node", "tags TEXT NOT NULL DEFAULT ''")?;
+    }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
 }
@@ -283,6 +287,10 @@ pub struct Node {
     pub expires_at: Option<String>,
     #[serde(default)]
     pub remark: String,
+    /// Public labels, separated with semicolons. Themes may interpret a trailing
+    /// `<color>` on each label using the Radix Themes color names.
+    #[serde(default)]
+    pub tags: String,
     /// Monthly allowance in bytes; 0 means unmetered.
     #[serde(default)]
     pub traffic_limit: i64,
@@ -356,6 +364,7 @@ pub struct NodePatch {
     #[serde(default, deserialize_with = "expiry_patch")]
     pub expires_at: Option<Option<String>>,
     pub remark: Option<String>,
+    pub tags: Option<String>,
     pub traffic_limit: Option<i64>,
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
@@ -535,8 +544,8 @@ impl Db {
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
             "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
-                               expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                               expires_at, remark, tags, traffic_limit, traffic_mode, traffic_reset_day, created_at)
+             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 n.name,
                 token,
@@ -546,6 +555,7 @@ impl Db {
                 n.billing_cycle,
                 n.expires_at,
                 n.remark,
+                n.tags,
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day,
@@ -578,10 +588,11 @@ impl Db {
                              price=COALESCE(?5,price), currency=COALESCE(?6,currency),
                              billing_cycle=COALESCE(?7,billing_cycle),
                              expires_at=CASE WHEN ?8 THEN ?9 ELSE expires_at END,
-                             remark=COALESCE(?10,remark), traffic_limit=COALESCE(?11,traffic_limit),
-                             traffic_mode=COALESCE(?12,traffic_mode),
-                             traffic_reset_day=COALESCE(?13,traffic_reset_day),
-                             notify=COALESCE(?14,notify)
+                             remark=COALESCE(?10,remark), tags=COALESCE(?11,tags),
+                             traffic_limit=COALESCE(?12,traffic_limit),
+                             traffic_mode=COALESCE(?13,traffic_mode),
+                             traffic_reset_day=COALESCE(?14,traffic_reset_day),
+                             notify=COALESCE(?15,notify)
              WHERE id=?1",
             params![
                 id,
@@ -594,6 +605,7 @@ impl Db {
                 n.expires_at.is_some(),
                 n.expires_at.as_ref().and_then(|v| v.as_deref()),
                 n.remark,
+                n.tags,
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day,
@@ -1152,14 +1164,14 @@ impl Db {
     ///
     /// The chart's `task_id IN (assignments)` filter hides both afterwards, but
     /// does not prevent the write, its storage, or the id being reused.
-    pub fn insert_ping(&self, node_id: i64, task_id: i64, ts: i64, latency: i64) -> Result<()> {
-        self.conn().execute(
+    pub fn insert_ping(&self, node_id: i64, task_id: i64, ts: i64, latency: i64) -> Result<bool> {
+        let inserted = self.conn().execute(
             "INSERT OR REPLACE INTO ping_record (node_id, task_id, ts, latency)
              SELECT ?1, ?2, ?3, ?4
              WHERE EXISTS (SELECT 1 FROM ping_node WHERE task_id = ?2 AND node_id = ?1)",
             params![node_id, task_id, ts, latency],
         )?;
-        Ok(())
+        Ok(inserted > 0)
     }
 
     /// Probe results for one node, one sample per probe per `step` seconds: the
@@ -1547,6 +1559,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         billing_cycle: s("billing_cycle"),
         expires_at: r.get::<_, Option<String>>("expires_at").unwrap_or(None),
         remark: s("remark"),
+        tags: s("tags"),
         traffic_limit: n("traffic_limit"),
         traffic_mode: s("traffic_mode"),
         traffic_reset_day: n("traffic_reset_day") as u32,
@@ -2109,13 +2122,19 @@ mod tests {
         let patch = |v| serde_json::from_value::<NodePatch>(v).unwrap();
         db.update_node(
             id,
-            &patch(serde_json::json!({"public":false,"remark":"private","expires_at":"2030-01-01"})),
+            &patch(serde_json::json!({
+                "public": false,
+                "remark": "private",
+                "tags": "二网精品;1Gbps<green>",
+                "expires_at": "2030-01-01"
+            })),
         )
         .unwrap();
         db.update_node(id, &patch(serde_json::json!({"price":20}))).unwrap();
         let n = db.node(id).unwrap().unwrap();
         assert!(!n.public);
         assert_eq!(n.remark, "private");
+        assert_eq!(n.tags, "二网精品;1Gbps<green>");
         assert_eq!(n.expires_at.as_deref(), Some("2030-01-01"));
         db.update_node(id, &patch(serde_json::json!({"price":0,"expires_at":null}))).unwrap();
         let n = db.node(id).unwrap().unwrap();
@@ -2139,6 +2158,21 @@ mod tests {
             .unwrap();
         db.set_traffic(id, &TrafficPatch { total_rx: Some(130_000), ..Default::default() }).unwrap();
         assert_eq!(db.all_traffic()[&id].month_tx, 0);
+    }
+
+    #[test]
+    fn schema_five_gains_the_public_tags_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE node (id INTEGER PRIMARY KEY); PRAGMA user_version = 5;")
+            .unwrap();
+
+        migrate(&conn, 5).unwrap();
+
+        assert!(columns_of(&conn, "node").unwrap().contains("tags"));
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(),
+            SCHEMA_VERSION
+        );
     }
 
     #[test]

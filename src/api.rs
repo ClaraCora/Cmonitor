@@ -76,7 +76,13 @@ pub(crate) const PUBLIC_METRICS: [&str; 18] = [
 
 /// One node as the UI consumes it: stored config, live metrics and the hub's
 /// accumulated traffic in a single object.
-fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool) -> Value {
+fn node_view(
+    node: &Node,
+    current: Option<&Agent>,
+    traffic: &Traffic,
+    tasks: &[PingTask],
+    full: bool,
+) -> Value {
     // The three capacities arrive twice: once in `Facts`, sent at the handshake
     // and stored, and again in every `Metrics`. A machine that gains a disk while
     // the agent is running -- the agent re-reads its mount table every sample so
@@ -120,6 +126,7 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "currency": node.currency,
         "billing_cycle": node.billing_cycle,
         "expires_at": node.expires_at,
+        "tags": node.tags,
         "traffic_limit": node.traffic_limit,
         "traffic_mode": node.traffic_mode,
         "traffic_reset_day": node.traffic_reset_day,
@@ -132,6 +139,18 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         // the public page already shows, so this one is public as well.
         "day_rx": traffic.day_rx,
         "day_tx": traffic.day_tx,
+        // Every assigned task is present before its first answer, so the card
+        // does not jump when a probe starts. Results are session-live: after a
+        // hub restart they refill on the task's next interval.
+        "pings": tasks.iter().filter(|task| task.nodes.contains(&node.id)).map(|task| {
+            let reading = current.and_then(|agent| agent.pings.get(&task.id));
+            json!({
+                "id": task.id,
+                "name": task.name,
+                "latency": reading.map(|value| value.0),
+                "updated_at": reading.map(|value| value.1),
+            })
+        }).collect::<Vec<_>>(),
     });
     // An allowlist rather than a denylist: the agent ships from its own
     // repository, so a field added there would otherwise reach anonymous visitors
@@ -160,12 +179,13 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
     // visitor to the public page loads.
     let nodes = app.db.nodes()?;
     let traffic = app.db.all_traffic();
+    let tasks = app.db.ping_tasks()?;
     let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
     let none = Traffic::default();
     Ok(nodes
         .iter()
         .filter(|n| full || n.public)
-        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full))
+        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), &tasks, full))
         .collect())
 }
 
@@ -509,6 +529,19 @@ fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -
     None
 }
 
+/// Tags are copied into every public snapshot. Bound that repeated payload and
+/// keep control characters out of the one-line editor format.
+fn normalize_tags(tags: &mut String) -> Option<&'static str> {
+    *tags = tags.trim().to_owned();
+    if tags.chars().any(char::is_control) {
+        return Some("tags must not contain control characters");
+    }
+    if tags.chars().count() > 512 {
+        return Some("tags must not exceed 512 characters");
+    }
+    None
+}
+
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     let authenticated = authed(&app, &headers);
     let config = app.db.auth_config(&app.site).ok();
@@ -548,6 +581,9 @@ pub async fn create_node(
         return bad(message);
     }
     node.name = node.name.trim().to_owned();
+    if let Some(message) = normalize_tags(&mut node.tags) {
+        return bad(message);
+    }
     let token = random_token();
     match app.db.create_node(&node, &token) {
         // Usable immediately: the install command is readable from the node list,
@@ -682,6 +718,11 @@ pub async fn update_node(
         *name = name.trim().to_owned();
         if name.is_empty() {
             return bad("name is required");
+        }
+    }
+    if let Some(tags) = &mut node.tags {
+        if let Some(message) = normalize_tags(tags) {
+            return bad(message);
         }
     }
     if let Some(message) = node_limits(node.traffic_reset_day, node.price, node.traffic_limit) {
@@ -1997,6 +2038,13 @@ mod tests {
         let open = node(&app, "open", true);
         node(&app, "hidden", false);
         app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
+        app.db
+            .update_node(
+                open,
+                &NodePatch { tags: Some("二网精品;1Gbps<green>".into()), ..Default::default() },
+            )
+            .unwrap();
+        let probe = task(&app, vec![open]);
 
         // A live report, so the public view has metrics to strip. `hostname` is
         // what a node token in the wrong hands can insert, and what the agent
@@ -2007,10 +2055,20 @@ mod tests {
             json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0,
                    "hostname": "db-prod-01", "ip": "203.0.113.7"}),
         );
+        app.agents
+            .write()
+            .unwrap()
+            .get_mut(&open)
+            .unwrap()
+            .pings
+            .insert(probe, (7, 1_700_000_000));
 
         let public = visible_nodes(&app, false).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
         assert_eq!(public[0]["name"], "open");
+        assert_eq!(public[0]["tags"], "二网精品;1Gbps<green>");
+        assert_eq!(public[0]["pings"][0]["name"], "probe");
+        assert_eq!(public[0]["pings"][0]["latency"], 7);
         // Disclosing the token would let any visitor impersonate the node.
         for hidden in ["ip", "remark", "hostname", "token"] {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
@@ -2031,6 +2089,18 @@ mod tests {
         assert_eq!(admin.len(), 2);
         assert_eq!(admin[0]["ip"], "198.51.100.9");
         assert_eq!(admin[0]["remark"], "secret note");
+    }
+
+    #[test]
+    fn public_tags_are_trimmed_bounded_and_single_line() {
+        let mut valid = format!("  {}  ", "标".repeat(512));
+        assert_eq!(normalize_tags(&mut valid), None);
+        assert_eq!(valid.chars().count(), 512);
+
+        let mut too_long = "x".repeat(513);
+        assert!(normalize_tags(&mut too_long).is_some());
+        let mut multiline = "one\ntwo".to_owned();
+        assert!(normalize_tags(&mut multiline).is_some());
     }
 
     #[tokio::test]

@@ -49,6 +49,9 @@ pub struct Agent {
     pub tx: mpsc::Sender<String>,
     /// The latest report, or `Null` between connecting and the first one.
     pub metrics: serde_json::Value,
+    /// Latest accepted probe result by task id: `(latency_ms, unix_seconds)`.
+    /// It is live state, repopulated by the next probe after a hub restart.
+    pub pings: HashMap<i64, (i64, i64)>,
     pub last_seen: i64,
     /// Wall-clock minute this session has already accounted for. A history row
     /// is written when a report arrives past it.
@@ -76,6 +79,7 @@ impl Agent {
             cancel: watch::channel(false).0,
             tx,
             metrics: serde_json::Value::Null,
+            pings: HashMap::new(),
             last_seen: 0,
             // The minute in progress rather than zero. Its row is already on
             // disk, written by the session this one replaces from the mean of a
@@ -308,7 +312,16 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
             // same rule for a counter it cannot read.
             let latency = rpc.params.get("latency_ms").and_then(|v| v.as_i64());
             if let (true, Some(latency)) = (task_id > 0, latency) {
-                app.db.insert_ping(node_id, task_id, Utc::now().timestamp(), latency)?;
+                let now = Utc::now().timestamp();
+                // Only current assignments are recorded. The same result decides
+                // whether this task may enter the public live snapshot, so a node
+                // token cannot invent labels or unbounded task ids there either.
+                if app.db.insert_ping(node_id, task_id, now, latency)? {
+                    let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
+                    if let Some(agent) = agents.get_mut(&node_id) {
+                        agent.pings.insert(task_id, (latency, now));
+                    }
+                }
             }
         }
         other => debug!("node {node_id} sent unknown method {other}"),
@@ -509,13 +522,19 @@ fn ping_tasks_message(app: &App, node_id: i64) -> String {
 /// Pushes the current probe list to every connected agent, so a panel edit takes
 /// effect without waiting for a reconnect.
 pub fn push_ping_tasks(app: &App) {
-    let connected: Vec<(i64, mpsc::Sender<String>)> = app
-        .agents
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .map(|(id, agent)| (*id, agent.tx.clone()))
-        .collect();
+    let connected: Vec<(i64, mpsc::Sender<String>)> = {
+        let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
+        agents
+            .iter_mut()
+            .map(|(id, agent)| {
+                // SQLite may reuse a deleted task id. Clear the live readings so
+                // an edited or newly created task cannot inherit the old task's
+                // latency under a different name.
+                agent.pings.clear();
+                (*id, agent.tx.clone())
+            })
+            .collect()
+    };
     for (node_id, sender) in connected {
         // The queue carries only these messages, so a full one indicates an agent
         // that has stopped reading its socket. It is dropped within SILENCE and
@@ -794,7 +813,7 @@ mod tests {
     #[test]
     fn ping_results_are_recorded_and_bad_ones_ignored() {
         let app = app();
-        let id = node(&app);
+        let (id, _held) = connect(&app);
         // Assigned probes: a result is readable only through a node's current
         // assignments.
         let probe = |name: &str| {
@@ -844,6 +863,19 @@ mod tests {
             .collect();
         seen.sort();
         assert_eq!(seen, vec![(one, 42), (two, 15)], "each real task keeps its own result, and only those");
+        {
+            let agents = app.agents.read().unwrap();
+            let live = &agents[&id].pings;
+            assert_eq!(live[&one].0, 42);
+            assert_eq!(live[&two].0, 15);
+            assert_eq!(live.len(), 2, "rejected task ids never reach the live snapshot");
+        }
+
+        push_ping_tasks(&app);
+        assert!(
+            app.agents.read().unwrap()[&id].pings.is_empty(),
+            "an edited task must wait for its own result instead of inheriting one"
+        );
     }
 
     #[test]
