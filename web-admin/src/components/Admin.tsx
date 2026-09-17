@@ -568,23 +568,6 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
   const [message, setMessage] = useState("正在连接 Hub…")
 
   useEffect(() => {
-    const host = container.current
-    if (!host) return
-
-    const terminal = new XTerm({
-      cursorBlink: true,
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-      fontSize: 13,
-      scrollback: 5000,
-      theme: { background: "#0d1117", foreground: "#e6edf3", cursor: "#58a6ff" },
-    })
-    const fit = new FitAddon()
-    terminal.loadAddon(fit)
-    terminal.open(host)
-
-    const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/terminal/ws`
-    const ws = new WebSocket(url)
-    socket.current = ws
     let disposed = false
     let currentState: TerminalState = "connecting"
     const updateState = (next: TerminalState, text: string) => {
@@ -592,12 +575,60 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
       setState(next)
       setMessage(text)
     }
+    const detail = (error: unknown) => error instanceof Error && error.message ? `：${error.message}` : ""
+    const host = container.current
+    if (!host) {
+      updateState("error", "终端界面初始化失败：找不到显示区域")
+      return
+    }
+
+    const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/terminal/ws`
+    let ws: WebSocket
+    try {
+      // Start the handshake before xterm touches the DOM. If xterm fails, the
+      // Hub log still tells us whether the browser reached this point.
+      ws = new WebSocket(url)
+    } catch (error) {
+      updateState("error", `浏览器无法创建终端连接${detail(error)}`)
+      return
+    }
+    socket.current = ws
     const connectTimer = window.setTimeout(() => {
       if (!disposed && ws.readyState !== WebSocket.OPEN) {
         updateState("error", "无法连接 Hub 的终端通道，请检查反向代理的 WebSocket 配置")
         ws.close()
       }
     }, 10_000)
+
+    const initialize = () => {
+      const terminal = new XTerm({
+        cursorBlink: true,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+        fontSize: 13,
+        scrollback: 5000,
+        theme: { background: "#0d1117", foreground: "#e6edf3", cursor: "#58a6ff" },
+      })
+      try {
+        const fit = new FitAddon()
+        terminal.loadAddon(fit)
+        terminal.open(host)
+        return { terminal, fit }
+      } catch (error) {
+        terminal.dispose()
+        throw error
+      }
+    }
+    let initialized: ReturnType<typeof initialize>
+    try {
+      initialized = initialize()
+    } catch (error) {
+      window.clearTimeout(connectTimer)
+      updateState("error", `终端界面初始化失败${detail(error)}`)
+      ws.close()
+      socket.current = null
+      return
+    }
+    const { terminal, fit } = initialized
 
     const resize = () => {
       if (disposed || !host.clientWidth || !host.clientHeight) return

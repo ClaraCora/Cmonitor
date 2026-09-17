@@ -14,6 +14,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 use crate::auth::{authed, current_session, random_token};
 use crate::{App, Shared};
@@ -102,6 +103,7 @@ pub async fn handler(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
     let Some(session) = current_session(&headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    info!("browser terminal websocket accepted");
     upgrade
         .read_buffer_size(crate::api::SOCKET_BUFFER)
         .max_message_size(crate::api::MAX_FRAME)
@@ -118,6 +120,7 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
         send_error(&mut socket, "终端窗口大小无效").await;
         return;
     }
+    info!("opening terminal on node {node_id}");
 
     let agent = app.agents.read().unwrap_or_else(|e| e.into_inner()).get(&node_id).map(|a| a.tx.clone());
     let Some(agent) = agent else {
@@ -162,6 +165,7 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
                     let terminal_event = event_type(&message);
                     if terminal_event.as_deref() == Some("terminal.ready") {
                         ready = true;
+                        info!("terminal on node {node_id} is ready");
                     }
                     if socket.send(Message::Text(message.into())).await.is_err() { break }
                     if matches!(terminal_event.as_deref(), Some("terminal.exit" | "terminal.error")) {
@@ -174,6 +178,7 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
                 if !authed_hash(&app, &session) { break }
             }
             _ = &mut open_timeout, if !ready => {
+                warn!("terminal on node {node_id} did not answer within {}s", TERMINAL_OPEN_TIMEOUT.as_secs());
                 send_error(&mut socket, "Cagent 未响应终端请求，请检查 Agent 与 Hub 的 WebSocket 连接").await;
                 break;
             }
