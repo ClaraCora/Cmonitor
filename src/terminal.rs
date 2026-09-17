@@ -11,7 +11,6 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -110,7 +109,7 @@ pub async fn handler(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
 }
 
 async fn run(app: Shared, mut socket: WebSocket, session: String) {
-    let Some(Ok(Message::Text(first))) = socket.next().await else { return };
+    let Some(Ok(Message::Text(first))) = socket.recv().await else { return };
     let Ok(ClientMessage::Connect { node_id, cols, rows }) = serde_json::from_str(first.as_str()) else {
         send_error(&mut socket, "终端必须先选择一个节点").await;
         return;
@@ -139,7 +138,7 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
     let mut check = tokio::time::interval(TERMINAL_IDLE_CHECK);
     let result = loop {
         tokio::select! {
-            incoming = socket.next() => match incoming {
+            incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(text))) => {
                     if !authed_hash(&app, &session) { break Ok(()) }
                     if let Some(message) = to_agent(&terminal_id, &text) {
@@ -159,7 +158,9 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
                 Some(message) => {
                     let terminal_event = event_type(&message);
                     if socket.send(Message::Text(message.into())).await.is_err() { break Ok(()) }
-                    if matches!(terminal_event, Some("terminal.exit" | "terminal.error")) { break Ok(()) }
+                    if matches!(terminal_event.as_deref(), Some("terminal.exit" | "terminal.error")) {
+                        break Ok(());
+                    }
                 }
                 None => break Ok(()),
             },
@@ -201,8 +202,12 @@ fn rpc(method: &str, params: Value) -> String {
     json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string()
 }
 
-fn event_type(message: &str) -> Option<&str> {
-    serde_json::from_str::<Value>(message).ok()?.get("method").and_then(Value::as_str)
+fn event_type(message: &str) -> Option<String> {
+    serde_json::from_str::<Value>(message)
+        .ok()?
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 async fn send_error(socket: &mut WebSocket, message: &str) {
