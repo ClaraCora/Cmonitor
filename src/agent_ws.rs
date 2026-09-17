@@ -235,12 +235,16 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
 /// reconnect may have installed a newer session under the same node id; clearing
 /// that one would mark a node offline while it is reporting normally.
 fn release(app: &App, node_id: i64, session: u64) -> bool {
-    let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
-    if !agents.get(&node_id).is_some_and(|a| a.session == session) {
-        return false;
-    }
-    agents.remove(&node_id);
-    true
+    let released = {
+        let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
+        if !agents.get(&node_id).is_some_and(|a| a.session == session) {
+            return false;
+        }
+        agents.remove(&node_id);
+        true
+    };
+    app.terminals.disconnect_node(node_id);
+    released
 }
 
 /// Handles one inbound frame and reports whether the node is now owed a country
@@ -248,6 +252,10 @@ fn release(app: &App, node_id: i64, session: u64) -> bool {
 /// see `locate`.
 fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
     let rpc: Rpc = serde_json::from_str(text)?;
+    if rpc.method.starts_with("terminal.") {
+        crate::terminal::from_agent(app, node_id, text);
+        return Ok(false);
+    }
     match rpc.method.as_str() {
         "hello" => return app.db.save_facts(node_id, &rpc.params, ip),
         "report" => report(app, node_id, rpc.params)?,

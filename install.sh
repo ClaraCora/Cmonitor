@@ -116,13 +116,15 @@ else
 	exit 1
 fi
 
-# The service user the unit below runs as, created before the download and the
-# registration, so a host where this fails keeps the agent it already runs and
-# spends no registration key. OpenRC has no equivalent and Alpine ships no
-# useradd, which is why this is confined to systemd.
+# The service user runs under both init systems. It is created before download
+# and registration, so a host where this fails keeps its current agent and
+# spends no registration key. Alpine provides adduser rather than useradd.
 if [ "$INIT" = systemd ]; then
 	id -u monitor-agent >/dev/null 2>&1 ||
 		useradd --system --no-create-home --shell /usr/sbin/nologin monitor-agent ||
+		{ echo "cannot create the system user monitor-agent" >&2; exit 1; }
+elif ! id -u monitor-agent >/dev/null 2>&1; then
+	adduser -S -D -H -s /sbin/nologin monitor-agent >/dev/null 2>&1 ||
 		{ echo "cannot create the system user monitor-agent" >&2; exit 1; }
 fi
 
@@ -215,6 +217,7 @@ if [ "$INIT" = openrc ]; then
 description="monitor agent"
 command="$BIN"
 command_args="--interval $INTERVAL${INSECURE:+ --insecure}"
+command_user="monitor-agent:monitor-agent"
 supervisor="supervise-daemon"
 respawn_delay=5
 output_log="/var/log/monitor-agent.log"
@@ -261,7 +264,9 @@ RestrictSUIDSGID=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-PrivateDevices=yes
+# PTY requires the real /dev/ptmx and /dev/pts namespace. The terminal still
+# runs as monitor-agent and does not receive root or SSH credentials.
+PrivateDevices=no
 # AF_NETLINK is how getifaddrs(3) obtains this host's own addresses from the
 # kernel; without it the agent reports none.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK

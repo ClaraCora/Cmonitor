@@ -117,6 +117,9 @@
 /* Tabular figures keep live numbers from shifting as they update. */
 .tnum { font-variant-numeric: tabular-nums; }
 
+.terminal-surface .xterm { height: 100%; }
+.terminal-surface .xterm-viewport { background: #0d1117 !important; }
+
 /* Reordering animates the rows themselves; the rest of the page swaps. */
 ::view-transition-old(root),
 ::view-transition-new(root) {

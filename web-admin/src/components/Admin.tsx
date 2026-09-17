@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Terminal as TerminalIcon, Trash2, Upload } from "lucide-react"
+import { FitAddon } from "@xterm/addon-fit"
+import { Terminal as XTerm } from "@xterm/xterm"
+import "@xterm/xterm/css/xterm.css"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -556,11 +559,142 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   )
 }
 
+type TerminalState = "connecting" | "online" | "closed" | "error"
+
+function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) {
+  const container = useRef<HTMLDivElement>(null)
+  const socket = useRef<WebSocket | null>(null)
+  const [state, setState] = useState<TerminalState>("connecting")
+  const [message, setMessage] = useState("正在连接节点…")
+
+  useEffect(() => {
+    const host = container.current
+    if (!host) return
+
+    const terminal = new XTerm({
+      cursorBlink: true,
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+      fontSize: 13,
+      scrollback: 5000,
+      theme: { background: "#0d1117", foreground: "#e6edf3", cursor: "#58a6ff" },
+    })
+    const fit = new FitAddon()
+    terminal.loadAddon(fit)
+    terminal.open(host)
+
+    const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/terminal/ws`
+    const ws = new WebSocket(url)
+    socket.current = ws
+    let disposed = false
+    let currentState: TerminalState = "connecting"
+    const updateState = (next: TerminalState, text: string) => {
+      currentState = next
+      setState(next)
+      setMessage(text)
+    }
+
+    const resize = () => {
+      if (disposed || !host.clientWidth || !host.clientHeight) return
+      fit.fit()
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "resize", cols: terminal.cols, rows: terminal.rows }))
+      }
+    }
+    const observer = new ResizeObserver(() => requestAnimationFrame(resize))
+    observer.observe(host)
+
+    const data = terminal.onData((input) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "input", data: input }))
+    })
+    const resized = terminal.onResize(({ cols, rows }) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "resize", cols, rows }))
+    })
+
+    ws.onopen = () => {
+      fit.fit()
+      ws.send(JSON.stringify({ type: "connect", node_id: node.id, cols: terminal.cols, rows: terminal.rows }))
+      if (!disposed) {
+        setMessage("正在启动终端…")
+      }
+    }
+    ws.onmessage = (event) => {
+      try {
+        const frame = JSON.parse(event.data) as { type?: string; message?: string; method?: string; params?: { data?: string; reason?: string; message?: string } }
+        if (frame.type === "error") {
+          updateState("error", frame.message || "终端连接失败")
+        } else if (frame.method === "terminal.ready") {
+          updateState("online", "已连接")
+          terminal.focus()
+        } else if (frame.method === "terminal.output" && frame.params?.data) {
+          terminal.write(frame.params.data)
+        } else if (frame.method === "terminal.error") {
+          updateState("error", frame.params?.message || "终端发生错误")
+          terminal.write(`\r\n\x1b[31m${frame.params?.message || "终端发生错误"}\x1b[0m\r\n`)
+        } else if (frame.method === "terminal.exit") {
+          updateState("closed", "终端进程已结束")
+          terminal.write(`\r\n\x1b[90m终端进程已结束${frame.params?.reason ? `：${frame.params.reason}` : ""}\x1b[0m\r\n`)
+        }
+      } catch {
+        updateState("error", "收到无法识别的终端数据")
+      }
+    }
+    ws.onerror = () => {
+      if (!disposed) {
+        updateState("error", "终端连接失败，请确认节点在线")
+      }
+    }
+    ws.onclose = () => {
+      if (!disposed) {
+        if (currentState !== "error" && currentState !== "closed") updateState("closed", "连接已关闭")
+      }
+    }
+
+    return () => {
+      disposed = true
+      observer.disconnect()
+      data.dispose()
+      resized.dispose()
+      ws.close()
+      socket.current = null
+      terminal.dispose()
+    }
+  }, [node.id])
+
+  const status = {
+    connecting: "连接中",
+    online: "在线",
+    closed: "已关闭",
+    error: "错误",
+  }[state]
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="w-[calc(100%-1rem)] max-w-5xl gap-3 p-3 sm:p-4">
+        <DialogHeader className="px-1">
+          <DialogTitle className="flex items-center gap-2"><TerminalIcon className="size-4" />{node.name} · Web Terminal</DialogTitle>
+          <DialogDescription>终端命令在目标节点的 agent 服务账户下执行。</DialogDescription>
+        </DialogHeader>
+        <div className="flex items-center justify-between gap-3 px-1 text-xs text-muted-foreground">
+          <span className="flex items-center gap-2"><span className={`size-2 rounded-full ${state === "online" ? "bg-ok" : state === "error" ? "bg-destructive" : "bg-muted-foreground"}`} />{status}</span>
+          <span className="truncate" title={message}>{message}</span>
+        </div>
+        <div className="terminal-surface overflow-hidden rounded-md border bg-[#0d1117] p-2 shadow-xs">
+          <div ref={container} className="h-[min(65vh,520px)] min-h-64 w-full" />
+        </div>
+        <DialogFooter className="pt-1">
+          <Button variant="ghost" onClick={onClose}>关闭</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh: () => void; site: string; canProvision: boolean }) {
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
   const [installing, setInstalling] = useState<Node | null>(null)
+  const [terminal, setTerminal] = useState<Node | null>(null)
   const [registering, setRegistering] = useState(false)
   const reg = useRegisterWindow()
   const [deleting, setDeleting] = useState<Node | null>(null)
@@ -741,6 +875,9 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 </TableCell>
                 <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
+                  <Button variant="ghost" size="icon" disabled={!n.online} onClick={() => setTerminal(n)} title={n.online ? "打开 Web Terminal" : "节点离线"} aria-label={n.online ? "打开 Web Terminal" : "节点离线"}>
+                    <TerminalIcon />
+                  </Button>
                   <Button variant="ghost" size="icon" disabled={!canProvision} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />
                   </Button>
@@ -800,6 +937,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
           onRotated={refresh}
         />
       )}
+      {terminal && <TerminalDialog node={terminal} onClose={() => setTerminal(null)} />}
       {deleting && (
         <ConfirmDialog
           title={`删除节点「${deleting.name}」？`}

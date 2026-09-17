@@ -10,6 +10,7 @@ mod auth;
 mod db;
 mod frontend;
 mod notify;
+mod terminal;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -47,6 +48,8 @@ pub struct App {
     /// two have different threat models, and a batch install run with a stale
     /// key must not lock the operator out of the panel.
     pub registrations: auth::Throttle,
+    /// Browser terminal sessions waiting for output from an agent.
+    pub terminals: terminal::Registry,
     pub http: reqwest::Client,
     /// Public base URL when `--site` was given, empty otherwise. In the default
     /// case the hub is reached at whatever ip:port the browser used and the
@@ -68,6 +71,7 @@ impl App {
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
+            terminals: terminal::Registry::default(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
@@ -115,7 +119,7 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 
 /// Where the agent binaries are published. Not a setting: redirecting it
 /// implies a fork, which rebuilds this line anyway.
-const AGENT_REPO: &str = "monitor-probe/agent";
+const AGENT_REPO: &str = "ClaraCora/Cagent";
 
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {
@@ -389,6 +393,7 @@ async fn main() -> Result<()> {
         .route("/api/nodes", get(api::nodes))
         .route("/api/nodes/{id}/metrics", get(api::metrics))
         .route("/api/ws", get(api::live_ws))
+        .route("/api/terminal/ws", get(terminal::handler))
         // Sign-in.
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
@@ -837,7 +842,7 @@ mod tests {
     fn a_github_proxy_prefixes_the_release_url_and_an_empty_one_does_not() {
         let app = app("");
         let direct = release_url(&app, "x86_64");
-        assert!(direct.starts_with("https://github.com/monitor-probe/agent/releases/"), "{direct}");
+        assert!(direct.starts_with("https://github.com/ClaraCora/Cagent/releases/"), "{direct}");
 
         for set in ["https://ghfast.top", "https://ghfast.top/", "  https://ghfast.top/  "] {
             app.db.set("github_proxy", set).unwrap();
