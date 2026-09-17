@@ -203,11 +203,7 @@ fn rpc(method: &str, params: Value) -> String {
 }
 
 fn event_type(message: &str) -> Option<String> {
-    serde_json::from_str::<Value>(message)
-        .ok()?
-        .get("method")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    serde_json::from_str::<Value>(message).ok()?.get("method").and_then(Value::as_str).map(str::to_owned)
 }
 
 async fn send_error(socket: &mut WebSocket, message: &str) {
