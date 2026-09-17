@@ -908,10 +908,7 @@ mod tests {
             let agents = app.agents.read().unwrap();
             let reading = &agents[&id].pings[&one];
             assert_eq!(reading.latency, 121);
-            assert_eq!(
-                reading.samples.iter().copied().collect::<Vec<_>>(),
-                (102..=121).collect::<Vec<_>>()
-            );
+            assert_eq!(reading.samples.iter().copied().collect::<Vec<_>>(), (102..=121).collect::<Vec<_>>());
         }
 
         push_ping_tasks(&app);
