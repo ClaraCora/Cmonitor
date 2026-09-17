@@ -7,6 +7,7 @@
 mod agent_ws;
 mod api;
 mod auth;
+mod security;
 mod db;
 mod frontend;
 mod notify;
@@ -264,6 +265,7 @@ struct Args {
     /// taken literally.
     listen_defaulted: bool,
     database: String,
+    reset_password: bool,
     site: String,
     themes: PathBuf,
 }
@@ -286,6 +288,7 @@ fn default_listen() -> &'static str {
 fn parse_args() -> Result<Args> {
     let mut listen = None;
     let mut database = "monitor.db".to_owned();
+    let mut reset_password = false;
     let mut site = String::new();
     let mut themes = None;
     let mut it = std::env::args().skip(1);
@@ -294,12 +297,13 @@ fn parse_args() -> Result<Args> {
         match arg.as_str() {
             "--listen" => listen = Some(value()),
             "--db" => database = value(),
+            "--reset-password" => reset_password = true,
             "--site" => site = value(),
             "--themes" => themes = Some(PathBuf::from(value())),
             "-h" | "--help" => {
                 println!(
                     "monitor-hub {}\n\n\
-                     Usage: monitor-hub [--listen [::]:28080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n\n\
+                     Usage: monitor-hub [--reset-password] [--listen [::]:28080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n\n\
                      --listen defaults to [::]:28080, one socket serving IPv6 and IPv4\n\
                      both; where the kernel has no dual-stack sockets it is 0.0.0.0:28080.\n\
                      --themes defaults to a themes/ directory beside the database.\n\
@@ -319,7 +323,7 @@ fn parse_args() -> Result<Args> {
     let themes = themes.unwrap_or_else(|| {
         std::path::Path::new(&database).parent().unwrap_or_else(|| std::path::Path::new(".")).join("themes")
     });
-    Ok(Args { listen, listen_defaulted, database, site: site.trim_end_matches('/').to_owned(), themes })
+    Ok(Args { listen, listen_defaulted, database, reset_password, site: site.trim_end_matches('/').to_owned(), themes })
 }
 
 #[tokio::main]
@@ -332,6 +336,14 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
+    if args.reset_password {
+        anyhow::ensure!(std::path::Path::new(&args.database).is_file(), "数据库不存在；请用 --db 指定 Hub 的现有数据库");
+        let db = Db::open(&args.database)?;
+        let password = auth::random_token()[..24].to_owned();
+        db.recover_password(&auth::hash_password(&password)?)?;
+        println!("应急密码登录已开启，所有旧登录已撤销。新密码仅显示一次：{password}");
+        return Ok(());
+    }
     std::fs::create_dir_all(&args.themes)?;
     let (notes, inbox) = tokio::sync::mpsc::channel(notify::QUEUE);
     let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, notes));
@@ -449,6 +461,7 @@ async fn main() -> Result<()> {
                     }),
             ),
         )
+        .layer(axum::middleware::from_fn_with_state(app.clone(), auth::browser_guard))
         .with_state(app);
 
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
@@ -550,7 +563,7 @@ fn host_is_loopback(authority: &str) -> bool {
 /// Prints a one-time admin password when the database is first created, since a
 /// fresh hub is otherwise inaccessible until GitHub is configured.
 fn first_run(app: &App, url: &str) -> Result<()> {
-    if app.db.get("admin_password_hash").is_some() {
+    if app.db.get("admin_password_hash").is_some() || app.db.get("password_login").as_deref() == Some("off") {
         return Ok(());
     }
     let password = auth::random_token()[..24].to_owned();
@@ -641,6 +654,15 @@ async fn housekeeping(app: Shared) {
 mod tests {
     use super::*;
     use axum::http::{StatusCode, Uri};
+
+    #[test]
+    fn restarting_never_reenables_an_explicitly_disabled_password() {
+        let app = app("https://hub.example.com");
+        app.db.set("password_login", "off").unwrap();
+        first_run(&app, "https://hub.example.com").unwrap();
+        assert!(app.db.get("admin_password_hash").is_none());
+        assert_eq!(app.db.get("password_login").as_deref(), Some("off"));
+    }
 
     fn app(site: &str) -> App {
         App::new(

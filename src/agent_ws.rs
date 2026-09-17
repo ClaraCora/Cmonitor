@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::auth::client_ip;
@@ -44,6 +44,7 @@ static SESSION: AtomicU64 = AtomicU64::new(0);
 pub struct Agent {
     /// Distinguishes one session on a node from the next; see [`release`].
     pub session: u64,
+    pub cancel: watch::Sender<bool>,
     /// Outbound channel, used to push probe assignments.
     pub tx: mpsc::Sender<String>,
     /// The latest report, or `Null` between connecting and the first one.
@@ -72,6 +73,7 @@ impl Agent {
     pub fn new(session: u64, tx: mpsc::Sender<String>) -> Self {
         Self {
             session,
+            cancel: watch::channel(false).0,
             tx,
             metrics: serde_json::Value::Null,
             last_seen: 0,
@@ -83,6 +85,13 @@ impl Agent {
             mark: None,
             minute: Minute::default(),
         }
+    }
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        // Terminals clone tx. Revocation must not depend on its reference count.
+        self.cancel.send_replace(true);
     }
 }
 
@@ -151,10 +160,11 @@ pub async fn handler(
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     };
     let ip = client_ip(&headers, peer.ip()).to_string();
+    let token = token.to_owned();
 
     upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).max_message_size(crate::api::MAX_FRAME).on_upgrade(
         move |socket| async move {
-            if let Err(e) = serve(app, node_id, ip, socket).await {
+            if let Err(e) = serve(app, node_id, ip, token, socket).await {
                 debug!("node {node_id} disconnected: {e:#}");
             }
         },
@@ -166,26 +176,36 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ").filter(|t| !t.is_empty())
 }
 
-async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
+async fn serve(app: Shared, node_id: i64, ip: String, token: String, mut socket: WebSocket) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<String>(16);
     let session = SESSION.fetch_add(1, Ordering::Relaxed);
     // Online from the handshake rather than the first report: a panel reporting
     // otherwise for a whole interval would describe the hub's bookkeeping rather
     // than the machine.
-    app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(session, tx));
+    let agent = Agent::new(session, tx);
+    let mut cancelled = agent.cancel.subscribe();
+    {
+        let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
+        // A token may be rotated between the HTTP check and the upgrade task.
+        anyhow::ensure!(app.db.node_by_token(&token)? == Some(node_id), "node credential revoked");
+        agents.insert(node_id, agent);
+    }
     info!("node {node_id} connected from {ip}");
 
-    // Send the probe list before the first report arrives.
-    let _ = socket.send(Message::Text(ping_tasks_message(&app, node_id).into())).await;
+    // All fallible writes stay inside this block so cleanup cannot be skipped.
+    let outcome = async {
+    send_frame(&mut socket, Message::Text(ping_tasks_message(&app, node_id).into()), &mut cancelled).await?;
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await; // The first tick completes immediately.
     let mut last_frame = Instant::now();
 
-    let outcome = loop {
+    loop {
         tokio::select! {
+            biased;
+            _ = cancelled.changed() => break Ok(()),
             outbound = rx.recv() => match outbound {
-                Some(text) => socket.send(Message::Text(text.into())).await?,
+                Some(text) => send_frame(&mut socket, Message::Text(text.into()), &mut cancelled).await?,
                 None => break Ok(()),
             },
             // A machine that leaves the network without closing its socket would
@@ -198,7 +218,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 if quiet > SILENCE {
                     break Err(anyhow::anyhow!("silent for {}s", quiet.as_secs()));
                 }
-                socket.send(Message::Ping(Vec::new().into())).await?;
+                send_frame(&mut socket, Message::Ping(Vec::new().into()), &mut cancelled).await?;
             }
             inbound = socket.recv() => {
                 last_frame = Instant::now();
@@ -209,7 +229,15 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 // of the runtime -- the panel, the public page, the shutdown
                 // signal.
                 Some(Ok(Message::Text(text))) =>
-                    match tokio::task::block_in_place(|| dispatch(&app, node_id, &ip, &text)) {
+                    match tokio::task::block_in_place(|| {
+                        anyhow::ensure!(app.agents.read().unwrap_or_else(|e| e.into_inner()).get(&node_id).is_some_and(|a| a.session == session), "agent session replaced");
+                        if serde_json::from_str::<Rpc>(&text).is_ok_and(|rpc| rpc.method.starts_with("terminal.")) {
+                            crate::terminal::from_agent(&app, node_id, session, &text);
+                            Ok(false)
+                        } else {
+                            dispatch(&app, node_id, &ip, &text)
+                        }
+                    }) {
                     Ok(true) => locate(app.clone(), node_id, ip.clone()),
                     Ok(false) => {}
                     Err(e) => warn!("node {node_id} sent an unusable message: {e:#}"),
@@ -220,12 +248,25 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 }
             }
         }
-    };
+    }
+    }.await;
 
     if release(&app, node_id, session) {
         info!("node {node_id} went offline");
     }
     outcome
+}
+
+async fn send_frame(socket: &mut WebSocket, frame: Message, cancelled: &mut watch::Receiver<bool>) -> Result<()> {
+    anyhow::ensure!(!*cancelled.borrow(), "agent connection revoked");
+    tokio::select! {
+        biased;
+        _ = cancelled.changed() => anyhow::bail!("agent connection revoked"),
+        result = tokio::time::timeout(Duration::from_secs(5), socket.send(frame)) => {
+            result.map_err(|_| anyhow::anyhow!("agent write timed out"))??;
+            Ok(())
+        }
+    }
 }
 
 /// Drops a node's connection state, but only while `session` is still the one
@@ -252,10 +293,6 @@ fn release(app: &App, node_id: i64, session: u64) -> bool {
 /// see `locate`.
 fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
     let rpc: Rpc = serde_json::from_str(text)?;
-    if rpc.method.starts_with("terminal.") {
-        crate::terminal::from_agent(app, node_id, text);
-        return Ok(false);
-    }
     match rpc.method.as_str() {
         "hello" => return app.db.save_facts(node_id, &rpc.params, ip),
         "report" => report(app, node_id, rpc.params)?,

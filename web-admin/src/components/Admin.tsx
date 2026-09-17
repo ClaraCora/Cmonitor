@@ -1379,14 +1379,20 @@ type Settings = Record<string, string | boolean>
 
 // Two pages write settings, and each loads only what it displays.
 function useSettings() {
+  const [saving, setSaving] = useState(false)
   const [s, setS] = useState<Settings | null>(null)
   useEffect(() => { api<Settings>("/settings").then(setS).catch(() => {}) }, [])
   return {
-    s,
+    s, saving,
     set: (k: string, v: string) => setS((old) => ({ ...(old ?? {}), [k]: v })),
     save: async (patch: Record<string, string>) => {
+      setSaving(true)
       try {
-        await api("/settings", { method: "PUT", body: JSON.stringify(patch) })
+        const result = await api<{ reauth_required?: boolean }>("/settings", { method: "PUT", body: JSON.stringify(patch) })
+        if (result.reauth_required) {
+          location.assign("/admin")
+          return true
+        }
         toast.success("已保存")
         // Only the saved keys and the `*_set` flags are taken from the hub: a
         // credential comes back as a flag, so the typed value must not linger,
@@ -1395,11 +1401,15 @@ function useSettings() {
         setS((old) => {
           const next = { ...old }
           for (const key of Object.keys(patch)) next[key] = fresh[key]
-          for (const [key, value] of Object.entries(fresh)) if (key.endsWith("_set")) next[key] = value
+          for (const [key, value] of Object.entries(fresh)) if (key.endsWith("_set") || ["github_ready", "github_verified", "password_login"].includes(key)) next[key] = value
           return next
         })
+        return true
       } catch (e) {
         toast.error((e as Error).message)
+        return false
+      } finally {
+        setSaving(false)
       }
     },
   }
@@ -1793,9 +1803,12 @@ function Sessions() {
 }
 
 function Security({ site }: { site: string }) {
-  const { s, set, save } = useSettings()
+  const { s, set, save, saving } = useSettings()
   const [password, setPassword] = useState("")
+  const [githubDirty, setGithubDirty] = useState(false)
   if (!s) return null
+  const passwordEnabled = s.password_login !== "off"
+  const verified = !!s.github_verified && !githubDirty
   const callback = `${site}/api/auth/github/callback`
 
   return (
@@ -1811,10 +1824,10 @@ function Security({ site }: { site: string }) {
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Client ID">
-            <Input value={String(s.github_client_id ?? "")} onChange={(e) => set("github_client_id", e.target.value)} />
+            <Input disabled={!passwordEnabled || saving} value={String(s.github_client_id ?? "")} onChange={(e) => (setGithubDirty(true), set("github_client_id", e.target.value))} />
           </Field>
           <Field label="Client Secret" hint={s.github_secret_set ? "已设置，留空不变" : "未设置"}>
-            <Input type="password" placeholder={s.github_secret_set ? "••••••••" : ""} onChange={(e) => set("github_client_secret", e.target.value)} />
+            <Input disabled={!passwordEnabled || saving} type="password" placeholder={s.github_secret_set ? "••••••••" : ""} onChange={(e) => (setGithubDirty(true), set("github_client_secret", e.target.value))} />
           </Field>
         </div>
         {String(s.github_client_id ?? "") !== "" && String(s.github_allowed_users ?? "").trim() === "" && (
@@ -1823,12 +1836,13 @@ function Security({ site }: { site: string }) {
           </p>
         )}
         <Field label="允许登录的 GitHub 用户名" hint="逗号分隔。留空 = 拒绝所有人，不是放行所有人">
-          <Input value={String(s.github_allowed_users ?? "")} onChange={(e) => set("github_allowed_users", e.target.value)} placeholder="GitHub 用户名" />
+          <Input disabled={!passwordEnabled || saving} value={String(s.github_allowed_users ?? "")} onChange={(e) => (setGithubDirty(true), set("github_allowed_users", e.target.value))} placeholder="GitHub 用户名" />
         </Field>
-        <div>
+        <div className="flex flex-wrap items-center gap-3">
           <Button
             size="sm"
-            onClick={() => {
+            disabled={!passwordEnabled || saving}
+            onClick={async () => {
               const patch: Record<string, string> = {
                 github_client_id: String(s.github_client_id ?? ""),
                 github_allowed_users: String(s.github_allowed_users ?? ""),
@@ -1836,12 +1850,15 @@ function Security({ site }: { site: string }) {
               if (typeof s.github_client_secret === "string" && s.github_client_secret) {
                 patch.github_client_secret = s.github_client_secret
               }
-              save(patch)
+              if (await save(patch)) setGithubDirty(false)
             }}
           >
-            保存 GitHub 设置
+            {saving ? "保存中…" : "保存 GitHub 设置"}
           </Button>
+          {!!s.github_ready && !verified && !githubDirty && <Button size="sm" variant="outline" asChild><a href="/api/auth/github">验证 GitHub 登录</a></Button>}
+          <Badge variant={verified ? "secondary" : "outline"}>{githubDirty ? "有未保存的修改" : verified ? "已验证" : s.github_ready ? "待登录验证" : "未配置完整"}</Badge>
         </div>
+        {!passwordEnabled && <p className="text-sm text-muted-foreground">修改 GitHub 配置前，请先开启应急密码。</p>}
       </Card>
 
       <Card className="gap-4 p-5">
@@ -1851,14 +1868,24 @@ function Security({ site }: { site: string }) {
             GitHub 不可用时的备用入口。修改后其它设备登录立即失效，当前设备不受影响。
           </p>
         </div>
-        <Field label="新密码" hint="至少 12 位">
+        <div className="flex items-start justify-between gap-4">
+          <div className="space-y-1">
+            <Label id="password-login-label">允许应急密码登录</Label>
+            <p id="password-login-hint" className="text-sm text-muted-foreground">
+              {passwordEnabled ? verified ? "关闭后仅允许 GitHub 登录，密码登录的设备会退出。" : "请先保存 GitHub 配置并成功登录验证，才能关闭。" : "已关闭。重启或升级不会重新开启。"}
+            </p>
+          </div>
+          <Switch aria-labelledby="password-login-label" aria-describedby="password-login-hint" checked={passwordEnabled} disabled={saving || (passwordEnabled && !verified)} onCheckedChange={(enabled) => { save({ password_login: enabled ? "on" : "off" }) }} />
+        </div>
+        {!passwordEnabled && <p className="text-sm text-muted-foreground">GitHub 无法登录时，可在 Hub 服务器执行 <code className="break-all">sudo /opt/monitor/monitor-hub --db /opt/monitor/data/monitor.db --reset-password</code> 恢复。</p>}
+        <Field label="新密码" hint="至少 12 位；修改密码不会自动开启密码登录">
           <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
         </Field>
         <div>
           <Button
             size="sm"
-            disabled={password.length < 12}
-            onClick={() => save({ admin_password: password }).then(() => setPassword(""))}
+            disabled={saving || password.length < 12}
+            onClick={async () => { if (await save({ admin_password: password })) setPassword("") }}
           >
             修改密码
           </Button>

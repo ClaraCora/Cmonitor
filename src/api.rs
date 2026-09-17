@@ -397,6 +397,9 @@ fn stream_audience(app: &App, session: Option<&str>) -> Option<bool> {
 /// reason about than a fan-out channel -- over a shared snapshot, so a timer
 /// costs no more than a send.
 pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+    if !crate::auth::same_origin(&app, &headers, true) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     // The digest rather than the result: signing out must reach a stream already
     // running, and only the row it names can report whether it has.
     let session = current_session(&headers).filter(|hash| app.db.session_valid(hash));
@@ -507,9 +510,13 @@ fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -
 }
 
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
+    let authenticated = authed(&app, &headers);
+    let config = app.db.auth_config(&app.site).ok();
     Json(json!({
-        "authed": authed(&app, &headers),
-        "github": app.db.get("github_client_id").is_some_and(|v| !v.is_empty()),
+        "authed": authenticated,
+        "hub_version": authenticated.then_some(env!("CARGO_PKG_VERSION")),
+        "password_login": config.as_ref().is_some_and(|c| c.password_enabled),
+        "github": config.as_ref().is_some_and(|c| c.github_ready()),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
         "public_page": app.public_page(),
         "can_provision": provisioning_allowed(&app, &headers),
@@ -722,6 +729,7 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // metrics. Dropped after the delete, so the reconnect that follows finds no
     // token to accept. The same reasoning applies in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    app.terminals.disconnect_node(id);
     invalidate_snapshot(&app);
     Json(json!({"ok": true})).into_response()
 }
@@ -742,6 +750,7 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // agent reconnects and is refused. Its own teardown leaves the entry
     // untouched, because the session tag no longer matches.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    app.terminals.disconnect_node(id);
     // The token is part of the admin frame, which would otherwise continue to
     // display an install command for the credential just retired.
     invalidate_snapshot(&app);
@@ -1099,6 +1108,7 @@ pub async fn db_restore(
             // now belong to different nodes, or to none. Dropping the senders ends
             // those loops; each reconnects against the restored database.
             app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
+            app.terminals.disconnect_all();
             invalidate_snapshot(&app);
             let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers)) {
                 Ok(cookie) => cookie,
@@ -1374,7 +1384,10 @@ pub async fn sessions(_: Admin, State(app): State<Shared>, headers: HeaderMap) -
 /// same list both achieve the requested sign-out.
 pub async fn delete_session(_: Admin, State(app): State<Shared>, Path(id): Path<String>) -> Response {
     match app.db.drop_session(&id) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            app.terminals.revoke_invalid(&app.db);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => fail(e),
     }
 }
@@ -1400,6 +1413,11 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     // both names.
     for key in ["register_key", "register_until"] {
         out.insert(key.into(), json!(app.db.get(key).unwrap_or_default()));
+    }
+    if let Ok(config) = app.db.auth_config(&app.site) {
+        out.insert("password_login".into(), json!(if config.password_enabled { "on" } else { "off" }));
+        out.insert("github_ready".into(), json!(config.github_ready()));
+        out.insert("github_verified".into(), json!(config.github_ready() && config.verified));
     }
     crate::notify::settings(&app, &mut out);
     Json(Value::Object(out))
@@ -1437,6 +1455,8 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         "github_proxy" if !(value.is_empty() || value.starts_with("https://")) => {
             Some("GitHub proxy must start with https://: the agent binary is fetched through it and installed on every node".into())
         }
+        "password_login" if !matches!(value, "on" | "off") => Some("password_login must be on or off".into()),
+        "password_login" => None,
         "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
         "admin_password" => None,
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
@@ -1457,29 +1477,25 @@ pub async fn save_settings(
             return bad(&message);
         }
     }
-    // Set when the password changed, so the caller receives a fresh session rather
-    // than being logged out by their own change.
-    let mut reissued = String::new();
-    for (key, value) in map {
-        let value = value.as_str().unwrap_or_default();
-        // Changing the password logs out every existing session; the caller
-        // receives a replacement.
-        if key == "admin_password" {
-            match hash_password(value).and_then(|h| {
-                app.db.set("admin_password_hash", &h)?;
-                app.db.drop_all_sessions()?;
-                issue_session(&app, &headers)
-            }) {
-                Ok(cookie) => reissued = cookie,
-                Err(e) => return fail(e),
-            }
-            continue;
-        }
-        if let Err(e) = app.db.set(key, value) {
-            return fail(e);
-        }
+    let password_hash = match map.get("admin_password").and_then(Value::as_str).map(hash_password).transpose() {
+        Ok(hash) => hash,
+        Err(e) => return fail(e),
+    };
+    let replacement = password_hash.as_ref().map(|_| random_token());
+    let replacement_hash = replacement.as_ref().map(|token| crate::auth::sha256(token));
+    let actor = current_session(&headers);
+    if let Err(e) = app.db.save_settings_atomic(
+        map, password_hash.as_deref(), &app.site, actor.as_deref(),
+        replacement_hash.as_deref().map(|hash| (hash, crate::auth::session_expiry())),
+    ) {
+        return bad(&e.to_string());
     }
-    with_cookies(Json(json!({"ok": true})), [reissued])
+    app.terminals.revoke_invalid(&app.db);
+    let active = replacement_hash.as_ref().or(actor.as_ref());
+    let reauth = active.is_some_and(|hash| !app.db.session_valid(hash));
+    let cookie = replacement.as_ref().filter(|_| !reauth)
+        .map(|token| crate::auth::session_cookie(&app, &headers, token)).unwrap_or_default();
+    with_cookies(Json(json!({"ok": true, "reauth_required": reauth})), [cookie])
 }
 
 #[cfg(test)]

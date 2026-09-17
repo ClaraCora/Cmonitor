@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, provisioningSite, useNodes } from "@/lib/api"
 
-type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string; can_provision: boolean }
+type Me = { authed: boolean; github: boolean; password_login: boolean; hub_version: string | null; site_name: string; public_page: boolean; site: string; can_provision: boolean }
 
 // `/admin` alone is not a page; it is normalised to the first section so that a
 // bookmark and the OAuth redirect both resolve to a real route.
@@ -92,7 +92,7 @@ export default function App() {
   if (!me.authed) {
     return (
       <>
-        <Login github={me.github} onDone={() => { loadMe(); refresh(); go("/admin/nodes") }} />
+        <Login github={me.github} passwordEnabled={me.password_login} onDone={() => { loadMe(); refresh(); go("/admin/nodes") }} />
         <Toaster position="top-center" theme={dark ? "dark" : "light"} />
       </>
     )
@@ -108,13 +108,13 @@ export default function App() {
   return (
     <div className="min-h-svh">
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
-        <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3">
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-3 px-4 py-3">
           {/* The site name is the way back to the status page, as in the
               theme's own header. */}
           <a href="/" className="font-semibold transition-opacity hover:opacity-70">
             {me.site_name || "Monitor"}
           </a>
-          <span className="text-xs text-muted-foreground">后台</span>
+          <span className="text-xs text-muted-foreground">后台{me.hub_version && <span className="ml-2 whitespace-nowrap font-mono">Hub v{me.hub_version}</span>}</span>
           <div className="flex-1" />
           {/* The status page is a separate app, so this is a navigation. */}
           <Button variant="ghost" size="sm" asChild>

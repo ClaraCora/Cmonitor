@@ -25,7 +25,7 @@ function callbackError(): string {
   return reason ?? ""
 }
 
-export function Login({ github, onDone }: { github: boolean; onDone: () => void }) {
+export function Login({ github, passwordEnabled, onDone }: { github: boolean; passwordEnabled: boolean; onDone: () => void }) {
   const [password, setPassword] = useState("")
   const [error, setError] = useState(callbackError)
   const [busy, setBusy] = useState(false)
@@ -60,16 +60,16 @@ export function Login({ github, onDone }: { github: boolean; onDone: () => void 
                 <GithubMark /> 使用 GitHub 登录
               </a>
             </Button>
-            <div className="relative">
+            {passwordEnabled && <div className="relative">
               <Separator />
               <span className="absolute inset-0 -top-2 mx-auto w-fit bg-card px-2 text-xs text-muted-foreground">
                 或使用应急密码
               </span>
-            </div>
+            </div>}
           </>
         )}
 
-        <form onSubmit={submit} className="space-y-3">
+        {passwordEnabled && <form onSubmit={submit} className="space-y-3">
           <div className="space-y-1.5">
             <Label htmlFor="password" className="text-xs">应急密码</Label>
             <Input
@@ -84,7 +84,8 @@ export function Login({ github, onDone }: { github: boolean; onDone: () => void 
           <Button type="submit" className="w-full" disabled={busy || !password}>
             登录
           </Button>
-        </form>
+        </form>}
+        {!passwordEnabled && <p className="text-sm text-muted-foreground">应急密码登录已关闭。{github ? "请使用 GitHub 登录。" : "请由服务器管理员恢复登录配置。"}</p>}
       </Card>
     </div>
   )

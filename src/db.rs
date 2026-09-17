@@ -121,14 +121,16 @@ CREATE TABLE IF NOT EXISTS ping_record (
 
 CREATE TABLE IF NOT EXISTS session (
   token_hash TEXT    PRIMARY KEY,
-  expires_at INTEGER NOT NULL
+  expires_at INTEGER NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'legacy',
+  identity TEXT NOT NULL DEFAULT ''
 );
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -248,6 +250,10 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 4 {
         migrate_to_4(conn)?;
+    }
+    if from < 5 {
+        add_column(conn, "session", "kind TEXT NOT NULL DEFAULT 'legacy'")?;
+        add_column(conn, "session", "identity TEXT NOT NULL DEFAULT ''")?;
     }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
@@ -479,7 +485,7 @@ impl Db {
         Ok(Self(Mutex::new(conn)))
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 

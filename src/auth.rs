@@ -155,6 +155,46 @@ pub fn issue_session(app: &App, headers: &HeaderMap) -> Result<String> {
     Ok(set_cookie(COOKIE, &token, SESSION_DAYS * 86_400, app.secure_cookies(headers)))
 }
 
+pub fn session_expiry() -> i64 {
+    Utc::now().timestamp() + SESSION_DAYS * 86_400
+}
+
+pub fn session_cookie(app: &App, headers: &HeaderMap, token: &str) -> String {
+    set_cookie(COOKIE, token, SESSION_DAYS * 86_400, app.secure_cookies(headers))
+}
+
+/// WebSocket handshakes always carry Origin. Cookie-authenticated writes also
+/// accept a same-origin Fetch Metadata header, which browsers cannot forge.
+/// A configured public site is authoritative, never an arbitrary client Host.
+pub fn same_origin(app: &App, headers: &HeaderMap, websocket: bool) -> bool {
+    let expected = if app.site.is_empty() {
+        let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else { return false };
+        let scheme = if app.secure_cookies(headers) { "https" } else { "http" };
+        format!("{scheme}://{host}")
+    } else { app.site.clone() };
+    let Ok(expected) = reqwest::Url::parse(&expected) else { return false };
+    match headers.get(header::ORIGIN).and_then(|h| h.to_str().ok()) {
+        Some(origin) => reqwest::Url::parse(origin).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https") && url.username().is_empty() && url.password().is_none()
+                && url.path() == "/" && url.query().is_none() && url.fragment().is_none()
+                && url.origin() == expected.origin()
+        }),
+        None => !websocket && headers.get("sec-fetch-site").is_some_and(|v| v == "same-origin"),
+    }
+}
+
+pub async fn browser_guard(
+    State(app): State<crate::Shared>, request: axum::extract::Request, next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    let writes = !matches!(*request.method(), axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS);
+    // Agent registration uses a Bearer credential, never a browser cookie.
+    if writes && path.starts_with("/api/") && path != "/api/agent/register" && !same_origin(&app, request.headers(), false) {
+        return (StatusCode::FORBIDDEN, "请求来源不匹配，请从 Hub 后台重试").into_response();
+    }
+    next.run(request).await
+}
+
 #[derive(Deserialize)]
 pub struct LoginBody {
     password: String,
@@ -166,6 +206,13 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
+    let config = match app.db.auth_config(&app.site) {
+        Ok(config) => config,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if !config.password_enabled {
+        return (StatusCode::FORBIDDEN, "应急密码登录已关闭，请使用 GitHub 登录").into_response();
+    }
     let ip = client_ip(&headers, peer.ip());
     if app.throttle.locked(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
@@ -174,7 +221,7 @@ pub async fn login(
     let Ok(_permit) = PASSWORD_GATE.try_acquire() else {
         return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
     };
-    let Some(stored) = app.db.get("admin_password_hash") else {
+    let Some(stored) = config.password_hash else {
         return (StatusCode::FORBIDDEN, "password login is disabled").into_response();
     };
     if !verify_password(&body.password, &stored) {
@@ -182,10 +229,11 @@ pub async fn login(
         return (StatusCode::UNAUTHORIZED, "invalid password").into_response();
     }
     app.throttle.clear(ip);
-    match issue_session(&app, &headers) {
-        Ok(cookie) => {
+    let token = random_token();
+    match app.db.password_session(&sha256(&token), session_expiry(), &stored) {
+        Ok(()) => {
             crate::notify::signed_in(&app, "应急密码", ip);
-            with_cookies(Json(serde_json::json!({"ok": true})), [cookie])
+            with_cookies(Json(serde_json::json!({"ok": true})), [session_cookie(&app, &headers, &token)])
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -195,6 +243,7 @@ pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Res
     if let Some(token) = cookie_value(&headers, COOKIE) {
         let _ = app.db.drop_session(&sha256(&token));
     }
+    app.terminals.revoke_invalid(&app.db);
     with_cookies(
         Json(serde_json::json!({"ok": true})),
         [set_cookie(COOKIE, "", 0, app.secure_cookies(&headers))],
@@ -204,10 +253,14 @@ pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Res
 /// Step one of the OAuth exchange: issue a state nonce and redirect the browser
 /// to GitHub. The nonce returns in step two and must match.
 pub async fn github_start(State(app): State<crate::Shared>, headers: HeaderMap) -> Response {
-    let Some(client_id) = app.db.get("github_client_id").filter(|v| !v.is_empty()) else {
-        return (StatusCode::PRECONDITION_FAILED, "GitHub sign-in is not configured").into_response();
+    let Ok(config) = app.db.auth_config(&app.site) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let state = random_token();
+    if !config.github_ready() {
+        return (StatusCode::PRECONDITION_FAILED, "GitHub sign-in is not configured").into_response();
+    }
+    let client_id = urlencode(&config.github_id);
+    let state = format!("{}.{}", random_token(), config.stamp);
     let url = format!(
         "https://github.com/login/oauth/authorize?client_id={client_id}&scope=read:user&state={state}"
     );
@@ -252,14 +305,19 @@ pub async fn github_callback(
     let Some(code) = query.code.as_deref().filter(|c| !c.is_empty()) else {
         return sign_in_failed(&app, &headers, "GitHub sent no authorization code");
     };
-    let user = match github_login(&app, code).await {
+    let config = match app.db.auth_config(&app.site) {
+        Ok(config) if state.rsplit_once('.').is_some_and(|(_, stamp)| stamp == config.stamp) => config,
+        _ => return sign_in_failed(&app, &headers, "GitHub 配置已变更，请重新发起登录"),
+    };
+    let user = match github_login(&app, code, &config).await {
         Ok(user) => user,
         Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
     };
-    let session = match issue_session(&app, &headers) {
-        Ok(cookie) => cookie,
-        Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
-    };
+    let token = random_token();
+    if let Err(e) = app.db.github_session(&sha256(&token), session_expiry(), &user, &config.stamp, &app.site) {
+        return sign_in_failed(&app, &headers, &e.to_string());
+    }
+    let session = session_cookie(&app, &headers, &token);
     crate::notify::signed_in(&app, &format!("GitHub {user}"), client_ip(&headers, peer.ip()));
     with_cookies(Redirect::to("/admin"), [clear_state(&app, &headers), session])
 }
@@ -311,14 +369,9 @@ fn urlencode(value: &str) -> String {
 
 /// Exchanges the code for a token and checks the login against the allow list,
 /// returning the accepted login.
-async fn github_login(app: &App, code: &str) -> Result<String> {
-    let (Some(id), Some(secret)) = (app.db.get("github_client_id"), app.db.get("github_client_secret"))
-    else {
-        bail!("not configured");
-    };
-    let allowed = app.db.get("github_allowed_users").unwrap_or_default();
-    let allowed: Vec<String> =
-        allowed.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+async fn github_login(app: &App, code: &str, config: &crate::security::AuthConfig) -> Result<String> {
+    let (id, secret) = (&config.github_id, &config.github_secret);
+    let allowed = &config.github_users;
     if allowed.is_empty() {
         // Without an allow list, any GitHub account could sign in.
         bail!("no allowed GitHub users configured");
@@ -427,6 +480,25 @@ fn behind_local_proxy(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_origins_are_exact_and_a_missing_websocket_origin_is_refused() {
+        let mut app = App::for_test(crate::db::Db::open(":memory:").unwrap());
+        app.site = "https://hub.example.com".into();
+        for origin in ["https://evil.example.com", "https://hub.example.com.evil.test", "http://hub.example.com", "https://hub.example.com:8443", "null"] {
+            let headers = HeaderMap::from_iter([(header::ORIGIN, origin.parse().unwrap())]);
+            assert!(!same_origin(&app, &headers, true), "{origin}");
+            assert!(!same_origin(&app, &headers, false), "{origin}");
+        }
+        let mut headers = HeaderMap::new();
+        assert!(!same_origin(&app, &headers, true));
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert!(same_origin(&app, &headers, false));
+        assert!(!same_origin(&app, &headers, true));
+        headers.insert(header::ORIGIN, "https://hub.example.com".parse().unwrap());
+        headers.insert(header::HOST, "127.0.0.1:28080".parse().unwrap());
+        assert!(same_origin(&app, &headers, true), "the public site survives a local reverse proxy");
+    }
 
     #[test]
     fn a_password_round_trips_fails_closed_and_never_repeats_a_salt() {
