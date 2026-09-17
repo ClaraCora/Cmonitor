@@ -3,9 +3,8 @@
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --token TOKEN [options]
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --register KEY [options]
 set -eu
-# useradd and rc-update reside in sbin, which a root shell entered through `su`
-# without `-` lacks on Debian: su keeps the caller's PATH unless ALWAYS_SET_PATH
-# is set, and Debian does not set it.
+# rc-update resides in sbin, which a root shell entered through `su` without `-`
+# can lack because the caller's PATH is retained.
 PATH="$PATH:/usr/sbin:/sbin"
 
 # Binary and token in one directory, the same one the hub uses, giving a node a
@@ -116,18 +115,6 @@ else
 	exit 1
 fi
 
-# The service user runs under both init systems. It is created before download
-# and registration, so a host where this fails keeps its current agent and
-# spends no registration key. Alpine provides adduser rather than useradd.
-if [ "$INIT" = systemd ]; then
-	id -u monitor-agent >/dev/null 2>&1 ||
-		useradd --system --no-create-home --shell /usr/sbin/nologin monitor-agent ||
-		{ echo "cannot create the system user monitor-agent" >&2; exit 1; }
-elif ! id -u monitor-agent >/dev/null 2>&1; then
-	adduser -S -D -H -s /sbin/nologin monitor-agent >/dev/null 2>&1 ||
-		{ echo "cannot create the system user monitor-agent" >&2; exit 1; }
-fi
-
 case "$(uname -m)" in
 x86_64 | amd64) ARCH=x86_64 ;;
 aarch64 | arm64) ARCH=aarch64 ;;
@@ -217,7 +204,7 @@ if [ "$INIT" = openrc ]; then
 description="monitor agent"
 command="$BIN"
 command_args="--interval $INTERVAL${INSECURE:+ --insecure}"
-command_user="monitor-agent:monitor-agent"
+command_user="root:root"
 supervisor="supervise-daemon"
 respawn_delay=5
 output_log="/var/log/monitor-agent.log"
@@ -253,24 +240,9 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$BIN --interval $INTERVAL${INSECURE:+ --insecure}
 Restart=always
 RestartSec=5
-# A fixed user rather than DynamicUser=: when the mount namespace cannot be
-# created, as in an LXC container without nesting, systemd skips ProtectSystem=
-# and the other mount sandboxing for a unit with a static User=, but refuses to
-# start one with DynamicUser= and exits 226/NAMESPACE. DynamicUser= also implied
-# RestrictSUIDSGID=, which is therefore stated below.
-User=monitor-agent
-NoNewPrivileges=yes
-RestrictSUIDSGID=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-# PTY requires the real /dev/ptmx and /dev/pts namespace. The terminal still
-# runs as monitor-agent and does not receive root or SSH credentials.
-PrivateDevices=no
-# AF_NETLINK is how getifaddrs(3) obtains this host's own addresses from the
-# kernel; without it the agent reports none.
-RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
-MemoryMax=64M
+# Web Terminal is the node's remote administration channel. Running the agent
+# as root gives that terminal the same access as a root SSH login.
+User=root
 
 [Install]
 WantedBy=multi-user.target

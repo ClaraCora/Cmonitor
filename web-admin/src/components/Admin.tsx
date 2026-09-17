@@ -714,7 +714,7 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
       >
         <DialogHeader className="px-1">
           <DialogTitle className="flex items-center gap-2"><TerminalIcon className="size-4" />{node.name} · Web Terminal</DialogTitle>
-          <DialogDescription>终端命令在目标节点的 agent 服务账户下执行。</DialogDescription>
+          <DialogDescription>终端命令在目标节点上以 root 权限执行。</DialogDescription>
         </DialogHeader>
         <div className="flex items-center justify-between gap-3 px-1 text-xs text-muted-foreground">
           <span className="flex items-center gap-2"><span className={`size-2 rounded-full ${state === "online" ? "bg-ok" : state === "error" ? "bg-destructive" : "bg-muted-foreground"}`} />{status}</span>
