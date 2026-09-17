@@ -233,15 +233,27 @@ async fn verified_agent(app: &App, arch: &str) -> Result<Vec<u8>> {
     use sha2::Digest;
     let pin = agent_pin();
     let expected = pin.sha256.get(arch).ok_or_else(|| anyhow::anyhow!("unknown architecture"))?;
-    let mut response = app.http.get(release_url(app, arch)).timeout(std::time::Duration::from_secs(120)).send().await?.error_for_status()?;
+    let mut response = app
+        .http
+        .get(release_url(app, arch))
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await?
+        .error_for_status()?;
     const MAX_BINARY: usize = 16 * 1024 * 1024;
-    anyhow::ensure!(response.content_length().is_none_or(|size| size <= MAX_BINARY as u64), "agent binary exceeds size limit");
+    anyhow::ensure!(
+        response.content_length().is_none_or(|size| size <= MAX_BINARY as u64),
+        "agent binary exceeds size limit"
+    );
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         anyhow::ensure!(bytes.len() + chunk.len() <= MAX_BINARY, "agent binary exceeds size limit");
         bytes.extend_from_slice(&chunk);
     }
-    anyhow::ensure!(hex::encode(sha2::Sha256::digest(&bytes)) == *expected, "Agent SHA-256 校验失败，已拒绝下载；请检查 GitHub 下载代理");
+    anyhow::ensure!(
+        hex::encode(sha2::Sha256::digest(&bytes)) == *expected,
+        "Agent SHA-256 校验失败，已拒绝下载；请检查 GitHub 下载代理"
+    );
     Ok(bytes)
 }
 
@@ -263,7 +275,8 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
         Ok(Ok(bytes)) => (
             [(header::CONTENT_TYPE, "application/octet-stream"), (header::CACHE_CONTROL, "no-store")],
             axum::body::Body::from_stream(metered(axum::body::Body::from(bytes).into_data_stream(), permit)),
-        ).into_response(),
+        )
+            .into_response(),
         Ok(Err(e)) => (StatusCode::BAD_GATEWAY, format!("agent download refused: {e}")).into_response(),
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "agent download timed out").into_response(),
     }
@@ -898,6 +911,22 @@ mod tests {
         // the row.
         app.db.set("github_proxy", "").unwrap();
         assert_eq!(release_url(&app, "x86_64"), direct);
+    }
+
+    #[tokio::test]
+    async fn a_proxy_cannot_replace_the_agent_installed_as_root() {
+        let app = app("");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(|| async { "tampered agent binary" }))
+                .await
+                .unwrap();
+        });
+        app.db.set("github_proxy", &format!("http://{address}")).unwrap();
+        let error = verified_agent(&app, "x86_64").await.unwrap_err();
+        assert!(error.to_string().contains("SHA-256"));
+        server.abort();
     }
 
     #[test]
