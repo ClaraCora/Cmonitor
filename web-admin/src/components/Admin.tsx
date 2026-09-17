@@ -562,7 +562,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
 type TerminalState = "connecting" | "online" | "closed" | "error"
 
 function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) {
-  const container = useRef<HTMLDivElement>(null)
+  const [container, setContainer] = useState<HTMLDivElement | null>(null)
   const socket = useRef<WebSocket | null>(null)
   const [state, setState] = useState<TerminalState>("connecting")
   const [message, setMessage] = useState("正在连接 Hub…")
@@ -576,11 +576,9 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
       setMessage(text)
     }
     const detail = (error: unknown) => error instanceof Error && error.message ? `：${error.message}` : ""
-    const host = container.current
-    if (!host) {
-      updateState("error", "终端界面初始化失败：找不到显示区域")
-      return
-    }
+    const host = container
+    if (!host) return
+    updateState("connecting", "正在连接 Hub…")
 
     const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/terminal/ws`
     let ws: WebSocket
@@ -699,7 +697,7 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
       socket.current = null
       terminal.dispose()
     }
-  }, [node.id])
+  }, [node.id, container])
 
   const status = {
     connecting: "连接中",
@@ -720,7 +718,7 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
           <span className="truncate" title={message}>{message}</span>
         </div>
         <div className="terminal-surface overflow-hidden rounded-md border bg-[#0d1117] p-2 shadow-xs">
-          <div ref={container} className="h-[min(65vh,520px)] min-h-64 w-full" />
+          <div ref={setContainer} className="h-[min(65vh,520px)] min-h-64 w-full" />
         </div>
         <DialogFooter className="pt-1">
           <Button variant="ghost" onClick={onClose}>关闭</Button>
