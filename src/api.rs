@@ -1477,7 +1477,8 @@ pub async fn save_settings(
             return bad(&message);
         }
     }
-    let password_hash = match map.get("admin_password").and_then(Value::as_str).map(hash_password).transpose() {
+    let password_hash = match map.get("admin_password").and_then(Value::as_str).map(hash_password).transpose()
+    {
         Ok(hash) => hash,
         Err(e) => return fail(e),
     };
@@ -1485,7 +1486,10 @@ pub async fn save_settings(
     let replacement_hash = replacement.as_ref().map(|token| crate::auth::sha256(token));
     let actor = current_session(&headers);
     if let Err(e) = app.db.save_settings_atomic(
-        map, password_hash.as_deref(), &app.site, actor.as_deref(),
+        map,
+        password_hash.as_deref(),
+        &app.site,
+        actor.as_deref(),
         replacement_hash.as_deref().map(|hash| (hash, crate::auth::session_expiry())),
     ) {
         return bad(&e.to_string());
@@ -1493,8 +1497,11 @@ pub async fn save_settings(
     app.terminals.revoke_invalid(&app.db);
     let active = replacement_hash.as_ref().or(actor.as_ref());
     let reauth = active.is_some_and(|hash| !app.db.session_valid(hash));
-    let cookie = replacement.as_ref().filter(|_| !reauth)
-        .map(|token| crate::auth::session_cookie(&app, &headers, token)).unwrap_or_default();
+    let cookie = replacement
+        .as_ref()
+        .filter(|_| !reauth)
+        .map(|token| crate::auth::session_cookie(&app, &headers, token))
+        .unwrap_or_default();
     with_cookies(Json(json!({"ok": true, "reauth_required": reauth})), [cookie])
 }
 

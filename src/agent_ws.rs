@@ -257,7 +257,11 @@ async fn serve(app: Shared, node_id: i64, ip: String, token: String, mut socket:
     outcome
 }
 
-async fn send_frame(socket: &mut WebSocket, frame: Message, cancelled: &mut watch::Receiver<bool>) -> Result<()> {
+async fn send_frame(
+    socket: &mut WebSocket,
+    frame: Message,
+    cancelled: &mut watch::Receiver<bool>,
+) -> Result<()> {
     anyhow::ensure!(!*cancelled.borrow(), "agent connection revoked");
     tokio::select! {
         biased;

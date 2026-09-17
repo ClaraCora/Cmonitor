@@ -7,10 +7,10 @@
 mod agent_ws;
 mod api;
 mod auth;
-mod security;
 mod db;
 mod frontend;
 mod notify;
+mod security;
 mod terminal;
 
 use std::collections::HashMap;
@@ -323,7 +323,14 @@ fn parse_args() -> Result<Args> {
     let themes = themes.unwrap_or_else(|| {
         std::path::Path::new(&database).parent().unwrap_or_else(|| std::path::Path::new(".")).join("themes")
     });
-    Ok(Args { listen, listen_defaulted, database, reset_password, site: site.trim_end_matches('/').to_owned(), themes })
+    Ok(Args {
+        listen,
+        listen_defaulted,
+        database,
+        reset_password,
+        site: site.trim_end_matches('/').to_owned(),
+        themes,
+    })
 }
 
 #[tokio::main]
@@ -337,7 +344,10 @@ async fn main() -> Result<()> {
 
     let args = parse_args()?;
     if args.reset_password {
-        anyhow::ensure!(std::path::Path::new(&args.database).is_file(), "数据库不存在；请用 --db 指定 Hub 的现有数据库");
+        anyhow::ensure!(
+            std::path::Path::new(&args.database).is_file(),
+            "数据库不存在；请用 --db 指定 Hub 的现有数据库"
+        );
         let db = Db::open(&args.database)?;
         let password = auth::random_token()[..24].to_owned();
         db.recover_password(&auth::hash_password(&password)?)?;

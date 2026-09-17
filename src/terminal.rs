@@ -17,8 +17,8 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::auth::{authed, current_session, random_token};
-use crate::{App, Shared};
 use crate::db::Db;
+use crate::{App, Shared};
 
 const TERMINAL_IDLE_CHECK: Duration = Duration::from_secs(5);
 const TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,7 +41,14 @@ struct Entry {
 }
 
 impl Registry {
-    fn insert(&self, id: String, node_id: i64, agent_session: u64, admin_session: String, browser: mpsc::Sender<String>) -> Option<watch::Receiver<bool>> {
+    fn insert(
+        &self,
+        id: String,
+        node_id: i64,
+        agent_session: u64,
+        admin_session: String,
+        browser: mpsc::Sender<String>,
+    ) -> Option<watch::Receiver<bool>> {
         let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if entries.len() >= 32 || entries.values().filter(|e| e.node_id == node_id).count() >= 4 {
             return None;
@@ -52,7 +59,10 @@ impl Registry {
     }
 
     pub fn revoke_invalid(&self, db: &Db) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, entry| db.session_valid(&entry.admin_session));
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, entry| db.session_valid(&entry.admin_session));
     }
 
     pub fn disconnect_all(&self) {
@@ -66,7 +76,10 @@ impl Registry {
     fn route(&self, id: &str, node_id: i64, agent_session: u64, message: &str) -> bool {
         let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = entries.get(id) else { return false };
-        if entry.node_id != node_id || entry.agent_session != agent_session || entry.browser.try_send(message.to_owned()).is_ok() {
+        if entry.node_id != node_id
+            || entry.agent_session != agent_session
+            || entry.browser.try_send(message.to_owned()).is_ok()
+        {
             return false;
         }
         // A terminal that stops reading must not retain an agent process or a
@@ -89,7 +102,9 @@ impl Registry {
 }
 
 impl Drop for Entry {
-    fn drop(&mut self) { self.cancel.send_replace(true); }
+    fn drop(&mut self) {
+        self.cancel.send_replace(true);
+    }
 }
 
 struct Lease {
@@ -153,8 +168,13 @@ pub async fn handler(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
 }
 
 async fn run(app: Shared, mut socket: WebSocket, session: String) {
-    let Ok(Some(Ok(Message::Text(first)))) = tokio::time::timeout(TERMINAL_OPEN_TIMEOUT, socket.recv()).await else { return };
-    if !authed_hash(&app, &session) { return; }
+    let Ok(Some(Ok(Message::Text(first)))) = tokio::time::timeout(TERMINAL_OPEN_TIMEOUT, socket.recv()).await
+    else {
+        return;
+    };
+    if !authed_hash(&app, &session) {
+        return;
+    }
     let Ok(ClientMessage::Connect { node_id, cols, rows }) = serde_json::from_str(first.as_str()) else {
         send_error(&mut socket, "终端必须先选择一个节点").await;
         return;
@@ -165,7 +185,11 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
     }
     info!("opening terminal on node {node_id}");
 
-    let connection = app.agents.read().unwrap_or_else(|e| e.into_inner()).get(&node_id)
+    let connection = app
+        .agents
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&node_id)
         .map(|a| (a.tx.clone(), a.session, a.cancel.clone(), a.cancel.subscribe()));
     let Some((agent, agent_session, cancel_agent, mut agent_cancelled)) = connection else {
         send_error(&mut socket, "节点当前不在线").await;
@@ -173,12 +197,16 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
     };
     let terminal_id = random_token();
     let (browser_tx, mut browser_rx) = mpsc::channel(128);
-    let Some(mut cancelled) = app.terminals.insert(terminal_id.clone(), node_id, agent_session, session.clone(), browser_tx) else {
+    let Some(mut cancelled) =
+        app.terminals.insert(terminal_id.clone(), node_id, agent_session, session.clone(), browser_tx)
+    else {
         send_error(&mut socket, "终端数量已达上限：每节点 4 个，Hub 共 32 个").await;
         return;
     };
     let lease = Lease { app: app.clone(), id: terminal_id.clone(), agent, cancel_agent };
-    if *agent_cancelled.borrow() || !authed_hash(&app, &session) { return; }
+    if *agent_cancelled.borrow() || !authed_hash(&app, &session) {
+        return;
+    }
     let open = rpc("terminal.open", json!({"terminal_id": terminal_id, "cols": cols, "rows": rows}));
     if lease.agent.try_send(open).is_err() {
         send_error(&mut socket, "节点连接繁忙，请稍后重试").await;
@@ -270,7 +298,8 @@ fn event_type(message: &str) -> Option<String> {
 }
 
 async fn send_error(socket: &mut WebSocket, message: &str) {
-    let _ = send(socket, Message::Text(json!({"type": "error", "message": message}).to_string().into())).await;
+    let _ =
+        send(socket, Message::Text(json!({"type": "error", "message": message}).to_string().into())).await;
 }
 
 async fn send(socket: &mut WebSocket, message: Message) -> bool {
@@ -280,7 +309,12 @@ async fn send(socket: &mut WebSocket, message: Message) -> bool {
 /// Routes an agent's terminal notification to the browser that opened it.
 pub fn from_agent(app: &App, node_id: i64, agent_session: u64, text: &str) {
     let Ok(frame) = serde_json::from_str::<Value>(text) else { return };
-    if !matches!(frame.get("method").and_then(Value::as_str), Some("terminal.ready" | "terminal.output" | "terminal.error" | "terminal.exit")) { return; }
+    if !matches!(
+        frame.get("method").and_then(Value::as_str),
+        Some("terminal.ready" | "terminal.output" | "terminal.error" | "terminal.exit")
+    ) {
+        return;
+    }
     let Some(id) = frame.get("params").and_then(|p| p.get("terminal_id")).and_then(Value::as_str) else {
         return;
     };

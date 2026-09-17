@@ -171,12 +171,18 @@ pub fn same_origin(app: &App, headers: &HeaderMap, websocket: bool) -> bool {
         let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else { return false };
         let scheme = if app.secure_cookies(headers) { "https" } else { "http" };
         format!("{scheme}://{host}")
-    } else { app.site.clone() };
+    } else {
+        app.site.clone()
+    };
     let Ok(expected) = reqwest::Url::parse(&expected) else { return false };
     match headers.get(header::ORIGIN).and_then(|h| h.to_str().ok()) {
         Some(origin) => reqwest::Url::parse(origin).is_ok_and(|url| {
-            matches!(url.scheme(), "http" | "https") && url.username().is_empty() && url.password().is_none()
-                && url.path() == "/" && url.query().is_none() && url.fragment().is_none()
+            matches!(url.scheme(), "http" | "https")
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
                 && url.origin() == expected.origin()
         }),
         None => !websocket && headers.get("sec-fetch-site").is_some_and(|v| v == "same-origin"),
@@ -184,12 +190,21 @@ pub fn same_origin(app: &App, headers: &HeaderMap, websocket: bool) -> bool {
 }
 
 pub async fn browser_guard(
-    State(app): State<crate::Shared>, request: axum::extract::Request, next: axum::middleware::Next,
+    State(app): State<crate::Shared>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
 ) -> Response {
     let path = request.uri().path();
-    let writes = !matches!(*request.method(), axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS);
+    let writes = !matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
     // Agent registration uses a Bearer credential, never a browser cookie.
-    if writes && path.starts_with("/api/") && path != "/api/agent/register" && !same_origin(&app, request.headers(), false) {
+    if writes
+        && path.starts_with("/api/")
+        && path != "/api/agent/register"
+        && !same_origin(&app, request.headers(), false)
+    {
         return (StatusCode::FORBIDDEN, "请求来源不匹配，请从 Hub 后台重试").into_response();
     }
     next.run(request).await
@@ -314,7 +329,8 @@ pub async fn github_callback(
         Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
     };
     let token = random_token();
-    if let Err(e) = app.db.github_session(&sha256(&token), session_expiry(), &user, &config.stamp, &app.site) {
+    if let Err(e) = app.db.github_session(&sha256(&token), session_expiry(), &user, &config.stamp, &app.site)
+    {
         return sign_in_failed(&app, &headers, &e.to_string());
     }
     let session = session_cookie(&app, &headers, &token);
@@ -485,7 +501,13 @@ mod tests {
     fn browser_origins_are_exact_and_a_missing_websocket_origin_is_refused() {
         let mut app = App::for_test(crate::db::Db::open(":memory:").unwrap());
         app.site = "https://hub.example.com".into();
-        for origin in ["https://evil.example.com", "https://hub.example.com.evil.test", "http://hub.example.com", "https://hub.example.com:8443", "null"] {
+        for origin in [
+            "https://evil.example.com",
+            "https://hub.example.com.evil.test",
+            "http://hub.example.com",
+            "https://hub.example.com:8443",
+            "null",
+        ] {
             let headers = HeaderMap::from_iter([(header::ORIGIN, origin.parse().unwrap())]);
             assert!(!same_origin(&app, &headers, true), "{origin}");
             assert!(!same_origin(&app, &headers, false), "{origin}");

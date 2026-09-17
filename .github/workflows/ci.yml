@@ -45,6 +45,17 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+      - uses: actions/checkout@v7
+        with:
+          repository: ClaraCora/Cagent
+          ref: 1ebb802993f813b653bf6d003d7e2f0e64445bbc
+          path: .ci-agent
+          persist-credentials: false
+      - name: Build security regression binaries
+        run: cargo build --locked && cargo build --locked --manifest-path .ci-agent/Cargo.toml
+      - name: Real Hub and root Agent security regression
+        run: sudo python3 scripts/security-smoke.py target/debug/monitor-hub .ci-agent/target/debug/monitor-agent
+
       - name: Export formatting corrections
         if: failure()
         run: cargo fmt --all && git diff > formatting.patch
