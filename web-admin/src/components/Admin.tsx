@@ -600,9 +600,9 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
 
     const initialize = () => {
       const terminal = new XTerm({
-        cursorBlink: true,
-        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-        fontSize: 13,
+      cursorBlink: true,
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+      fontSize: 15,
         scrollback: 5000,
         theme: { background: "#0d1117", foreground: "#e6edf3", cursor: "#58a6ff" },
       })
@@ -708,7 +708,10 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="w-[calc(100%-1rem)] max-w-5xl gap-3 p-3 sm:p-4">
+      <DialogContent
+        onOpenAutoFocus={(e) => e.preventDefault()}
+        className="grid h-[calc(100dvh_-_1rem)] w-[calc(100vw_-_1rem)] max-h-[calc(100dvh_-_1rem)] max-w-none grid-rows-[auto_auto_minmax(0,1fr)_auto] gap-3 overflow-hidden p-3 sm:h-[calc(100dvh_-_2rem)] sm:max-h-[calc(100dvh_-_2rem)] sm:max-w-7xl sm:p-4 2xl:max-w-[96rem]"
+      >
         <DialogHeader className="px-1">
           <DialogTitle className="flex items-center gap-2"><TerminalIcon className="size-4" />{node.name} · Web Terminal</DialogTitle>
           <DialogDescription>终端命令在目标节点的 agent 服务账户下执行。</DialogDescription>
@@ -717,8 +720,8 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
           <span className="flex items-center gap-2"><span className={`size-2 rounded-full ${state === "online" ? "bg-ok" : state === "error" ? "bg-destructive" : "bg-muted-foreground"}`} />{status}</span>
           <span className="truncate" title={message}>{message}</span>
         </div>
-        <div className="terminal-surface overflow-hidden rounded-md border bg-[#0d1117] p-2 shadow-xs">
-          <div ref={setContainer} className="h-[min(65vh,520px)] min-h-64 w-full" />
+        <div className="terminal-surface min-h-0 overflow-hidden rounded-md border bg-[#0d1117] p-2 shadow-xs">
+          <div ref={setContainer} className="h-full min-h-0 w-full" />
         </div>
         <DialogFooter className="pt-1">
           <Button variant="ghost" onClick={onClose}>关闭</Button>
