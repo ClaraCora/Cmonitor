@@ -74,6 +74,18 @@ export function changes<T extends object>(initial: T, values: Partial<T>): Parti
 
 export const GIB = 1024 ** 3
 
+/** Web Terminal was added to Cagent 1.1.0. */
+export function supportsTerminal(version: string): boolean {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version.trim())
+  if (!match) return false
+  const current = match.slice(1, 4).map(Number)
+  const minimum = [1, 1, 0]
+  for (let i = 0; i < minimum.length; i += 1) {
+    if (current[i] !== minimum[i]) return current[i] > minimum[i]
+  }
+  return true
+}
+
 /**
  * The traffic fields as a `TrafficPatch`: GB entered by hand, bytes on the wire,
  * and only the counters actually given a value.

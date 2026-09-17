@@ -15,7 +15,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { addresses, api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask } from "@/lib/api"
+import { addresses, api, changes, GIB, provisioningSite, supportsTerminal, trafficCorrection, upload, type Node, type PingTask } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -565,7 +565,7 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
   const container = useRef<HTMLDivElement>(null)
   const socket = useRef<WebSocket | null>(null)
   const [state, setState] = useState<TerminalState>("connecting")
-  const [message, setMessage] = useState("正在连接节点…")
+  const [message, setMessage] = useState("正在连接 Hub…")
 
   useEffect(() => {
     const host = container.current
@@ -592,6 +592,12 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
       setState(next)
       setMessage(text)
     }
+    const connectTimer = window.setTimeout(() => {
+      if (!disposed && ws.readyState !== WebSocket.OPEN) {
+        updateState("error", "无法连接 Hub 的终端通道，请检查反向代理的 WebSocket 配置")
+        ws.close()
+      }
+    }, 10_000)
 
     const resize = () => {
       if (disposed || !host.clientWidth || !host.clientHeight) return
@@ -611,6 +617,7 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
     })
 
     ws.onopen = () => {
+      window.clearTimeout(connectTimer)
       fit.fit()
       ws.send(JSON.stringify({ type: "connect", node_id: node.id, cols: terminal.cols, rows: terminal.rows }))
       if (!disposed) {
@@ -639,11 +646,13 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
       }
     }
     ws.onerror = () => {
-      if (!disposed) {
+      window.clearTimeout(connectTimer)
+      if (!disposed && currentState !== "error") {
         updateState("error", "终端连接失败，请确认节点在线")
       }
     }
     ws.onclose = () => {
+      window.clearTimeout(connectTimer)
       if (!disposed) {
         if (currentState !== "error" && currentState !== "closed") updateState("closed", "连接已关闭")
       }
@@ -651,6 +660,7 @@ function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) 
 
     return () => {
       disposed = true
+      window.clearTimeout(connectTimer)
       observer.disconnect()
       data.dispose()
       resized.dispose()
@@ -854,6 +864,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                     {n.online ? "在线" : "离线"}
                   </Badge>
                   {!n.public && <Badge variant="outline" className="ml-1 font-normal">不公开</Badge>}
+                  {n.agent_version && <div className="tnum mt-1 text-xs text-muted-foreground">Cagent {n.agent_version}</div>}
                   {/* Under the badge, not inside it: the column is a tenth of
                       the table and the three do not share one line. */}
                   {!n.online && n.last_seen > 0 && Date.now() / 1000 - n.last_seen >= 60 && (
@@ -875,7 +886,14 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 </TableCell>
                 <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
-                  <Button variant="ghost" size="icon" disabled={!n.online} onClick={() => setTerminal(n)} title={n.online ? "打开 Web Terminal" : "节点离线"} aria-label={n.online ? "打开 Web Terminal" : "节点离线"}>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    disabled={!n.online || !supportsTerminal(n.agent_version)}
+                    onClick={() => setTerminal(n)}
+                    title={!n.online ? "节点离线" : supportsTerminal(n.agent_version) ? "打开 Web Terminal" : "请升级 Cagent 至 1.1.0 或更高版本"}
+                    aria-label={!n.online ? "节点离线" : supportsTerminal(n.agent_version) ? "打开 Web Terminal" : "请升级 Cagent 至 1.1.0 或更高版本"}
+                  >
                     <TerminalIcon />
                   </Button>
                   <Button variant="ghost" size="icon" disabled={!canProvision} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">

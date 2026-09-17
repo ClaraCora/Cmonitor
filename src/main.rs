@@ -244,7 +244,7 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
         // a few hundred parallel requests within reach of the unit file's memory
         // ceiling. Passing the bytes through costs one buffer per request.
         Ok(res) if res.status().is_success() => (
-            [(header::CONTENT_TYPE, "application/octet-stream")],
+            [(header::CONTENT_TYPE, "application/octet-stream"), (header::CACHE_CONTROL, "no-store")],
             axum::body::Body::from_stream(metered(Box::pin(res.bytes_stream()), permit)),
         )
             .into_response(),

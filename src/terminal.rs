@@ -19,6 +19,7 @@ use crate::auth::{authed, current_session, random_token};
 use crate::{App, Shared};
 
 const TERMINAL_IDLE_CHECK: Duration = Duration::from_secs(5);
+const TERMINAL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TERMINAL_ID: usize = 128;
 // JSON escaping can expand one byte to six; stay inside the agent's 64 KiB
 // WebSocket frame limit even for a chunk made entirely of control bytes.
@@ -135,6 +136,9 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
     }
 
     let mut check = tokio::time::interval(TERMINAL_IDLE_CHECK);
+    let open_timeout = tokio::time::sleep(TERMINAL_OPEN_TIMEOUT);
+    tokio::pin!(open_timeout);
+    let mut ready = false;
     loop {
         tokio::select! {
             incoming = socket.recv() => match incoming {
@@ -156,6 +160,9 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
             message = browser_rx.recv() => match message {
                 Some(message) => {
                     let terminal_event = event_type(&message);
+                    if terminal_event.as_deref() == Some("terminal.ready") {
+                        ready = true;
+                    }
                     if socket.send(Message::Text(message.into())).await.is_err() { break }
                     if matches!(terminal_event.as_deref(), Some("terminal.exit" | "terminal.error")) {
                         break;
@@ -165,6 +172,10 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
             },
             _ = check.tick() => {
                 if !authed_hash(&app, &session) { break }
+            }
+            _ = &mut open_timeout, if !ready => {
+                send_error(&mut socket, "Cagent 未响应终端请求，请检查 Agent 与 Hub 的 WebSocket 连接").await;
+                break;
             }
         }
     }
