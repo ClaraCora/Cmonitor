@@ -130,7 +130,11 @@ TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
 echo "downloading monitor-agent ($ARCH)"
-curl -fsSL "$URL" -o "$TMP"
+command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum is required (install coreutils)" >&2; exit 1; }
+curl -fsSL --max-time 180 "$URL" -o "$TMP"
+WANT=$(curl -fsSL --max-time 30 "$URL/sha256")
+GOT=$(sha256sum "$TMP" | cut -d ' ' -f1)
+[ "$GOT" = "$WANT" ] || { echo "Agent SHA-256 mismatch; installation refused" >&2; exit 1; }
 
 # Downloaded before the registration below, because that step spends a node: the
 # key returns a token and the panel gains a row, while the env file recording it

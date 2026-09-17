@@ -122,6 +122,16 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 /// implies a fork, which rebuilds this line anyway.
 const AGENT_REPO: &str = "ClaraCora/Cagent";
 
+#[derive(serde::Deserialize)]
+struct AgentPin {
+    tag: String,
+    sha256: HashMap<String, String>,
+}
+
+fn agent_pin() -> AgentPin {
+    serde_json::from_str(include_str!("../agent.pin")).expect("valid bundled agent pin")
+}
+
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {
     ([(header::CONTENT_TYPE, "text/x-shellscript")], include_str!("../install.sh")).into_response()
@@ -136,10 +146,11 @@ async fn install_script() -> Response {
 /// path. It remains within the bounds `agent_binary` already enforces: four
 /// concurrent transfers, a 120-second timeout, and a streamed body.
 fn release_url(app: &App, arch: &str) -> String {
+    let tag = agent_pin().tag;
     proxied(
         app,
         format!(
-            "https://github.com/{AGENT_REPO}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl"
+            "https://github.com/{AGENT_REPO}/releases/download/{tag}/monitor-agent-{arch}-unknown-linux-musl"
         ),
     )
 }
@@ -216,20 +227,31 @@ impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
     }
 }
 
-/// Serves the agent binary from the hub itself, so a node that can reach the hub
-/// can install without reaching GitHub: IPv6-only machines cannot resolve
-/// github.com, and neither can blocked networks.
-///
-/// ponytail: these bytes are relayed unverified, and `install.sh` executes them
-/// as root on every node. Fetched directly from github.com that is TLS's
-/// concern; through the panel's `github_proxy` it rests on the mirror alone.
-/// Currently held by the setting accepting https:// only, and by stating so
-/// where it is entered. The upgrade path is a pinned digest -- `agent.pin`
-/// beside `web-theme.pin`, a fixed release tag, hashed after the fetch and
-/// before the relay (4 permits x 1.73 MiB against MemoryMax=256M, so buffering
-/// is free). Not a fetched checksum: whoever can replace the binary can replace
-/// that too. Deliberately deferred, as it couples agent releases to hub
-/// releases.
+/// The digest is bundled in this Hub release, independently of any download
+/// proxy. Buffer under a hard limit and verify before exposing a single byte.
+async fn verified_agent(app: &App, arch: &str) -> Result<Vec<u8>> {
+    use sha2::Digest;
+    let pin = agent_pin();
+    let expected = pin.sha256.get(arch).ok_or_else(|| anyhow::anyhow!("unknown architecture"))?;
+    let mut response = app.http.get(release_url(app, arch)).timeout(std::time::Duration::from_secs(120)).send().await?.error_for_status()?;
+    const MAX_BINARY: usize = 16 * 1024 * 1024;
+    anyhow::ensure!(response.content_length().is_none_or(|size| size <= MAX_BINARY as u64), "agent binary exceeds size limit");
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(bytes.len() + chunk.len() <= MAX_BINARY, "agent binary exceeds size limit");
+        bytes.extend_from_slice(&chunk);
+    }
+    anyhow::ensure!(hex::encode(sha2::Sha256::digest(&bytes)) == *expected, "Agent SHA-256 校验失败，已拒绝下载；请检查 GitHub 下载代理");
+    Ok(bytes)
+}
+
+async fn agent_checksum(Path(arch): Path<String>) -> Response {
+    match agent_pin().sha256.get(&arch) {
+        Some(hash) => ([(header::CONTENT_TYPE, "text/plain")], hash.clone()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
         return (StatusCode::NOT_FOUND, "unknown architecture").into_response();
@@ -237,22 +259,13 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
     let Ok(permit) = RELAY_GATE.try_acquire() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again").into_response();
     };
-    let url = release_url(&app, &arch);
-    // The default client timeout is sized for API calls, not a 1.8 MB download.
-    let fetched = app.http.get(&url).timeout(std::time::Duration::from_secs(120)).send().await;
-    match fetched {
-        // Streamed rather than collected: holding each release in full would put
-        // a few hundred parallel requests within reach of the unit file's memory
-        // ceiling. Passing the bytes through costs one buffer per request.
-        Ok(res) if res.status().is_success() => (
+    match tokio::time::timeout(std::time::Duration::from_secs(120), verified_agent(&app, &arch)).await {
+        Ok(Ok(bytes)) => (
             [(header::CONTENT_TYPE, "application/octet-stream"), (header::CACHE_CONTROL, "no-store")],
-            axum::body::Body::from_stream(metered(Box::pin(res.bytes_stream()), permit)),
-        )
-            .into_response(),
-        Ok(res) => {
-            (StatusCode::BAD_GATEWAY, format!("release download failed: {}", res.status())).into_response()
-        }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("release download failed: {e}")).into_response(),
+            axum::body::Body::from_stream(metered(axum::body::Body::from(bytes).into_data_stream(), permit)),
+        ).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, format!("agent download refused: {e}")).into_response(),
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "agent download timed out").into_response(),
     }
 }
 
@@ -410,6 +423,7 @@ async fn main() -> Result<()> {
         .route("/api/agent/register", post(api::agent_register))
         .route("/install.sh", get(install_script))
         .route("/agent/{arch}", get(agent_binary))
+        .route("/agent/{arch}/sha256", get(agent_checksum))
         // Read paths; the public page reaches these unauthenticated.
         .route("/api/me", get(api::me))
         .route("/api/nodes", get(api::nodes))

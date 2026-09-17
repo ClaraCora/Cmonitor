@@ -51,8 +51,11 @@ jobs:
           ref: 1ebb802993f813b653bf6d003d7e2f0e64445bbc
           path: .ci-agent
           persist-credentials: false
-      - name: Build security regression binaries
-        run: cargo build --locked && cargo build --locked --manifest-path .ci-agent/Cargo.toml
+      - name: Build Hub regression binary
+        run: cargo build --locked
+      - name: Build Agent regression binary
+        working-directory: .ci-agent
+        run: cargo build --locked
       - name: Real Hub and root Agent security regression
         run: sudo python3 scripts/security-smoke.py target/debug/monitor-hub .ci-agent/target/debug/monitor-agent
 
