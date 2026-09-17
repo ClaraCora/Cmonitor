@@ -2055,13 +2055,7 @@ mod tests {
             json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0,
                    "hostname": "db-prod-01", "ip": "203.0.113.7"}),
         );
-        app.agents
-            .write()
-            .unwrap()
-            .get_mut(&open)
-            .unwrap()
-            .pings
-            .insert(probe, (7, 1_700_000_000));
+        app.agents.write().unwrap().get_mut(&open).unwrap().pings.insert(probe, (7, 1_700_000_000));
 
         let public = visible_nodes(&app, false).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");

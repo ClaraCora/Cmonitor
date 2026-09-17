@@ -2163,8 +2163,7 @@ mod tests {
     #[test]
     fn schema_five_gains_the_public_tags_column() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE node (id INTEGER PRIMARY KEY); PRAGMA user_version = 5;")
-            .unwrap();
+        conn.execute_batch("CREATE TABLE node (id INTEGER PRIMARY KEY); PRAGMA user_version = 5;").unwrap();
 
         migrate(&conn, 5).unwrap();
 
