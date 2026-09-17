@@ -162,7 +162,7 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
                     if matches!(terminal_event, Some("terminal.exit" | "terminal.error")) { break Ok(()) }
                 }
                 None => break Ok(()),
-            }
+            },
             _ = check.tick() => {
                 if !authed_hash(&app, &session) { break Ok(()) }
             }
