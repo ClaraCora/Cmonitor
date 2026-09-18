@@ -589,7 +589,9 @@ pub async fn visitor(
 ) -> Response {
     let ip = client_ip(&headers, peer.ip());
     let ip = match ip {
-        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(std::net::IpAddr::V6(v6)),
+        std::net::IpAddr::V6(v6) => {
+            v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(std::net::IpAddr::V6(v6))
+        }
         v4 => v4,
     };
     // Private space has no public answer, and asking for one would describe
@@ -2785,9 +2787,7 @@ mod tests {
         for ip in ["127.0.0.1", "10.0.0.8", "192.168.1.1"] {
             let peer: std::net::SocketAddr = format!("{ip}:4000").parse().unwrap();
             let body = axum::body::to_bytes(
-                visitor(State(app.clone()), ConnectInfo(peer), HeaderMap::new())
-                    .await
-                    .into_body(),
+                visitor(State(app.clone()), ConnectInfo(peer), HeaderMap::new()).await.into_body(),
                 usize::MAX,
             )
             .await
