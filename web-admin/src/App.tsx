@@ -111,7 +111,8 @@ export default function App() {
         <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-3 px-4 py-3">
           {/* The site name is the way back to the status page, as in the
               theme's own header. */}
-          <a href="/" className="font-semibold transition-opacity hover:opacity-70">
+          <a href="/" className="flex items-center gap-2 font-semibold transition-opacity hover:opacity-70">
+            <img src={`${import.meta.env.BASE_URL}favicon.svg`} alt="" className="size-5 rounded-md" />
             {me.site_name || "Monitor"}
           </a>
           <span className="text-xs text-muted-foreground">后台{me.hub_version && <span className="ml-2 whitespace-nowrap font-mono">Hub v{me.hub_version}</span>}</span>
