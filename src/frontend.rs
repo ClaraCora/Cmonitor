@@ -68,6 +68,13 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
         );
     }
 
+    // A closed status page has no public face: anonymous visitors are sent to
+    // the panel's sign-in rather than handed a shell whose first fetch fails.
+    // Signed-in operators still get the theme.
+    if !app.public_page() && !crate::auth::authed(&app, &headers) {
+        return axum::response::Redirect::to("/clara").into_response();
+    }
+
     let theme = app.db.get("theme").unwrap_or_default();
     if let Some(root) = external_theme(&app.themes, &theme) {
         if let Some(response) = disk(&root, path, known) {

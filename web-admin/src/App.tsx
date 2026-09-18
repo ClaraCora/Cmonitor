@@ -108,7 +108,7 @@ export default function App() {
   return (
     <div className="min-h-svh">
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
-        <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-3 px-4 py-3">
+        <div className="mx-auto flex max-w-[1600px] flex-wrap items-center gap-3 px-4 py-3">
           {/* The site name is the way back to the status page, as in the
               theme's own header. */}
           <a href="/" className="flex items-center gap-2 font-semibold transition-opacity hover:opacity-70">
@@ -132,7 +132,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-7xl space-y-5 px-4 py-6">
+      <main className="mx-auto max-w-[1600px] space-y-5 px-4 py-6">
         {error && <p className="text-sm text-destructive">{error}</p>}
         {!nodes ? (
           <Skeleton className="h-64" />

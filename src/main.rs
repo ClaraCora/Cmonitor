@@ -759,6 +759,25 @@ mod tests {
     }
 
     /// A build writes hashed filenames under `assets/`, so a miss there means a
+    /// With the status page closed, its shell stops being served to anonymous
+    /// callers at all: every theme path redirects to the panel, which is the
+    /// only page left that can sign them in.
+    #[tokio::test]
+    async fn a_closed_status_page_redirects_anonymous_visitors_to_the_panel() {
+        let app = Arc::new(app("http://localhost:8080"));
+        app.db.set("public_page", "off").unwrap();
+        let spa = |p: &str| frontend::serve(State(app.clone()), HeaderMap::new(), p.parse::<Uri>().unwrap());
+
+        for path in ["/", "/node/3"] {
+            let response = spa(path).await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path} must redirect");
+            assert_eq!(response.headers()["location"], "/clara");
+        }
+        assert_eq!(spa("/clara").await.status(), StatusCode::OK, "the panel itself stays reachable");
+        assert_eq!(spa("/api/nope").await.status(), StatusCode::NOT_FOUND, "unknown APIs still 404");
+    }
+
+    /// A build writes hashed filenames under `assets/`, so a miss there means a
     /// tab left open across a deploy. Answering with index.html would hand a
     /// script tag HTML, failing on MIME type long after the request that caused
     /// it. Both bundles share the same fallback, so both must refuse.

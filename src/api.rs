@@ -551,6 +551,10 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     Json(json!({
         "authed": authenticated,
         "hub_version": authenticated.then_some(env!("CARGO_PKG_VERSION")),
+        // Where the panel lives, told only to callers already inside it: the
+        // status page's public bundle may not carry the path, so it cannot be
+        // a constant there.
+        "admin_url": authenticated.then_some("/clara/"),
         "password_login": config.as_ref().is_some_and(|c| c.password_enabled),
         "github": config.as_ref().is_some_and(|c| c.github_ready()),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
