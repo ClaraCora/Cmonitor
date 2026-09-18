@@ -607,7 +607,7 @@ fn first_run(app: &App, url: &str) -> Result<()> {
     app.db.set("admin_password_hash", &auth::hash_password(&password)?)?;
     println!(
         "\n  Monitor hub is ready.\n\n  \
-         Sign in at {url}/admin\n  \
+         Sign in at {url}/clara\n  \
          Emergency password: {password}\n\n  \
          This is shown once. Change it, and set up GitHub sign-in, under Security.\n"
     );
@@ -752,7 +752,7 @@ mod tests {
         assert_eq!(spa("/api").await.status(), StatusCode::NOT_FOUND);
 
         // Client-side routes still fall through to the app.
-        assert_eq!(spa("/admin").await.status(), StatusCode::OK);
+        assert_eq!(spa("/clara").await.status(), StatusCode::OK);
         assert_eq!(spa("/").await.status(), StatusCode::OK);
         // A path merely beginning with "api" is not an API path.
         assert_eq!(spa("/apiary").await.status(), StatusCode::OK);
@@ -768,7 +768,7 @@ mod tests {
         let spa = |p: &str| frontend::serve(State(app.clone()), HeaderMap::new(), p.parse::<Uri>().unwrap());
 
         assert_eq!(spa("/assets/index-STALE.js").await.status(), StatusCode::NOT_FOUND);
-        assert_eq!(spa("/admin/assets/index-STALE.js").await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(spa("/clara/assets/index-STALE.js").await.status(), StatusCode::NOT_FOUND);
 
         // A route merely beginning with those letters is still a route.
         assert_eq!(spa("/assetsomething").await.status(), StatusCode::OK);

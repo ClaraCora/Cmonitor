@@ -109,16 +109,16 @@
      whose content exceeds the fold widens the page. */
   html { scrollbar-gutter: stable; }
   body { @apply bg-background text-foreground; }
-  /* The same wallpapers the status page sits on, under this app's /admin/
+  /* The same wallpapers the status page sits on, under this app's /clara/
      base rather than the theme's root. */
   body {
-    background-image: url("/admin/wallpaper-day.svg");
+    background-image: url("/clara/wallpaper-day.svg");
     background-size: cover;
     background-position: center;
     background-attachment: fixed;
   }
   .dark body {
-    background-image: url("/admin/wallpaper-night.svg");
+    background-image: url("/clara/wallpaper-night.svg");
   }
   /* Tailwind v4 leaves `button` and `input` on the browser's default cursor,
      where v3 made buttons a pointer. Radix renders Switch as a button, so without

@@ -57,8 +57,10 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
         return (StatusCode::NOT_FOUND, format!("no such endpoint: /{path}")).into_response();
     }
 
-    if path == "admin" || path.starts_with("admin/") {
-        let path = path.strip_prefix("admin").unwrap_or(path).trim_start_matches('/');
+    // The panel keeps an unadvertised first segment: the status page links
+    // nowhere to it, and the old well-known one answers as the theme.
+    if path == "clara" || path.starts_with("clara/") {
+        let path = path.strip_prefix("clara").unwrap_or(path).trim_start_matches('/');
         return embedded::<AdminAssets>(
             path,
             "the panel is not built; run `npm run build` in web-admin/",

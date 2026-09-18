@@ -264,7 +264,7 @@ UNIT
 	printf '\n  %s%s%s\n' "$B" "$done_title" "$N"
 	rule
 	printf '\n'
-	field "面板" "${SITE:-http://127.0.0.1:$PORT}/admin"
+	field "面板" "${SITE:-http://127.0.0.1:$PORT}/clara"
 	if [ -n "$first" ]; then
 		pw="$(journalctl -u "$SERVICE" --since '-2 min' --no-pager 2>/dev/null |
 			sed -n 's/.*Emergency password: //p' | tail -1)"

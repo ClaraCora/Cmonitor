@@ -850,12 +850,12 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
             {/* Percentages, or the address column swallows every spare pixel
                 and pushes status across the table. */}
             <TableRow>
-              <TableHead className="w-[20%]">名称</TableHead>
-              <TableHead className="w-[22%]">IP</TableHead>
-              <TableHead className="w-[12%]">状态</TableHead>
-              <TableHead className="w-[16%]">流量</TableHead>
-              <TableHead className="w-[10%]">价格</TableHead>
-              <TableHead className="w-[12%]">到期</TableHead>
+              <TableHead className="w-[16%]">名称</TableHead>
+              <TableHead className="w-[18%]">IP</TableHead>
+              <TableHead className="w-[10%]">状态</TableHead>
+              <TableHead className="w-[14%]">流量</TableHead>
+              <TableHead className="w-[8%]">价格</TableHead>
+              <TableHead className="w-[10%]">到期</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
@@ -939,7 +939,11 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                   {n.price > 0 ? money(n.price, n.currency) : "免费"}
                 </TableCell>
                 <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
-                <TableCell className="text-right whitespace-nowrap">
+                {/* Wraps to a second row before it clips: on a narrow window
+                    the table scrolls only once the icons no longer fit two
+                    across. */}
+                <TableCell className="px-1 text-right">
+                  <div className="flex flex-wrap justify-end">
                   <Button
                     variant="ghost"
                     size="icon"
@@ -971,6 +975,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                   <Button variant="ghost" size="icon" onClick={() => setDeleting(n)} title="删除节点" aria-label="删除节点">
                     <Trash2 className="text-destructive" />
                   </Button>
+                  </div>
                 </TableCell>
               </TableRow>
             ))}
@@ -1421,7 +1426,7 @@ function useSettings() {
       try {
         const result = await api<{ reauth_required?: boolean }>("/settings", { method: "PUT", body: JSON.stringify(patch) })
         if (result.reauth_required) {
-          location.assign("/admin")
+          location.assign("/clara")
           return true
         }
         toast.success("已保存")
@@ -2097,13 +2102,13 @@ function Data() {
 // Each area is its own route rather than a tab, so a page can be linked to and a
 // reload returns to the same section.
 const ADMIN_SECTIONS = [
-  { path: "/admin/nodes", label: "节点", icon: Server },
-  { path: "/admin/ping", label: "延迟", icon: Radio },
-  { path: "/admin/notify", label: "通知", icon: Bell },
-  { path: "/admin/data", label: "数据", icon: Database },
-  { path: "/admin/themes", label: "主题", icon: Palette },
-  { path: "/admin/security", label: "安全", icon: Shield },
-  { path: "/admin/settings", label: "设置", icon: Settings },
+  { path: "/clara/nodes", label: "节点", icon: Server },
+  { path: "/clara/ping", label: "延迟", icon: Radio },
+  { path: "/clara/notify", label: "通知", icon: Bell },
+  { path: "/clara/data", label: "数据", icon: Database },
+  { path: "/clara/themes", label: "主题", icon: Palette },
+  { path: "/clara/security", label: "安全", icon: Shield },
+  { path: "/clara/settings", label: "设置", icon: Settings },
 ] as const
 
 export function Admin({
@@ -2123,7 +2128,7 @@ export function Admin({
 }) {
   return (
     <div className="flex flex-col gap-6 md:flex-row">
-      <nav className="flex gap-1 overflow-x-auto md:w-44 md:shrink-0 md:flex-col md:overflow-visible">
+      <nav className="flex gap-1 overflow-x-auto rounded-xl border bg-card p-2 shadow-sm backdrop-blur-md md:w-44 md:shrink-0 md:flex-col md:self-start md:overflow-visible">
         {ADMIN_SECTIONS.map(({ path: to, label, icon: Icon }) => {
           const active = path === to
           return (
@@ -2143,17 +2148,17 @@ export function Admin({
       </nav>
 
       <div className="min-w-0 flex-1">
-        {path === "/admin/ping" ? (
+        {path === "/clara/ping" ? (
           <Ping nodes={nodes} />
-        ) : path === "/admin/notify" ? (
+        ) : path === "/clara/notify" ? (
           <Notify nodes={nodes} refresh={refresh} />
-        ) : path === "/admin/data" ? (
+        ) : path === "/clara/data" ? (
           <Data />
-        ) : path === "/admin/themes" ? (
+        ) : path === "/clara/themes" ? (
           <Themes />
-        ) : path === "/admin/security" ? (
+        ) : path === "/clara/security" ? (
           <Security site={site} />
-        ) : path === "/admin/settings" ? (
+        ) : path === "/clara/settings" ? (
           <SettingsTab />
         ) : (
           <Nodes nodes={nodes} refresh={refresh} site={site} canProvision={canProvision} />
