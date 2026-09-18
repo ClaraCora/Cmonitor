@@ -1491,6 +1491,14 @@ function SettingsTab() {
           />
           <span id="public-page-label">开放公开状态页，关闭后所有页面需登录</span>
         </div>
+        <div className="flex items-center gap-2 text-sm">
+          <Switch
+            aria-labelledby="visitor-card-label"
+            checked={s.visitor_card !== "off"}
+            onCheckedChange={(v) => set("visitor_card", v ? "on" : "off")}
+          />
+          <span id="visitor-card-label">状态页显示访客欢迎卡片（访客 IP 与归属地）</span>
+        </div>
         <div>
           <Button
             size="sm"
@@ -1503,6 +1511,7 @@ function SettingsTab() {
                 retention_days: String(s.retention_days || "7"),
                 github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
+                visitor_card: s.visitor_card === "off" ? "off" : "on",
               })
             }
           >

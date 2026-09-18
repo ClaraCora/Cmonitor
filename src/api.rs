@@ -568,6 +568,7 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         "github": config.as_ref().is_some_and(|c| c.github_ready()),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
         "public_page": app.public_page(),
+        "visitor_card": app.db.get("visitor_card").as_deref() != Some("off"),
         "can_provision": provisioning_allowed(&app, &headers),
         // The hub's own public URL when one was given, which is what belongs in an
         // install command and in the OAuth callback -- not whichever address this
@@ -587,6 +588,11 @@ pub async fn visitor(
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
+    // Switched off in the panel: nothing to greet with, so there is nothing
+    // here at all.
+    if app.db.get("visitor_card").as_deref() == Some("off") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let ip = client_ip(&headers, peer.ip());
     let ip = match ip {
         std::net::IpAddr::V6(v6) => {
@@ -984,6 +990,7 @@ pub async fn delete_ping_task(_: Admin, State(app): State<Shared>, Path(id): Pat
 const READABLE_SETTINGS: &[&str] = &[
     "site_name",
     "public_page",
+    "visitor_card",
     "github_client_id",
     "github_allowed_users",
     "retention_days",
@@ -1579,6 +1586,7 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "password_login" if !matches!(value, "on" | "off") => Some("password_login must be on or off".into()),
         "password_login" => None,
+        "visitor_card" if !matches!(value, "on" | "off") => Some("visitor_card must be on or off".into()),
         "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
         "admin_password" => None,
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
