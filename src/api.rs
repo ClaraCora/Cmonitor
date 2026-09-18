@@ -19,6 +19,15 @@ use crate::auth::{
 use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
 
+/// Where the visitor card's geo answers are kept between page loads. Fetching
+/// hub-side means the visitor's browser talks to nobody but the hub, and the
+/// cache means a busy status page costs ipinfo one call per address per six
+/// hours rather than one per view.
+static VISITOR_GEO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (std::time::Instant, Value)>>,
+> = std::sync::OnceLock::new();
+const VISITOR_GEO_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3_600);
+
 /// Present only on requests carrying a valid session. Handlers taking it cannot
 /// be reached unauthenticated, so the check cannot be omitted.
 pub struct Admin;
@@ -567,6 +576,69 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         // and the panel falls back to its own origin.
         "site": app.site,
     }))
+}
+
+/// The one thing the status page's visitor card may learn about its caller:
+/// the address it connected from, plus whatever ipinfo says about it. The
+/// lookup happens here rather than in the visitor's browser, so a public page
+/// sends nobody to a third party.
+pub async fn visitor(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let ip = client_ip(&headers, peer.ip());
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(std::net::IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    // Private space has no public answer, and asking for one would describe
+    // the hub's own network to ipinfo.
+    let unlisted = match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.segments()[0] & 0xffc0 == 0xfe80
+        }
+    };
+    if unlisted {
+        return Json(json!({ "ip": ip.to_string() })).into_response();
+    }
+    let cache = VISITOR_GEO.get_or_init(Default::default);
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, hit)) = guard.get(&ip) {
+            if at.elapsed() < VISITOR_GEO_TTL {
+                return Json(hit.clone()).into_response();
+            }
+        }
+    }
+    // Failure still answers the address alone: the card shows the IP and drops
+    // its geo rows rather than hanging the page on a third party.
+    let mut geo = json!({ "ip": ip.to_string() });
+    if let Ok(body) = app.http.get(format!("https://ipinfo.io/{ip}/json")).send().await {
+        if let Ok(body) = body.error_for_status() {
+            if let Ok(found) = body.json::<Value>().await {
+                for key in ["city", "region", "country", "org"] {
+                    if let Some(value) = found.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                        geo[key] = value.into();
+                    }
+                }
+            }
+        }
+    }
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    // An address-rotating bot must not grow this without bound; at this size a
+    // full flush costs each real visitor one refetch.
+    if guard.len() >= 512 {
+        guard.clear();
+    }
+    guard.insert(ip, (std::time::Instant::now(), geo.clone()));
+    Json(geo).into_response()
 }
 
 pub async fn create_node(
@@ -2701,6 +2773,28 @@ mod tests {
         assert!(body.get("github_client_secret").is_none());
         for secret in ["super-secret", "bot-secret", "url-secret", "header-secret"] {
             assert!(!body.to_string().contains(secret), "{secret}");
+        }
+    }
+
+    /// Private callers get their address back alone: no external lookup is
+    /// owed, and none may happen -- this test makes no network available to
+    /// prove it.
+    #[tokio::test]
+    async fn a_private_visitor_gets_no_geo_lookup() {
+        let app = std::sync::Arc::new(app());
+        for ip in ["127.0.0.1", "10.0.0.8", "192.168.1.1"] {
+            let peer: std::net::SocketAddr = format!("{ip}:4000").parse().unwrap();
+            let body = axum::body::to_bytes(
+                visitor(State(app.clone()), ConnectInfo(peer), HeaderMap::new())
+                    .await
+                    .into_body(),
+                usize::MAX,
+            )
+            .await
+            .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains(ip), "{body}");
+            assert!(!body.contains("city"), "{body}");
         }
     }
 }

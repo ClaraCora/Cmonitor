@@ -439,6 +439,7 @@ async fn main() -> Result<()> {
         .route("/agent/{arch}/sha256", get(agent_checksum))
         // Read paths; the public page reaches these unauthenticated.
         .route("/api/me", get(api::me))
+        .route("/api/visitor", get(api::visitor))
         .route("/api/nodes", get(api::nodes))
         .route("/api/nodes/{id}/metrics", get(api::metrics))
         .route("/api/ws", get(api::live_ws))
