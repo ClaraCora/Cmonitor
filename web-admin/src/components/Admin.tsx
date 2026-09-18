@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Terminal as TerminalIcon, Trash2, Upload } from "lucide-react"
+import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, Eye, EyeOff, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Terminal as TerminalIcon, Trash2, Upload } from "lucide-react"
 import { FitAddon } from "@xterm/addon-fit"
 import { Terminal as XTerm } from "@xterm/xterm"
 import "@xterm/xterm/css/xterm.css"
@@ -770,6 +770,16 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
     ? order.filter((n) => [n.name, n.ip, n.ipv4, n.ipv6].some((v) => v?.toLowerCase().includes(needle)))
     : order
 
+  async function togglePublic(n: Node) {
+    try {
+      await api(`/nodes/${n.id}`, { method: "PUT", body: JSON.stringify({ public: !n.public }) })
+      toast.success(n.public ? `「${n.name}」已在状态页隐藏` : `「${n.name}」已在状态页显示`)
+      refresh()
+    } catch (e) {
+      toast.error((e as Error).message)
+    }
+  }
+
   async function remove() {
     if (!deleting) return
     setRemoving(true)
@@ -930,6 +940,15 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 </TableCell>
                 <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => togglePublic(n)}
+                    title={n.public ? "在状态页隐藏该节点" : "在状态页显示该节点"}
+                    aria-label={n.public ? "在状态页隐藏该节点" : "在状态页显示该节点"}
+                  >
+                    {n.public ? <Eye /> : <EyeOff className="text-muted-foreground" />}
+                  </Button>
                   <Button
                     variant="ghost"
                     size="icon"
