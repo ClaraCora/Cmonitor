@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
@@ -50,7 +50,12 @@ pub struct Theme {
     pub builtin: bool,
 }
 
-pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
+pub async fn serve(
+    State(app): State<Shared>,
+    ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
     let path = uri.path().trim_start_matches('/');
     let known = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
     if is_api_path(path) {
@@ -73,6 +78,12 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
     // Signed-in operators still get the theme.
     if !app.public_page() && !crate::auth::authed(&app, &headers) {
         return axum::response::Redirect::to("/clara").into_response();
+    }
+
+    // A page view is what the visitor log counts: the shell itself, never the
+    // assets it then asks for, and never the panel's pages.
+    if path.is_empty() || path.starts_with("node/") {
+        crate::api::log_visit(&app, &headers, peer.ip());
     }
 
     let theme = app.db.get("theme").unwrap_or_default();

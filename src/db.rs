@@ -126,6 +126,19 @@ CREATE TABLE IF NOT EXISTS session (
   kind TEXT NOT NULL DEFAULT 'legacy',
   identity TEXT NOT NULL DEFAULT ''
 );
+
+-- The last hundred status-page views. Geo columns stay empty until the
+-- lookup behind the log answers, or forever for an address that has none.
+CREATE TABLE IF NOT EXISTS visitor_log (
+  id      INTEGER PRIMARY KEY,
+  ts      INTEGER NOT NULL,
+  ip      TEXT NOT NULL,
+  ua      TEXT NOT NULL DEFAULT '',
+  city    TEXT NOT NULL DEFAULT '',
+  region  TEXT NOT NULL DEFAULT '',
+  country TEXT NOT NULL DEFAULT '',
+  org     TEXT NOT NULL DEFAULT ''
+);
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
@@ -264,8 +277,17 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
 }
 
 /// Every table a backup must carry before this build will restore it.
-const TABLES: [&str; 8] =
-    ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
+const TABLES: [&str; 9] = [
+    "setting",
+    "node",
+    "traffic",
+    "metric",
+    "ping_task",
+    "ping_node",
+    "ping_record",
+    "session",
+    "visitor_log",
+];
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -514,6 +536,55 @@ impl Db {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    // ---- the visitor log ----
+
+    /// One page view: when, from where, with what. Geo arrives later, via
+    /// [`set_visitor_geo`]; the log keeps the newest hundred rows, the number
+    /// the panel page draws.
+    pub fn log_visit(&self, ts: i64, ip: &str, ua: &str) -> Result<i64> {
+        let conn = self.conn();
+        conn.execute("INSERT INTO visitor_log (ts, ip, ua) VALUES (?1, ?2, ?3)", params![ts, ip, ua])?;
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "DELETE FROM visitor_log WHERE id NOT IN (SELECT id FROM visitor_log ORDER BY id DESC LIMIT 100)",
+            [],
+        )?;
+        Ok(id)
+    }
+
+    pub fn set_visitor_geo(&self, id: i64, city: &str, region: &str, country: &str, org: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE visitor_log SET city=?2, region=?3, country=?4, org=?5 WHERE id=?1",
+            params![id, city, region, country, org],
+        )?;
+        Ok(())
+    }
+
+    pub fn visitor_log(&self) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, ts, ip, ua, city, region, country, org FROM visitor_log ORDER BY id DESC LIMIT 100",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, i64>(0)?,
+                "ts": r.get::<_, i64>(1)?,
+                "ip": r.get::<_, String>(2)?,
+                "ua": r.get::<_, String>(3)?,
+                "city": r.get::<_, String>(4)?,
+                "region": r.get::<_, String>(5)?,
+                "country": r.get::<_, String>(6)?,
+                "org": r.get::<_, String>(7)?,
+            }))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn clear_visitor_log(&self) -> Result<()> {
+        self.conn().execute("DELETE FROM visitor_log", [])?;
         Ok(())
     }
 
@@ -2425,5 +2496,26 @@ mod tests {
         // Editing an existing probe does not count as adding one.
         let first = db.ping_tasks().unwrap()[0].id;
         save(first, vec![id]).expect("an existing probe can still be edited at the cap");
+    }
+
+    #[test]
+    fn the_visitor_log_keeps_the_newest_hundred() {
+        let db = Db::open(":memory:").unwrap();
+        let now = 1_758_000_000;
+        for i in 0..105 {
+            db.log_visit(now + i, "203.0.113.9", "Agent/1.0").unwrap();
+        }
+        let rows = db.visitor_log().unwrap();
+        assert_eq!(rows.len(), 100);
+        assert_eq!(rows[0]["ts"], now + 104, "newest first");
+        assert_eq!(rows[99]["ts"], now + 5, "the oldest five fell off");
+
+        db.set_visitor_geo(rows[0]["id"].as_i64().unwrap(), "Hong Kong", "", "HK", "AS4760 HKT").unwrap();
+        let row = db.visitor_log().unwrap().remove(0);
+        assert_eq!(row["city"], "Hong Kong");
+        assert_eq!(row["org"], "AS4760 HKT");
+
+        db.clear_visitor_log().unwrap();
+        assert!(db.visitor_log().unwrap().is_empty());
     }
 }

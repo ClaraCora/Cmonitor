@@ -69,6 +69,19 @@ export type Node = {
 
 export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[] }
 
+/** One status-page view, newest first. Geo fields are empty until the hub's
+ * lookup answers, or forever for an address that has none. */
+export type VisitorRow = {
+  id: number
+  ts: number
+  ip: string
+  ua: string
+  city?: string
+  region?: string
+  country?: string
+  org?: string
+}
+
 /** Form snapshots must never overwrite fields the user did not edit. */
 export function changes<T extends object>(initial: T, values: Partial<T>): Partial<T> {
   return Object.fromEntries(Object.entries(values).filter(([key, value]) => value !== initial[key as keyof T])) as Partial<T>

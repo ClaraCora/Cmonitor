@@ -440,6 +440,7 @@ async fn main() -> Result<()> {
         // Read paths; the public page reaches these unauthenticated.
         .route("/api/me", get(api::me))
         .route("/api/visitor", get(api::visitor))
+        .route("/api/visitor-log", get(api::visitor_log).delete(api::clear_visitor_log))
         .route("/api/nodes", get(api::nodes))
         .route("/api/nodes/{id}/metrics", get(api::metrics))
         .route("/api/ws", get(api::live_ws))
@@ -745,7 +746,14 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_api_path_is_a_404_not_the_single_page_app() {
         let app = Arc::new(app("http://localhost:8080"));
-        let spa = |p: &str| frontend::serve(State(app.clone()), HeaderMap::new(), p.parse::<Uri>().unwrap());
+        let spa = |p: &str| {
+            frontend::serve(
+                State(app.clone()),
+                axum::extract::ConnectInfo("127.0.0.1:80".parse().unwrap()),
+                HeaderMap::new(),
+                p.parse::<Uri>().unwrap(),
+            )
+        };
 
         // The case that would conceal a misconfigured OAuth callback.
         assert_eq!(spa("/api/oauth_callback?code=x").await.status(), StatusCode::NOT_FOUND);
@@ -767,7 +775,14 @@ mod tests {
     async fn a_closed_status_page_redirects_anonymous_visitors_to_the_panel() {
         let app = Arc::new(app("http://localhost:8080"));
         app.db.set("public_page", "off").unwrap();
-        let spa = |p: &str| frontend::serve(State(app.clone()), HeaderMap::new(), p.parse::<Uri>().unwrap());
+        let spa = |p: &str| {
+            frontend::serve(
+                State(app.clone()),
+                axum::extract::ConnectInfo("127.0.0.1:80".parse().unwrap()),
+                HeaderMap::new(),
+                p.parse::<Uri>().unwrap(),
+            )
+        };
 
         for path in ["/", "/node/3"] {
             let response = spa(path).await;
@@ -778,6 +793,30 @@ mod tests {
         assert_eq!(spa("/api/nope").await.status(), StatusCode::NOT_FOUND, "unknown APIs still 404");
     }
 
+    /// The visitor log counts page views: the shell, once per (address,
+    /// agent) inside the window, and never the assets beneath it.
+    #[tokio::test]
+    async fn a_page_view_is_logged_once_per_visitor() {
+        let app = Arc::new(app("http://localhost:8080"));
+        let peer = axum::extract::ConnectInfo("203.0.113.9:4000".parse::<std::net::SocketAddr>().unwrap());
+        let ua = |name: &str| HeaderMap::from_iter([(header::USER_AGENT, name.parse().unwrap())]);
+        let serve =
+            |h: HeaderMap, p: &str| frontend::serve(State(app.clone()), peer, h, p.parse::<Uri>().unwrap());
+
+        assert_eq!(serve(ua("First/1.0"), "/").await.status(), StatusCode::OK);
+        assert_eq!(app.db.visitor_log().unwrap().len(), 1);
+        assert_eq!(serve(ua("First/1.0"), "/").await.status(), StatusCode::OK);
+        assert_eq!(app.db.visitor_log().unwrap().len(), 1, "a refresh inside the window is the same visit");
+
+        let miss = serve(ua("Assets/3.0"), "/assets/index-STALE.js").await;
+        assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+        assert_eq!(app.db.visitor_log().unwrap().len(), 1, "an asset is not a page view");
+
+        assert_eq!(serve(ua("Second/2.0"), "/").await.status(), StatusCode::OK);
+        assert_eq!(app.db.visitor_log().unwrap().len(), 2, "another agent is another visitor");
+        assert_eq!(app.db.visitor_log().unwrap()[0]["ip"], "203.0.113.9");
+    }
+
     /// A build writes hashed filenames under `assets/`, so a miss there means a
     /// tab left open across a deploy. Answering with index.html would hand a
     /// script tag HTML, failing on MIME type long after the request that caused
@@ -785,7 +824,14 @@ mod tests {
     #[tokio::test]
     async fn a_missing_hashed_asset_is_a_404_not_the_single_page_app() {
         let app = Arc::new(app("http://localhost:8080"));
-        let spa = |p: &str| frontend::serve(State(app.clone()), HeaderMap::new(), p.parse::<Uri>().unwrap());
+        let spa = |p: &str| {
+            frontend::serve(
+                State(app.clone()),
+                axum::extract::ConnectInfo("127.0.0.1:80".parse().unwrap()),
+                HeaderMap::new(),
+                p.parse::<Uri>().unwrap(),
+            )
+        };
 
         assert_eq!(spa("/assets/index-STALE.js").await.status(), StatusCode::NOT_FOUND);
         assert_eq!(spa("/clara/assets/index-STALE.js").await.status(), StatusCode::NOT_FOUND);

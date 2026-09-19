@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, Eye, EyeOff, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Terminal as TerminalIcon, Trash2, Upload } from "lucide-react"
+import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, Eye, EyeOff, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Terminal as TerminalIcon, Trash2, Upload, Users } from "lucide-react"
 import { FitAddon } from "@xterm/addon-fit"
 import { Terminal as XTerm } from "@xterm/xterm"
 import "@xterm/xterm/css/xterm.css"
@@ -15,7 +15,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { addresses, api, changes, GIB, provisioningSite, supportsTerminal, trafficCorrection, upload, type Node, type PingTask } from "@/lib/api"
+import { addresses, api, changes, GIB, provisioningSite, supportsTerminal, trafficCorrection, upload, type Node, type PingTask, type VisitorRow } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -1038,6 +1038,111 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   )
 }
 
+const exactTime = (ts: number) =>
+  new Date(ts * 1000).toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  })
+
+// ipinfo's org is "AS4760 HKT Limited"; the list wants those as two columns.
+function splitOrg(org?: string): [string, string] {
+  if (!org) return ["—", "—"]
+  const m = org.match(/^AS(\d+)\s*([\s\S]*)$/)
+  return m ? [`AS${m[1]}`, m[2].trim() || "—"] : ["—", org]
+}
+
+function Visitors() {
+  const [rows, setRows] = useState<VisitorRow[] | null>(null)
+  const [confirmClear, setConfirmClear] = useState(false)
+  const [clearing, setClearing] = useState(false)
+  const load = () => api<{ visits: VisitorRow[] }>("/visitor-log").then((d) => setRows(d.visits)).catch(() => {})
+  useEffect(() => { load() }, [])
+
+  const clear = async () => {
+    setClearing(true)
+    try {
+      await api("/visitor-log", { method: "DELETE" })
+      toast.success("已清空访客记录")
+      setConfirmClear(false)
+      setRows([])
+    } catch (e) {
+      toast.error((e as Error).toString())
+    } finally {
+      setClearing(false)
+    }
+  }
+
+  return (
+    <Card className="gap-0 overflow-x-auto p-0">
+      <div className="flex items-center justify-between gap-3 border-b px-4 py-3">
+        <div className="text-sm text-muted-foreground">状态页最近 100 次访问</div>
+        <div className="flex items-center gap-1">
+          <Button variant="ghost" size="icon" onClick={load} title="刷新" aria-label="刷新">
+            <RefreshCw />
+          </Button>
+          <Button variant="ghost" size="icon" onClick={() => setConfirmClear(true)} title="清空访客记录" aria-label="清空访客记录">
+            <Trash2 className="text-destructive" />
+          </Button>
+        </div>
+      </div>
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="w-44">时间</TableHead>
+            <TableHead className="w-36">IP</TableHead>
+            <TableHead className="w-40">归属地</TableHead>
+            <TableHead className="w-24">ASN</TableHead>
+            <TableHead className="w-48">服务商</TableHead>
+            <TableHead>UA</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {(rows ?? []).map((v) => {
+            const [asn, isp] = splitOrg(v.org)
+            const place = [v.city, v.region, v.country].filter((x, i, a) => x && a.indexOf(x) === i).join(", ")
+            return (
+              <TableRow key={v.id}>
+                <TableCell className="tnum text-sm">{exactTime(v.ts)}</TableCell>
+                <TableCell className="tnum text-sm">{v.ip}</TableCell>
+                <TableCell className="text-sm">{place || "—"}</TableCell>
+                <TableCell className="tnum text-sm">{asn}</TableCell>
+                <TableCell className="text-sm">
+                  <span className="block max-w-56 truncate" title={isp}>{isp}</span>
+                </TableCell>
+                <TableCell className="text-xs text-muted-foreground">
+                  <span className="block max-w-md truncate" title={v.ua}>{v.ua}</span>
+                </TableCell>
+              </TableRow>
+            )
+          })}
+          {rows !== null && rows.length === 0 && (
+            <TableRow>
+              <TableCell colSpan={6} className="py-10 text-center text-sm text-muted-foreground">
+                还没有访客记录
+              </TableCell>
+            </TableRow>
+          )}
+        </TableBody>
+      </Table>
+      {confirmClear && (
+        <ConfirmDialog
+          title="清空访客记录？"
+          description="全部访客记录将被删除，不可恢复。"
+          confirmLabel="清空"
+          busy={clearing}
+          onClose={() => setConfirmClear(false)}
+          onConfirm={clear}
+        />
+      )}
+    </Card>
+  )
+}
+
 function Ping({ nodes }: { nodes: Node[] }) {
   const [tasks, setTasks] = useState<PingTask[]>([])
   const [editing, setEditing] = useState<Partial<PingTask> | null>(null)
@@ -1956,6 +2061,7 @@ type DbInfo = {
 const DB_ROWS: [string, string][] = [
   ["metric", "历史明细"],
   ["ping_record", "延迟记录"],
+  ["visitor_log", "访客记录"],
 ]
 
 function Data() {
@@ -2112,6 +2218,7 @@ function Data() {
 // reload returns to the same section.
 const ADMIN_SECTIONS = [
   { path: "/clara/nodes", label: "节点", icon: Server },
+  { path: "/clara/visitors", label: "访客", icon: Users },
   { path: "/clara/ping", label: "延迟", icon: Radio },
   { path: "/clara/notify", label: "通知", icon: Bell },
   { path: "/clara/data", label: "数据", icon: Database },
@@ -2157,7 +2264,9 @@ export function Admin({
       </nav>
 
       <div className="min-w-0 flex-1">
-        {path === "/clara/ping" ? (
+        {path === "/clara/visitors" ? (
+          <Visitors />
+        ) : path === "/clara/ping" ? (
           <Ping nodes={nodes} />
         ) : path === "/clara/notify" ? (
           <Notify nodes={nodes} refresh={refresh} />

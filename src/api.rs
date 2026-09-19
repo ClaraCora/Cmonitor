@@ -579,6 +579,49 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     }))
 }
 
+/// The address a request really came from, with the IPv4-mapped form of a v6
+/// socket folded back into v4 so private-space rules only exist once.
+fn visitor_ip(headers: &HeaderMap, peer: std::net::IpAddr) -> std::net::IpAddr {
+    let ip = client_ip(headers, peer);
+    match ip {
+        std::net::IpAddr::V6(v6) => {
+            v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(std::net::IpAddr::V6(v6))
+        }
+        v4 => v4,
+    }
+}
+
+/// Private space has no public answer, and asking for one would describe the
+/// hub's own network to ipinfo.
+fn unlisted_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.segments()[0] & 0xffc0 == 0xfe80
+        }
+    }
+}
+
+/// One ipinfo answer, reduced to the four fields the hub keeps. `None` is any
+/// failure at all: the caller already has the address, which is the part it
+/// cannot do without.
+async fn lookup_geo(app: &App, ip: std::net::IpAddr) -> Option<serde_json::Map<String, Value>> {
+    let body = app.http.get(format!("https://ipinfo.io/{ip}/json")).send().await.ok()?;
+    let found = body.error_for_status().ok()?.json::<Value>().await.ok()?;
+    let mut geo = serde_json::Map::new();
+    for key in ["city", "region", "country", "org"] {
+        if let Some(value) = found.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            geo.insert(key.into(), value.into());
+        }
+    }
+    Some(geo)
+}
+
 /// The one thing the status page's visitor card may learn about its caller:
 /// the address it connected from, plus whatever ipinfo says about it. The
 /// lookup happens here rather than in the visitor's browser, so a public page
@@ -593,27 +636,8 @@ pub async fn visitor(
     if app.db.get("visitor_card").as_deref() == Some("off") {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let ip = client_ip(&headers, peer.ip());
-    let ip = match ip {
-        std::net::IpAddr::V6(v6) => {
-            v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(std::net::IpAddr::V6(v6))
-        }
-        v4 => v4,
-    };
-    // Private space has no public answer, and asking for one would describe
-    // the hub's own network to ipinfo.
-    let unlisted = match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.segments()[0] & 0xffc0 == 0xfe80
-        }
-    };
-    if unlisted {
+    let ip = visitor_ip(&headers, peer.ip());
+    if unlisted_ip(ip) {
         return Json(json!({ "ip": ip.to_string() })).into_response();
     }
     let cache = VISITOR_GEO.get_or_init(Default::default);
@@ -625,19 +649,9 @@ pub async fn visitor(
             }
         }
     }
-    // Failure still answers the address alone: the card shows the IP and drops
-    // its geo rows rather than hanging the page on a third party.
     let mut geo = json!({ "ip": ip.to_string() });
-    if let Ok(body) = app.http.get(format!("https://ipinfo.io/{ip}/json")).send().await {
-        if let Ok(body) = body.error_for_status() {
-            if let Ok(found) = body.json::<Value>().await {
-                for key in ["city", "region", "country", "org"] {
-                    if let Some(value) = found.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                        geo[key] = value.into();
-                    }
-                }
-            }
-        }
+    if let Some(found) = lookup_geo(&app, ip).await {
+        geo.as_object_mut().expect("an object literal").extend(found);
     }
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     // An address-rotating bot must not grow this without bound; at this size a
@@ -647,6 +661,64 @@ pub async fn visitor(
     }
     guard.insert(ip, (std::time::Instant::now(), geo.clone()));
     Json(geo).into_response()
+}
+
+/// When one (address, agent) pair was last written to the log. Thirty minutes
+/// of quiet makes the next load a new visit, so a refresher does not become a
+/// hundred rows of one person.
+static VISITS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>,
+> = std::sync::OnceLock::new();
+const VISIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1_800);
+
+/// One status-page view: noted synchronously, geo filled in behind it. The
+/// operator reading their own page is not a visitor, and an agent string
+/// nobody sent is not one either.
+pub fn log_visit(app: &Shared, headers: &HeaderMap, peer: std::net::IpAddr) {
+    if authed(app, headers) {
+        return;
+    }
+    let Some(ua) = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()) else { return };
+    let ua = &ua[..ua.len().min(512)];
+    let ip = visitor_ip(headers, peer);
+    {
+        let mut seen = VISITS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if seen.get(&(ip.to_string(), ua.to_owned())).is_some_and(|at| at.elapsed() < VISIT_WINDOW) {
+            return;
+        }
+        if seen.len() >= 4_096 {
+            seen.clear();
+        }
+        seen.insert((ip.to_string(), ua.to_owned()), std::time::Instant::now());
+    }
+    let Ok(id) = app.db.log_visit(Utc::now().timestamp(), &ip.to_string(), ua) else { return };
+    if unlisted_ip(ip) {
+        return;
+    }
+    let app = app.clone();
+    tokio::spawn(async move {
+        if let Some(geo) = lookup_geo(&app, ip).await {
+            let at = |key: &str| geo.get(key).and_then(|v| v.as_str()).unwrap_or("");
+            if let Err(e) = app.db.set_visitor_geo(id, at("city"), at("region"), at("country"), at("org")) {
+                debug!("visitor {ip}: storing geo failed: {e:#}");
+            }
+        }
+    });
+}
+
+/// The panel's page of it, newest first.
+pub async fn visitor_log(_: Admin, State(app): State<Shared>) -> Response {
+    match app.db.visitor_log() {
+        Ok(rows) => Json(json!({"visits": rows})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+pub async fn clear_visitor_log(_: Admin, State(app): State<Shared>) -> Response {
+    match app.db.clear_visitor_log() {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => fail(e),
+    }
 }
 
 pub async fn create_node(
