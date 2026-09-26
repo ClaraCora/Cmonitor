@@ -1,5 +1,7 @@
 # Cmonitor
 
+部署时无法访问 GitHub、运行时仅允许 IP 接入，可按 [Agent 离线安装与手写配置指南](OFFLINE_DEPLOY.md) 配置现有 HTTP IP 入口，启动后继续向原探针上报。
+
 ## 特性
 
 - 实时监控：秒级实时数据展示
