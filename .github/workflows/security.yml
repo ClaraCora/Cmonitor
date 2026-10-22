@@ -2,7 +2,7 @@ name: security
 on:
   push:
     branches: [main]
-    paths: [Cargo.lock, Cargo.toml, web-admin/package-lock.json, .github/workflows/security.yml]
+    paths: [Cargo.lock, Cargo.toml, .node-version, web-admin/package.json, web-admin/package-lock.json, web-admin/.npmrc, scripts/check-node-security.mjs, .github/workflows/security.yml]
   workflow_dispatch:
 permissions:
   contents: read
@@ -17,6 +17,8 @@ jobs:
       - run: cargo audit
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
-      - run: npm audit --audit-level=high
+          node-version-file: .node-version
+      - name: Verify patched Node runtime
+        run: node scripts/check-node-security.mjs
+      - run: npm audit --package-lock-only --ignore-scripts --audit-level=high
         working-directory: web-admin
