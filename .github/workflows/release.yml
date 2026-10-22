@@ -44,6 +44,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
       - run: cargo install --locked cross
       - run: cross build --release --locked --target ${{ matrix.target }}
 

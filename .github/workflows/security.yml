@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
     paths: [Cargo.lock, Cargo.toml, .node-version, web-admin/package.json, web-admin/package-lock.json, web-admin/.npmrc, scripts/check-node-security.mjs, .github/workflows/security.yml]
+  pull_request:
+    paths: [Cargo.lock, Cargo.toml, .node-version, web-admin/package.json, web-admin/package-lock.json, web-admin/.npmrc, scripts/check-node-security.mjs, .github/workflows/security.yml]
   workflow_dispatch:
 permissions:
   contents: read
