@@ -25,9 +25,16 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: web-admin/package-lock.json
+
+      - name: Verify patched Node runtime
+        run: node scripts/check-node-security.mjs
+
+      - name: Audit frontend dependencies
+        run: npm audit --package-lock-only --ignore-scripts --audit-level=high
+        working-directory: web-admin
 
       # The hub embeds the panel, so its dist/ must exist before cargo runs.
       - run: npm ci && npm run build
@@ -36,6 +43,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
 
       - run: cargo install --locked cross
       - run: cross build --release --locked --target ${{ matrix.target }}

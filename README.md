@@ -48,3 +48,11 @@ sudo /opt/monitor/monitor-hub --db /opt/monitor/data/monitor.db --reset-password
 - `agent.pin` 固定 Agent 发布版本及 SHA-256。Hub 校验下载内容后才转发，安装脚本再次校验后才安装。
   第三方 GitHub 下载代理不能提供自己的可信摘要。升级固定 Agent 版本需要更新该文件并发布 Hub。
 - 构建、测试、依赖漏洞扫描和发布通过 GitHub Actions 的 Linux 环境执行。
+- 前端开发与构建使用根目录 `.node-version` 指定的 Node 版本；在 `web-admin/` 执行 npm 命令。项目会拒绝低于安全基线的 Node 环境。
+
+## 服务器与 GitHub 构建
+
+- 正式服务器运行 Rust Hub 和内嵌静态前端；发布容器基于 `scratch`，不需要安装 PHP、Node 或 npm。
+- GitHub 的 CI、发布和依赖扫描统一使用 `.node-version` 中的 Node 安全版本。安装前端依赖前，CI 和发布流程会检查实际 Node 版本及 DNS/TLS 修复行为，并执行依赖审计；发布流程还会审计 Rust 依赖，任一步失败会阻止后续构建或发布。相关依赖变更的 PR 也会触发安全扫描。
+- 将修复提交到 GitHub 后，可在 Actions 的 `ci` 工作流手动运行完整检查。`release` 的手动运行只构建二进制产物；创建 `v*` 标签才会发布二进制和容器。
+- 现有服务器应通过原有安装脚本的升级入口或更新已发布容器进行升级。同机其他 PHP/Node 服务需要分别升级其实际运行时，Hub 的更新不会替它们修复漏洞。

@@ -7,6 +7,7 @@ on:
     paths-ignore: ["**.md", "LICENSE"]
   pull_request:
     paths-ignore: ["**.md", "LICENSE"]
+  workflow_dispatch:
 
 # A new push supersedes any run still in progress for the same ref.
 concurrency:
@@ -30,9 +31,16 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: web-admin/package-lock.json
+
+      - name: Verify patched Node runtime
+        run: node scripts/check-node-security.mjs
+
+      - name: Audit frontend dependencies
+        run: npm audit --package-lock-only --ignore-scripts --audit-level=high
+        working-directory: web-admin
 
       # rust-embed requires the panel's dist/ to exist before cargo runs.
       - run: npm ci && npm run lint && npm test && npm run build
