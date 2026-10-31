@@ -200,14 +200,23 @@ pub async fn browser_guard(
         axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
     );
     // Agent registration uses a Bearer credential, never a browser cookie.
-    if writes
+    let api = path.starts_with("/api/");
+    let mut response = if writes
         && path.starts_with("/api/")
         && path != "/api/agent/register"
         && !same_origin(&app, request.headers(), false)
     {
-        return (StatusCode::FORBIDDEN, "请求来源不匹配，请从 Hub 后台重试").into_response();
+        (StatusCode::FORBIDDEN, "请求来源不匹配，请从 Hub 后台重试").into_response()
+    } else {
+        next.run(request).await
+    };
+    // The same API URL may include node credentials for a signed-in operator.
+    if api {
+        response.headers_mut().insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
     }
-    next.run(request).await
+    response.headers_mut().insert("x-content-type-options", "nosniff".parse().unwrap());
+    response.headers_mut().insert("x-frame-options", "SAMEORIGIN".parse().unwrap());
+    response
 }
 
 #[derive(Deserialize)]
@@ -496,6 +505,42 @@ fn behind_local_proxy(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn api_responses_and_rejected_writes_are_never_shared_cache_entries() {
+        let app = std::sync::Arc::new(App::for_test(crate::db::Db::open(":memory:").unwrap()));
+        let router = axum::Router::new()
+            .route("/api/private", axum::routing::get(|| async { "credential" }).post(|| async { "ok" }))
+            .route("/asset.js", axum::routing::get(|| async { "script" }))
+            .layer(axum::middleware::from_fn_with_state(app, browser_guard));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        for cookie in ["", "monitor_session=example"] {
+            let response =
+                client.get(format!("{url}/api/private")).header(header::COOKIE, cookie).send().await.unwrap();
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "private, no-store");
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            assert_eq!(response.headers()["x-frame-options"], "SAMEORIGIN");
+        }
+        let response = client
+            .post(format!("{url}/api/private"))
+            .header(header::ORIGIN, "https://evil.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "private, no-store");
+        assert!(!client
+            .get(format!("{url}/asset.js"))
+            .send()
+            .await
+            .unwrap()
+            .headers()
+            .contains_key(header::CACHE_CONTROL));
+        server.abort();
+    }
 
     #[test]
     fn browser_origins_are_exact_and_a_missing_websocket_origin_is_refused() {

@@ -438,22 +438,43 @@ pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
     if session.is_none() && !app.public_page() {
         return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
     }
-    upgrade
-        .read_buffer_size(SOCKET_BUFFER)
-        .max_message_size(MAX_FRAME)
-        .on_upgrade(move |socket| stream_live(app, socket, session))
+    // Public viewers must not exhaust the panel's separate connection budget.
+    let gate = if session.is_some() { &ADMIN_STREAMS } else { &PUBLIC_STREAMS };
+    let Ok(permit) = gate.try_acquire() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many live connections, try again").into_response();
+    };
+    upgrade.read_buffer_size(SOCKET_BUFFER).max_message_size(MAX_FRAME).max_frame_size(MAX_FRAME).on_upgrade(
+        move |socket| async move {
+            let _permit = permit;
+            stream_live(app, socket, session).await;
+        },
+    )
 }
+
+static PUBLIC_STREAMS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(128);
+static ADMIN_STREAMS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
+const STREAM_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
-        ticker.tick().await;
-        // Closed rather than downgraded to the public frame, which would leave the
-        // panel rendering a list with every admin field missing. The close allows
-        // a client to re-query /api/me and determine its current state.
-        let Some(full) = stream_audience(&app, session.as_deref()) else { break };
-        if socket.send(Message::Text(live_snapshot(&app, full))).await.is_err() {
-            break;
+        tokio::select! {
+            _ = ticker.tick() => {
+                let Some(full) = stream_audience(&app, session.as_deref()) else { break };
+                if !matches!(tokio::time::timeout(
+                    STREAM_WRITE_TIMEOUT,
+                    socket.send(Message::Text(live_snapshot(&app, full))),
+                ).await, Ok(Ok(()))) { break; }
+            }
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(Message::Ping(data))) => {
+                    if !matches!(tokio::time::timeout(
+                        STREAM_WRITE_TIMEOUT, socket.send(Message::Pong(data)),
+                    ).await, Ok(Ok(()))) { break; }
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -611,6 +632,8 @@ fn unlisted_ip(ip: std::net::IpAddr) -> bool {
 /// failure at all: the caller already has the address, which is the part it
 /// cannot do without.
 async fn lookup_geo(app: &App, ip: std::net::IpAddr) -> Option<serde_json::Map<String, Value>> {
+    // Shared by page views and the visitor endpoint, refused rather than queued.
+    let _permit = GEO_LOOKUPS.try_acquire().ok()?;
     let body = app.http.get(format!("https://ipinfo.io/{ip}/json")).send().await.ok()?;
     let found = body.error_for_status().ok()?.json::<Value>().await.ok()?;
     let mut geo = serde_json::Map::new();
@@ -621,6 +644,8 @@ async fn lookup_geo(app: &App, ip: std::net::IpAddr) -> Option<serde_json::Map<S
     }
     Some(geo)
 }
+
+static GEO_LOOKUPS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 /// The one thing the status page's visitor card may learn about its caller:
 /// the address it connected from, plus whatever ipinfo says about it. The
@@ -1414,6 +1439,30 @@ struct Release {
 #[derive(Deserialize)]
 struct Asset {
     name: String,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+fn theme_digest(asset: &Asset) -> anyhow::Result<&str> {
+    let digest = asset.digest.as_deref().and_then(|d| d.strip_prefix("sha256:"));
+    digest
+        .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow::anyhow!("GitHub 未提供有效的主题 SHA-256，请核对来源后手动上传"))
+}
+
+async fn verified_theme(mut response: reqwest::Response, expected: &str) -> anyhow::Result<Vec<u8>> {
+    use sha2::Digest;
+    anyhow::ensure!(response.content_length().is_none_or(|size| size <= MAX_THEME), "主题包超过大小上限");
+    let mut archive = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(archive.len() as u64 + chunk.len() as u64 <= MAX_THEME, "主题包超过大小上限");
+        archive.extend_from_slice(&chunk);
+    }
+    anyhow::ensure!(
+        hex::encode(sha2::Sha256::digest(&archive)).eq_ignore_ascii_case(expected),
+        "主题 SHA-256 校验失败，已拒绝安装；请检查 GitHub 下载代理"
+    );
+    Ok(archive)
 }
 
 /// The `<owner>/<repo>` a theme's `url` names, where it names a GitHub repository
@@ -1492,9 +1541,13 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     }
     // Checked here rather than by downloading and reading a 404: the asset name is
     // the contract, and stating so is the entire error message.
-    if !release.assets.iter().any(|asset| asset.name == ARCHIVE) {
-        bail!("release {tag} 里没有 {ARCHIVE}");
-    }
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == ARCHIVE)
+        .with_context(|| format!("release {tag} 里没有 {ARCHIVE}"))?;
+    // The API is fetched directly; a download proxy cannot choose this digest.
+    let expected = theme_digest(asset)?;
 
     // Through the panel's GitHub proxy when one is configured, the archive being
     // the part a blocked network cannot reach. The API call above is not proxied:
@@ -1504,15 +1557,7 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
         crate::proxied(app, format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{ARCHIVE}"));
     let response =
         app.http.get(url).timeout(std::time::Duration::from_secs(120)).send().await?.error_for_status()?;
-    // The transfer stops at Content-Length, so checking it checks the body: a
-    // header understating the archive cannot make more arrive. GitHub always
-    // sends one; a proxy that omits it is refused rather than read unbounded.
-    match response.content_length() {
-        Some(size) if size <= MAX_THEME => {}
-        Some(size) => bail!("主题包 {} MiB，超过 {} MiB 的上限", size / 1024 / 1024, MAX_THEME / 1024 / 1024),
-        None => bail!("下载没有给出大小，无法确认它在 {} MiB 以内", MAX_THEME / 1024 / 1024),
-    }
-    let archive = response.bytes().await?;
+    let archive = verified_theme(response, expected).await?;
 
     // The same unpacking, validation and atomic replace an upload undergoes,
     // constrained to the theme it may replace. The built-in theme has no
@@ -2861,6 +2906,35 @@ mod tests {
     /// Private callers get their address back alone: no external lookup is
     /// owed, and none may happen -- this test makes no network available to
     /// prove it.
+    #[tokio::test]
+    async fn theme_downloads_reject_tampering_missing_digests_and_streamed_oversize() {
+        use sha2::Digest;
+        let trusted = b"trusted theme archive";
+        let digest = hex::encode(sha2::Sha256::digest(trusted));
+        let asset = Asset { name: ARCHIVE.into(), digest: Some(format!("sha256:{digest}")) };
+        assert_eq!(theme_digest(&asset).unwrap(), digest);
+        for invalid in [None, Some(String::new()), Some("md5:1234".into()), Some("sha256:bad".into())] {
+            assert!(theme_digest(&Asset { name: ARCHIVE.into(), digest: invalid }).is_err());
+        }
+        let response = |bytes: Vec<u8>| reqwest::Response::from(axum::http::Response::new(bytes));
+        assert_eq!(verified_theme(response(trusted.to_vec()), &digest).await.unwrap(), trusted);
+        assert!(verified_theme(response(b"proxy substituted a script".to_vec()), &digest).await.is_err());
+        // A chunked response has no Content-Length; its actual bytes are bounded.
+        let oversized = std::io::Cursor::new(vec![0u8; MAX_THEME as usize + 1]);
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(oversized));
+        let response = reqwest::Response::from(axum::http::Response::new(body));
+        assert!(verified_theme(response, &digest).await.unwrap_err().to_string().contains("大小上限"));
+    }
+
+    #[tokio::test]
+    async fn exhausted_geo_budget_returns_without_an_outbound_request() {
+        let held: Vec<_> = (0..4).map(|_| GEO_LOOKUPS.try_acquire().unwrap()).collect();
+        let app = app();
+        assert!(lookup_geo(&app, "203.0.113.7".parse().unwrap()).await.is_none());
+        drop(held);
+        assert_eq!(GEO_LOOKUPS.available_permits(), 4);
+    }
+
     #[tokio::test]
     async fn a_private_visitor_gets_no_geo_lookup() {
         let app = std::sync::Arc::new(app());

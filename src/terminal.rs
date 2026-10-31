@@ -164,6 +164,7 @@ pub async fn handler(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
     upgrade
         .read_buffer_size(crate::api::SOCKET_BUFFER)
         .max_message_size(crate::api::MAX_FRAME)
+        .max_frame_size(crate::api::MAX_FRAME)
         .on_upgrade(move |socket| run(app, socket, session))
 }
 
