@@ -56,7 +56,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: ClaraCora/Cagent
-          ref: ca60e4d9157364dff63306a7cd93c323092785c3
+          ref: 74d733c3cb2099757cbc1e700ec1072a81926b84
           path: .ci-agent
           persist-credentials: false
       - name: Build Hub regression binary
