@@ -54,7 +54,12 @@ class WebSocket:
         payload = json.dumps(value).encode() if not isinstance(value, bytes) else value
         size = len(payload)
         header = bytes([0x80 | opcode])
-        header += bytes([0x80 | size]) if size < 126 else bytes([0x80 | 126]) + struct.pack("!H", size)
+        if size < 126:
+            header += bytes([0x80 | size])
+        elif size < 65536:
+            header += bytes([0x80 | 126]) + struct.pack("!H", size)
+        else:
+            header += bytes([0x80 | 127]) + struct.pack("!Q", size)
         mask = secrets.token_bytes(4)
         self.sock.sendall(header + mask + bytes(v ^ mask[i % 4] for i, v in enumerate(payload)))
 
@@ -200,6 +205,32 @@ def main():
             log.seek(0)
             password = re.search(rb"Emergency password: ([a-f0-9]+)", log.read())[1].decode()
             cookie = login(password)
+            for route in ["/api/me", "/api/nodes", "/api/settings"]:
+                for identity in ["", cookie]:
+                    status, _, headers = api(route, cookie=identity)
+                    assert status in (200, 401)
+                    assert headers.get("cache-control") == "private, no-store"
+                    assert headers.get("x-content-type-options") == "nosniff"
+            assert api("/api/auth/logout", {}, cookie, None)[2].get("cache-control") == "private, no-store"
+            print("PASS: credential APIs and rejected writes cannot enter shared caches", flush=True)
+
+            # The public budget cannot take away the operator's live connection.
+            viewers = [ws("", path="/api/ws") for _ in range(128)]
+            ws("", path="/api/ws", expected=503)
+            operator = ws(cookie, path="/api/ws")
+            operator.close()
+            for viewer in viewers:
+                viewer.close()
+            # Closing sockets releases their permits, without waiting for a send.
+            time.sleep(0.2)
+            ws("", path="/api/ws").close()
+            print("PASS: public live connection limit preserves admin access and releases slots", flush=True)
+
+            oversized = ws("", path="/api/ws")
+            oversized.send(bytes(65537), 2)
+            oversized.closed()
+            print("PASS: oversized WebSocket frames are refused", flush=True)
+
             assert api("/api/me", cookie=cookie)[1]["hub_version"]
             assert api("/api/me")[1]["hub_version"] is None
             assert api("/api/settings", {"password_login": "off"}, cookie, method="PUT")[0] == 400
