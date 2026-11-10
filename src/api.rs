@@ -182,6 +182,7 @@ fn node_view(
         view["remark"] = json!(node.remark);
         view["token"] = json!(node.token);
         view["notify"] = json!(node.notify);
+        view["website"] = json!(node.website);
     }
     view
 }
@@ -575,6 +576,29 @@ fn normalize_tags(tags: &mut String) -> Option<&'static str> {
     None
 }
 
+fn normalize_website(website: &mut String) -> Option<&'static str> {
+    *website = website.trim().to_owned();
+    if website.is_empty() {
+        return None;
+    }
+    if website.len() > 2048 || website.chars().any(char::is_whitespace) {
+        return Some("官网地址不能包含空白字符，且不能超过 2048 字节");
+    }
+    let Ok(url) = reqwest::Url::parse(website) else {
+        return Some("请填写完整的官网地址，例如 https://example.com");
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || website.chars().any(char::is_control)
+    {
+        return Some("官网地址仅支持不含用户名和密码的 HTTP 或 HTTPS 链接");
+    }
+    *website = url.to_string();
+    None
+}
+
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     let authenticated = authed(&app, &headers);
     let config = app.db.auth_config(&app.site).ok();
@@ -768,6 +792,9 @@ pub async fn create_node(
     if let Some(message) = normalize_tags(&mut node.tags) {
         return bad(message);
     }
+    if let Some(message) = normalize_website(&mut node.website) {
+        return bad(message);
+    }
     let token = random_token();
     match app.db.create_node(&node, &token) {
         // Usable immediately: the install command is readable from the node list,
@@ -906,6 +933,11 @@ pub async fn update_node(
     }
     if let Some(tags) = &mut node.tags {
         if let Some(message) = normalize_tags(tags) {
+            return bad(message);
+        }
+    }
+    if let Some(website) = &mut node.website {
+        if let Some(message) = normalize_website(website) {
             return bad(message);
         }
     }
@@ -2247,7 +2279,11 @@ mod tests {
         app.db
             .update_node(
                 open,
-                &NodePatch { tags: Some("二网精品;1Gbps<green>".into()), ..Default::default() },
+                &NodePatch {
+                    tags: Some("二网精品;1Gbps<green>".into()),
+                    website: Some("https://provider.example/".into()),
+                    ..Default::default()
+                },
             )
             .unwrap();
         let probe = task(&app, vec![open]);
@@ -2277,7 +2313,7 @@ mod tests {
         assert_eq!(public[0]["pings"][0]["latency"], 7);
         assert_eq!(public[0]["pings"][0]["samples"], json!([7]));
         // Disclosing the token would let any visitor impersonate the node.
-        for hidden in ["ip", "remark", "hostname", "token"] {
+        for hidden in ["ip", "remark", "hostname", "token", "website"] {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
         }
         assert!(
@@ -2296,6 +2332,50 @@ mod tests {
         assert_eq!(admin.len(), 2);
         assert_eq!(admin[0]["ip"], "198.51.100.9");
         assert_eq!(admin[0]["remark"], "secret note");
+        assert_eq!(admin[0]["website"], "https://provider.example/");
+    }
+
+    #[tokio::test]
+    async fn websites_can_be_saved_cleared_and_only_use_web_links() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "provider", true);
+        let patch = |website: &str| {
+            update_node(
+                Admin,
+                State(app.clone()),
+                Path(id),
+                Ok(Json(NodePatch { website: Some(website.into()), ..Default::default() })),
+            )
+        };
+        // Warm the same snapshots the HTTP and WebSocket paths send.
+        let _ = live_snapshot(&app, true);
+        assert_eq!(patch("  https://provider.example/plans?ref=monitor  ").await.status(), StatusCode::OK);
+        let website = "https://provider.example/plans?ref=monitor";
+        assert_eq!(app.db.node(id).unwrap().unwrap().website, website);
+        assert!(live_snapshot(&app, true).contains(website));
+        assert!(!live_snapshot(&app, false).contains(website));
+
+        for bad in [
+            "javascript:alert(1)",
+            "data:text/html,test",
+            "ftp://provider.example/",
+            "provider.example",
+            "/relative",
+            "https://user:password@provider.example/",
+            "https://provider.example/with space",
+            "https://provider.example/\u{0000}",
+        ] {
+            assert_eq!(patch(bad).await.status(), StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(app.db.node(id).unwrap().unwrap().website, website);
+        }
+        assert_eq!(
+            patch(&format!("https://provider.example/{}", "x".repeat(2048))).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(patch("http://provider.example/").await.status(), StatusCode::OK);
+        assert_eq!(patch("  ").await.status(), StatusCode::OK);
+        assert_eq!(app.db.node(id).unwrap().unwrap().website, "");
+        assert!(!live_snapshot(&app, true).contains("provider.example"));
     }
 
     #[test]

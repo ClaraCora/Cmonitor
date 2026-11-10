@@ -171,6 +171,7 @@ function NodeForm({ node, onClose, onSaved }: {
     if (!form.name.trim()) return toast.error("请填写节点名称")
     const patch = changes(node, {
       name: form.name.trim(),
+      website: (form.website ?? "").trim(),
       public: form.public,
       remark: form.remark,
       tags: form.tags,
@@ -215,6 +216,16 @@ function NodeForm({ node, onClose, onSaved }: {
         <div className="space-y-5">
           <Field label="名称">
             <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
+          </Field>
+          <Field label="官网地址" hint="填写完整的 HTTP 或 HTTPS 地址；登录后在展示页的 VPS 名称后显示官网按钮，留空不显示。">
+            <Input
+              type="url"
+              aria-label="官网地址"
+              value={form.website ?? ""}
+              maxLength={2048}
+              onChange={(e) => set("website", e.target.value)}
+              placeholder="https://example.com"
+            />
           </Field>
           <Field
             label="标签"

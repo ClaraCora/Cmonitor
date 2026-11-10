@@ -59,6 +59,8 @@ export type Node = {
   ipv4?: string
   ipv6?: string
   remark?: string
+  /** Provider website. Only returned to signed-in callers. */
+  website?: string
   /** Public labels. Separate entries with semicolons; `<color>` is theme metadata. */
   tags: string
   /** Panel only. Empty for nodes created before the hub retained a copy. */
