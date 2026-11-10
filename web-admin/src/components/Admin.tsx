@@ -2233,8 +2233,9 @@ type DbInfo = {
     scheduler: { state: "active" | "inactive" | "not_installed" | "unavailable"; boot_enabled?: boolean; calendar?: string | null; random_delay?: string | null; next_run?: string | null }
     policy: { directory: string; keep: number; offsite: boolean } | null
     copies: number | null
-    checked_at: number
-    timezone: string
+    checked_at: number | null
+    timezone: string | null
+    stale?: boolean
   }
   rows: Record<string, number>
 }
@@ -2345,10 +2346,11 @@ function Data() {
           {stat("异机复制", backup?.policy ? backup.policy.offsite ? "已配置" : "未配置，目前仅保存在本机" : "等待备份任务上报")}
         </div>
         {info.backup_error && <p role="alert" className="text-sm text-destructive">最近备份失败：{info.backup_error}</p>}
+        {backup?.stale && <p role="alert" className="text-sm text-destructive">备份状态尚未上报或已过期，请检查服务器上的状态上报任务。</p>}
         {backup?.policy && <p className="break-all text-xs text-muted-foreground">备份目录：<code>{backup.policy.directory}</code></p>}
         <p className="text-xs leading-relaxed text-muted-foreground">
           新备份成功后才清理超出的旧备份；保留份数与历史数据保留天数分别计算。保留策略和目录来自最近一次备份任务。
-          {backup && <> 服务器时区：{backup.timezone}；状态查询于 {new Date(backup.checked_at * 1000).toLocaleTimeString("zh-CN")}。</>}
+          {backup?.checked_at != null && <> 服务器时区：{backup.timezone}；最近上报 {new Date(backup.checked_at * 1000).toLocaleTimeString("zh-CN")}。</>} 状态每分钟更新一次。
         </p>
       </Card>
       <Card className="gap-4 p-5">

@@ -6,14 +6,16 @@
 
 ```sh
 install -m 700 scripts/backup.py /opt/monitor/backup.py
-install -m 644 deploy/monitor-backup.service deploy/monitor-backup.timer /etc/systemd/system/
+install -m 644 deploy/monitor-backup.service deploy/monitor-backup.timer deploy/monitor-backup-status.service deploy/monitor-backup-status.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now monitor-backup.timer
+systemctl enable --now monitor-backup-status.timer
 systemctl start monitor-backup.service
+systemctl start monitor-backup-status.service
 journalctl -u monitor-backup.service --since today
 ```
 
-默认每天服务器本地时间 03:20 备份，最多随机延后 10 分钟，保留七代。后台“数据与备份”页顶部展示自动备份状态、计划、保留份数、当前本机副本数、最近成功和下次执行时间。定时任务状态实时读取 `monitor-backup.timer`，无法读取或未安装时明确提示，不会因为过去成功过就显示已启用。保留策略与目录由脚本在每次运行时上报；升级脚本后需执行一次备份才会显示。异机复制只报告是否配置，不暴露目标地址。数据库、副本和校验清单仅供运行用户读写。
+默认每天服务器本地时间 03:20 备份，最多随机延后 10 分钟，保留七代。后台“数据与备份”页顶部展示自动备份状态、计划、保留份数、当前本机副本数、最近成功和下次执行时间。独立状态任务每分钟读取 `monitor-backup.timer` 和本机备份目录，只把结果写入数据库；不会创建备份。Hub 只读这份状态，因此无需放宽现有服务隔离或备份目录权限。上报超过三分钟未更新时明确提示状态过期，不会因为过去成功过就显示已启用。保留策略与目录由脚本在每次运行时上报；升级脚本后需执行一次备份才会显示。异机复制只报告是否配置，不暴露目标地址。数据库、副本和校验清单仅供运行用户读写。
 
 异机副本通过服务覆盖配置增加 `--offsite backup@host:/srv/monitor/`，预先配置专用 SSH 密钥、主机指纹与远端目录；脚本不会自行建立信任或开放权限。异机复制使用 rsync 参数调用，不解释 shell 文本。远端保留策略由备份主机管理。备份含凭证，建议备份介质加密，并限制恢复权限。
 
