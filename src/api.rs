@@ -1299,7 +1299,13 @@ fn scratch_path(app: &App, kind: &str) -> String {
 /// 2.2M rows that is 127 ms during which the public page and every agent report
 /// also wait, growing with `retention_days`.
 pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
-    match tokio::task::spawn_blocking(move || app.db.stats()).await {
+    match tokio::task::spawn_blocking(move || {
+        let mut stats = app.db.stats()?;
+        stats["scheduled_backup"] = crate::backup::status(&app.db);
+        Ok::<_, anyhow::Error>(stats)
+    })
+    .await
+    {
         Ok(Ok(stats)) => Json(stats).into_response(),
         Ok(Err(e)) => fail(e),
         Err(e) => fail(anyhow::anyhow!(e)),

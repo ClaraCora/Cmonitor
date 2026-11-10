@@ -23,6 +23,8 @@ def backup(source, directory, keep=7, offsite=None, hub=None):
         raise ValueError("database does not exist")
     if keep < 1:
         raise ValueError("keep must be positive")
+    # Report only the destination kind; never expose an offsite address/key.
+    record(source, "backup_policy", json.dumps({"directory": str(directory), "keep": keep, "offsite": bool(offsite)}))
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(directory, 0o700)
     moment = time.time_ns()

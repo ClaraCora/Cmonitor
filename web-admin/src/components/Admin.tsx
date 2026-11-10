@@ -2229,6 +2229,13 @@ type DbInfo = {
   retention: number
   backup_success?: string | null
   backup_error?: string | null
+  scheduled_backup?: {
+    scheduler: { state: "active" | "inactive" | "not_installed" | "unavailable"; boot_enabled?: boolean; calendar?: string | null; random_delay?: string | null; next_run?: string | null }
+    policy: { directory: string; keep: number; offsite: boolean } | null
+    copies: number | null
+    checked_at: number
+    timezone: string
+  }
   rows: Record<string, number>
 }
 
@@ -2255,7 +2262,8 @@ function Data() {
   const picker = useRef<HTMLInputElement>(null)
 
   const [error, setError] = useState("")
-  const load = () => { setError(""); return api<DbInfo>("/db").then(setInfo).catch((e: Error) => setError(e.message || "网络错误")) }
+  const [refreshing, setRefreshing] = useState(false)
+  const load = () => { setError(""); setRefreshing(true); return api<DbInfo>("/db").then(setInfo).catch((e: Error) => setError(e.message || "网络错误")).finally(() => setRefreshing(false)) }
   useEffect(() => { queueMicrotask(load) }, [])
 
   async function vacuum() {
@@ -2303,6 +2311,11 @@ function Data() {
   }
 
   if (!info) return <LoadState error={error} retry={load} />
+  const backup = info.scheduled_backup
+  const calendar = backup?.scheduler.calendar
+  const daily = calendar?.match(/^\*-\*-\* (\d{2}:\d{2}):\d{2}$/)?.[1]
+  const delay = backup?.scheduler.random_delay?.replace(/min/g, " 分钟").replace(/sec/g, " 秒")
+  const backupState = backup?.scheduler.state === "active" ? "已启用" : backup?.scheduler.state === "inactive" ? "已停用" : backup?.scheduler.state === "not_installed" ? "尚未安装定时任务" : "无法确认定时任务状态"
   const stat = (label: string, value: string) => (
     <div key={label}>
       <div className="text-xs text-muted-foreground">{label}</div>
@@ -2313,6 +2326,31 @@ function Data() {
   return (
     <div className="space-y-4">
       {error && <LoadState error={error} retry={load} />}
+      <Card className="gap-4 p-5" aria-labelledby="scheduled-backup-title">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 id="scheduled-backup-title" className="text-sm font-medium">自动备份</h3>
+            <p className="mt-1 text-sm" role="status">{backupState}{backup?.scheduler.state === "active" && !backup.scheduler.boot_enabled ? "（未设置开机启用）" : ""}</p>
+          </div>
+          <Button size="sm" variant="secondary" disabled={refreshing || !!busy || !!operation} onClick={load}>
+            <RefreshCw className={refreshing ? "animate-spin" : ""} /> {refreshing ? "刷新中…" : "刷新备份状态"}
+          </Button>
+        </div>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          {stat("执行时间（服务器时间）", calendar ? `${daily ? `每天 ${daily}` : calendar}${delay && delay !== "0" ? `，最多延后 ${delay}` : ""}` : "暂无计划信息")}
+          {stat("保留策略", backup?.policy ? `最近 ${backup.policy.keep} 份成功备份` : "等待备份任务上报")}
+          {stat("已有备份", backup?.copies != null ? `${backup.copies} 份` : "无法读取备份目录")}
+          {stat("最近成功", info.backup_success ? new Date(Number(info.backup_success) * 1000).toLocaleString("zh-CN") : "尚无成功记录")}
+          {stat("下次执行（服务器时间）", backup?.scheduler.next_run?.replace(/^\w+ (\d{4}-\d{2}-\d{2}) /, "$1 ") ?? "暂无下次执行时间")}
+          {stat("异机复制", backup?.policy ? backup.policy.offsite ? "已配置" : "未配置，目前仅保存在本机" : "等待备份任务上报")}
+        </div>
+        {info.backup_error && <p role="alert" className="text-sm text-destructive">最近备份失败：{info.backup_error}</p>}
+        {backup?.policy && <p className="break-all text-xs text-muted-foreground">备份目录：<code>{backup.policy.directory}</code></p>}
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          新备份成功后才清理超出的旧备份；保留份数与历史数据保留天数分别计算。保留策略和目录来自最近一次备份任务。
+          {backup && <> 服务器时区：{backup.timezone}；状态查询于 {new Date(backup.checked_at * 1000).toLocaleTimeString("zh-CN")}。</>}
+        </p>
+      </Card>
       <Card className="gap-4 p-5">
         <h3 className="text-sm font-medium">数据库</h3>
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
@@ -2347,9 +2385,7 @@ function Data() {
 
       <Card className="gap-4 p-5">
         <div>
-          <h3 className="text-sm font-medium">备份</h3>
-          <p className="mt-2 text-sm">定时备份：{info.backup_success ? `最近成功 ${new Date(Number(info.backup_success)*1000).toLocaleString("zh-CN")}` : "尚无运行记录，请按部署文档启用定时备份"}</p>
-          {info.backup_error && <p role="alert" className="mt-1 text-sm text-destructive">最近备份失败：{info.backup_error}</p>}
+          <h3 className="text-sm font-medium">手动备份与恢复</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
             导出的是整个数据库，含节点凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，
             当前节点、设置、历史全部作废，所有设备需要重新登录。
@@ -2412,7 +2448,7 @@ const ADMIN_SECTIONS = [
   { path: "/clara/visitors", label: "访客", icon: Users },
   { path: "/clara/ping", label: "延迟", icon: Radio },
   { path: "/clara/notify", label: "通知", icon: Bell },
-  { path: "/clara/data", label: "数据", icon: Database },
+  { path: "/clara/data", label: "数据与备份", icon: Database },
   { path: "/clara/themes", label: "主题", icon: Palette },
   { path: "/clara/security", label: "安全", icon: Shield },
   { path: "/clara/settings", label: "设置", icon: Settings },
@@ -2433,9 +2469,17 @@ export function Admin({
   site: string
   canProvision: boolean
 }) {
+  const navigation = useRef<HTMLElement>(null)
+  useEffect(() => {
+    const nav = navigation.current
+    const active = nav?.querySelector<HTMLButtonElement>('[aria-current="page"]')
+    if (nav && active && nav.scrollWidth > nav.clientWidth) {
+      nav.scrollLeft += active.getBoundingClientRect().left - nav.getBoundingClientRect().left - 8
+    }
+  }, [path])
   return (
     <div className="flex flex-col gap-6 md:flex-row">
-      <nav className="flex gap-1 overflow-x-auto rounded-xl border bg-card p-2 shadow-sm backdrop-blur-md md:w-44 md:shrink-0 md:flex-col md:self-start md:overflow-visible">
+      <nav ref={navigation} className="flex gap-1 overflow-x-auto rounded-xl border bg-card p-2 shadow-sm backdrop-blur-md md:w-44 md:shrink-0 md:flex-col md:self-start md:overflow-visible">
         {ADMIN_SECTIONS.map(({ path: to, label, icon: Icon }) => {
           const active = path === to
           return (

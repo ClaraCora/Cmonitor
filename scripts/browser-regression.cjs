@@ -28,6 +28,7 @@ async function main() {
   const browser = await chromium.launch({ headless: true, ...(process.env.UX_BROWSER_CHANNEL ? { channel: process.env.UX_BROWSER_CHANNEL } : {}) })
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, locale: 'zh-CN', hasTouch: true })
   let settingsFail = false, pingFail = false, outage = false, authed = true, restorePhase = 'applying', restoreId = ''
+  let backupState = 'active', backupFail = false, backupError = ''
   const sockets = new Set(), timers = new Set(), writes = [], historyCalls = []
   const errors = []
   try {
@@ -37,6 +38,7 @@ async function main() {
       if (outage && pathname === '/api/nodes') return fail('模拟网络中断')
       if (settingsFail && pathname === '/api/settings') return fail('模拟设置加载失败')
       if (pingFail && pathname === '/api/ping-tasks') return fail('模拟探测加载失败')
+      if (backupFail && pathname === '/api/db') return fail('模拟备份状态加载失败')
       if (req.method() !== 'GET') {
         writes.push({ pathname, method:req.method(), body:req.postData() })
         if (pathname === '/api/auth/logout') return fail('模拟退出失败')
@@ -52,7 +54,7 @@ async function main() {
       let data = {}
       if (pathname === '/api/me') data = {...me,authed}
       else if (pathname === '/api/nodes') data = {nodes,admin:authed}
-      else if (pathname === '/api/db') data = {path:'fixture.db',size:1024,wal:0,free:0,oldest:null,retention:7,rows:{}}
+      else if (pathname === '/api/db') data = {path:'fixture.db',size:1024,wal:0,free:0,oldest:null,retention:7,rows:{},backup_success:'1794280900',backup_error:backupError,scheduled_backup:{scheduler:{state:backupState,boot_enabled:true,calendar:'*-*-* 03:20:00',random_delay:'10min',next_run:backupState==='active'?'Wed 2026-11-11 03:21:27 CST':null},policy:{directory:'/opt/monitor/backups',keep:7,offsite:false},copies:1,checked_at:1794280900,timezone:'UTC+08:00'}}
       else if (/^\/api\/db\/restore\/[a-f0-9]{32}$/.test(pathname)) data = {phase:restorePhase}
       else if (pathname === '/api/settings') data = settings
       else if (pathname.endsWith('/metrics')) {
@@ -126,6 +128,30 @@ async function main() {
       assert.equal(await page.getByText('还没有延迟监控。',{exact:false}).count(),0)
 
       await page.goto(origin+'/clara/data')
+      await page.getByRole('heading',{name:'自动备份',exact:true}).waitFor()
+      await page.getByText('最近 7 份成功备份',{exact:true}).waitFor()
+      await page.getByText('每天 03:20，最多延后 10 分钟',{exact:true}).waitFor()
+      await page.getByText('2026-11-11 03:21:27 CST',{exact:true}).waitFor()
+      await page.getByText('未配置，目前仅保存在本机',{exact:true}).waitFor()
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false)
+      await page.screenshot({animations:'disabled',path:path.join(output,'backup-mobile.png'),fullPage:true})
+      await page.setViewportSize({width:1440,height:1000})
+      await page.screenshot({animations:'disabled',path:path.join(output,'backup-desktop.png'),fullPage:true})
+      backupState='inactive'
+      await page.getByRole('button',{name:'刷新备份状态',exact:true}).click()
+      await page.getByText('已停用',{exact:true}).waitFor()
+      assert.equal(await page.getByText('2026-11-11 03:21:27 CST',{exact:true}).count(),0,'stopped timer cannot retain a stale next run')
+      backupFail=true
+      await page.getByRole('button',{name:'刷新备份状态',exact:true}).click()
+      await page.getByText('加载失败：模拟备份状态加载失败').waitFor()
+      await page.getByText('最近 7 份成功备份',{exact:true}).waitFor()
+      backupFail=false; backupState='unavailable'; backupError='模拟备份失败'
+      await page.getByRole('button',{name:'刷新备份状态',exact:true}).click()
+      await page.getByText('无法确认定时任务状态',{exact:true}).waitFor()
+      await page.getByRole('alert').filter({hasText:'最近备份失败：模拟备份失败'}).waitFor()
+      backupState='active'; backupError=''
+      await page.getByRole('button',{name:'刷新备份状态',exact:true}).click()
+      await page.getByText('已启用',{exact:true}).waitFor()
       await page.getByRole('button',{name:'导入备份',exact:true}).waitFor()
       await page.locator('input[type=file]').setInputFiles({name:'isolated.db',mimeType:'application/octet-stream',buffer:Buffer.from('fixture upload only')})
       await page.getByRole('button',{name:'确认恢复',exact:true}).click()
