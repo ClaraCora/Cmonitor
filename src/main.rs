@@ -7,6 +7,7 @@
 mod agent_ws;
 mod api;
 mod auth;
+mod backup;
 mod db;
 mod frontend;
 mod notify;

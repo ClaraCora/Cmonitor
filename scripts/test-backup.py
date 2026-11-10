@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from contextlib import closing
 import os
 from pathlib import Path
@@ -53,6 +54,8 @@ class BackupTests(unittest.TestCase):
             self.assertFalse(list(copies.glob("*.partial")))
             with closing(sqlite3.connect(live)) as conn:
                 self.assertTrue(conn.execute("SELECT value FROM setting WHERE key='backup_last_success'").fetchone())
+                policy = json.loads(conn.execute("SELECT value FROM setting WHERE key='backup_policy'").fetchone()[0])
+                self.assertEqual(policy, {"directory": str(copies.resolve()), "keep": 2, "offsite": False})
 
     def test_failed_offsite_copy_preserves_every_previous_generation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -66,6 +69,11 @@ class BackupTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     module.backup(live, copies, keep=1, offsite="unused-fixture")
             self.assertTrue(before <= set(copies.glob("monitor-*.db")))
+            with closing(sqlite3.connect(live)) as conn:
+                policy = json.loads(conn.execute("SELECT value FROM setting WHERE key='backup_policy'").fetchone()[0])
+                self.assertEqual(policy["keep"], 1)
+                self.assertTrue(policy["offsite"])
+                self.assertNotIn("unused-fixture", json.dumps(policy))
 
 
 if __name__ == "__main__":
