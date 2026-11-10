@@ -167,6 +167,8 @@ fn node_view(
     // An allowlist rather than a denylist: the agent ships from its own
     // repository, so a field added there would otherwise reach anonymous visitors
     // the day it is released. No address, hostname or note may ever do so.
+    view["permanent"] = json!(node.permanent);
+    view["traffic_incomplete"] = json!(traffic.traffic_incomplete);
     if !full {
         if let Some(m) = view["metrics"].as_object_mut() {
             m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()));
@@ -182,6 +184,7 @@ fn node_view(
         view["remark"] = json!(node.remark);
         view["token"] = json!(node.token);
         view["notify"] = json!(node.notify);
+        view["muted_until"] = json!(node.muted_until);
         view["website"] = json!(node.website);
     }
     view
@@ -944,12 +947,52 @@ pub async fn update_node(
     if let Some(message) = node_limits(node.traffic_reset_day, node.price, node.traffic_limit) {
         return bad(message);
     }
+    if let Some(p) = &node.traffic_correction {
+        if [p.total_rx, p.total_tx, p.month_rx, p.month_tx].into_iter().flatten().any(|v| v < 0) {
+            return bad("traffic must be non-negative");
+        }
+    }
+    if let Some(Some(date)) = &node.expires_at {
+        if date.parse::<chrono::NaiveDate>().is_err() {
+            return bad("invalid expiry date");
+        }
+    }
+    if node.permanent == Some(true) {
+        node.expires_at = Some(None);
+    } else if node.expires_at.as_ref().is_some_and(Option::is_some) {
+        node.permanent = Some(false);
+    }
     match app.db.update_node(id, &node) {
         Ok(true) => {
             invalidate_snapshot(&app);
             Json(json!({"ok": true})).into_response()
         }
         Ok(false) => no_such_node(),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Renewal {
+    expected_expiry: String,
+}
+pub async fn renew_node(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    Json(body): Json<Renewal>,
+) -> Response {
+    match app.db.renew_node(id, &body.expected_expiry) {
+        Ok(_) => {
+            invalidate_snapshot(&app);
+            Json(json!({"ok":true})).into_response()
+        }
+        Err(e) => bad(&e.to_string()),
+    }
+}
+pub async fn renewals(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    match app.db.renewals(id) {
+        Ok(history) => Json(json!({"history":history})).into_response(),
         Err(e) => fail(e),
     }
 }
@@ -1317,13 +1360,15 @@ pub async fn db_restore(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Response {
-    // One fixed path, which is what allows the file's own length to constitute
-    // the entire protocol.
-    // ponytail: one upload in flight per hub. Two started simultaneously land on
-    // this same name, and equal-sized chunks align their offsets, so they splice
-    // rather than collide. The cost is a failed upload; distinguishing them would
-    // require the upload id the protocol deliberately omits.
-    let path = format!("{}.upload", app.db.file());
+    // New clients stage under an unpredictable operation id and apply separately.
+    // The legacy fixed-path protocol remains compatible with existing clients.
+    let operation = headers.get("x-cmonitor-restore-id").and_then(|h| h.to_str().ok());
+    if operation.is_some_and(|id| !valid_operation(id)) {
+        return bad("invalid restore id");
+    }
+    let path = operation
+        .map(|id| format!("{}.upload-{id}", app.db.file()))
+        .unwrap_or_else(|| format!("{}.upload", app.db.file()));
     let received = match receive(&path, &chunk, MAX_RESTORE, body).await {
         Ok(received) => received,
         Err(e) => return bad(&format!("{e:#}")),
@@ -1331,6 +1376,14 @@ pub async fn db_restore(
     if received < chunk.total {
         return Json(json!({"received": received})).into_response();
     }
+
+    if let Some(id) = operation {
+        return Json(json!({"operation":id,"phase":"uploaded"})).into_response();
+    }
+
+    let Ok(_permit) = RESTORE_GATE.try_acquire() else {
+        return (StatusCode::CONFLICT, "已有恢复正在执行").into_response();
+    };
 
     // Moved off the upload name before a byte is read. Splicing costs an upload;
     // what it must not cost is the live database, which without this it could:
@@ -1385,9 +1438,147 @@ async fn restore(app: &Shared, path: &str) -> Result<(), anyhow::Error> {
     let (app, source) = (app.clone(), path.to_owned());
     tokio::task::spawn_blocking(move || {
         app.db.check_backup(&source)?;
+        let safety = format!("{}.before-restore-{}.db", app.db.file(), &random_token()[..16]);
+        app.db.backup_into(&safety)?;
         app.db.restore_from(&source)
     })
     .await?
+}
+
+// A random operation id is a capability to read only this restore's phase. It never issues a session.
+static RESTORE_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+fn valid_operation(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+fn restore_run() -> &'static str {
+    static RUN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUN.get_or_init(random_token)
+}
+fn restore_status_path(app: &App, id: &str) -> String {
+    format!("{}.restore-{id}.json", app.db.file())
+}
+fn record_restore(app: &App, id: &str, phase: &str) -> anyhow::Result<()> {
+    let path = restore_status_path(app, id);
+    let temp = format!("{path}.tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    use std::io::Write;
+    let mut file = options.open(&temp)?;
+    file.write_all(serde_json::to_string(&json!({"phase":phase,"run":restore_run()}))?.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(temp, path)?;
+    Ok(())
+}
+pub async fn restore_status(State(app): State<Shared>, Path(id): Path<String>) -> Response {
+    if !valid_operation(&id) {
+        return bad("invalid restore id");
+    }
+    let value = std::fs::read(restore_status_path(&app, &id))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    match value {
+        Some(value) => {
+            let phase = value["phase"].as_str().unwrap_or("unknown");
+            let phase = if matches!(phase, "validating" | "applying") && value["run"] != restore_run() {
+                "interrupted"
+            } else {
+                phase
+            };
+            Json(json!({"phase":phase})).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "尚未确认恢复操作，请检查结果后重试").into_response(),
+    }
+}
+pub async fn restore_cancel(_: Admin, State(app): State<Shared>, Path(id): Path<String>) -> Response {
+    if !valid_operation(&id) {
+        return bad("invalid restore id");
+    }
+    if std::path::Path::new(&restore_status_path(&app, &id)).exists() {
+        return (StatusCode::CONFLICT, "恢复已提交，请查询结果").into_response();
+    }
+    match std::fs::remove_file(format!("{}.upload-{id}", app.db.file())) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// Collect abandoned staged uploads after two days; intentional rollback copies are retained.
+pub fn cleanup_restore_uploads(app: &App) -> anyhow::Result<()> {
+    let file = std::path::PathBuf::from(app.db.file());
+    let Some(name) = file.file_name().and_then(|n| n.to_str()) else { return Ok(()) };
+    let prefix = format!("{name}.upload-");
+    for entry in std::fs::read_dir(file.parent().unwrap_or(std::path::Path::new(".")))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !entry.file_type()?.is_file() || !name.strip_prefix(&prefix).is_some_and(valid_operation) {
+            continue;
+        }
+        if entry.metadata()?.modified()?.elapsed().is_ok_and(|age| age.as_secs() > 2 * 86400) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn restore_apply(_: Admin, State(app): State<Shared>, Path(id): Path<String>) -> Response {
+    if !valid_operation(&id) {
+        return bad("invalid restore id");
+    }
+    let Ok(permit) = RESTORE_GATE.try_acquire() else {
+        return (StatusCode::CONFLICT, "已有恢复正在执行").into_response();
+    };
+    if std::path::Path::new(&restore_status_path(&app, &id)).exists() {
+        return (StatusCode::CONFLICT, "该恢复已提交，请查询结果").into_response();
+    }
+    let upload = format!("{}.upload-{id}", app.db.file());
+    let source = scratch_path(&app, "restoring");
+    if let Err(e) = std::fs::rename(upload, &source) {
+        return bad(&format!("上传文件不可用：{e}"));
+    }
+    if let Err(e) = record_restore(&app, &id, "validating") {
+        let _ = std::fs::rename(&source, format!("{}.upload-{id}", app.db.file()));
+        return fail(e);
+    }
+    tokio::spawn(async move {
+        let worker = app.clone();
+        let operation = id.clone();
+        let cleanup = source.clone();
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            worker.db.check_backup(&source)?;
+            let safety = format!("{}.before-restore-{operation}.db", worker.db.file());
+            worker.db.backup_into(&safety)?;
+            record_restore(&worker, &operation, "applying")?;
+            worker.db.restore_from(&source)?;
+            worker.db.drop_all_sessions()?;
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{source}{suffix}"));
+            }
+            Ok(())
+        })
+        .await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{cleanup}{suffix}"));
+        }
+        let phase = if matches!(result, Ok(Ok(()))) {
+            "complete"
+        } else {
+            tracing::warn!("restore {id} failed: {result:?}");
+            "failed"
+        };
+        app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
+        app.terminals.disconnect_all();
+        invalidate_snapshot(&app);
+        if let Err(e) = record_restore(&app, &id, phase) {
+            tracing::warn!("restore status write failed: {e:#}");
+        }
+        drop(permit);
+    });
+    (StatusCode::ACCEPTED, Json(json!({"phase":"validating"}))).into_response()
 }
 
 /// Drops history beyond the retention window and rebuilds the file around what
@@ -2037,14 +2228,65 @@ mod tests {
         assert_eq!(done.status(), StatusCode::OK);
         assert_eq!(app.db.nodes().unwrap().len(), 1, "the backup went in");
 
-        // The database and its journal are the only files that may remain.
+        // Temporary files are removed; the intentional rollback copy remains.
         let left: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
             .filter(|name| !matches!(name.as_str(), "live.db" | "live.db-wal" | "live.db-shm"))
             .collect();
-        assert!(left.is_empty(), "left beside the database: {left:?}");
+        assert_eq!(left.len(), 1, "left beside the database: {left:?}");
+        assert!(left[0].starts_with("live.db.before-restore-") && left[0].ends_with(".db"));
+        app.db.check_backup(&dir.join(&left[0]).to_string_lossy()).unwrap();
+        drop(app);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn staged_restore_never_applies_until_commit_and_exposes_a_durable_result() {
+        let dir = std::env::temp_dir().join(format!("monitor-staged-{}", random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.db").to_string_lossy().into_owned();
+        let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
+        node(&app, "before", true);
+        app.db.create_session("revoked-from-backup", chrono::Utc::now().timestamp() + 3600).unwrap();
+        let copy = dir.join("copy.db").to_string_lossy().into_owned();
+        app.db.backup_into(&copy).unwrap();
+        node(&app, "after", true);
+        let bytes = std::fs::read(&copy).unwrap();
+        let id = &random_token()[..32];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-cmonitor-restore-id", id.parse().unwrap());
+        let uploaded = db_restore(
+            Admin,
+            State(app.clone()),
+            Query(Chunk { offset: 0, total: bytes.len() as u64 }),
+            headers,
+            axum::body::Body::from(bytes),
+        )
+        .await;
+        assert_eq!(uploaded.status(), StatusCode::OK);
+        assert_eq!(app.db.nodes().unwrap().len(), 2, "upload alone cannot replace data");
+        let applied = restore_apply(Admin, State(app.clone()), Path(id.to_string())).await;
+        assert_eq!(applied.status(), StatusCode::ACCEPTED);
+        for _ in 0..200 {
+            let status = restore_status(State(app.clone()), Path(id.to_string())).await;
+            let body = axum::body::to_bytes(status.into_body(), 1024).await.unwrap();
+            let phase: Value = serde_json::from_slice(&body).unwrap();
+            if phase["phase"] == "complete" {
+                break;
+            }
+            assert_ne!(phase["phase"], "failed");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(app.db.nodes().unwrap().len(), 1);
+        assert!(!app.db.session_valid("revoked-from-backup"));
+        assert!(std::path::Path::new(&format!("{live}.before-restore-{id}.db")).is_file());
+        assert_eq!(
+            restore_apply(Admin, State(app.clone()), Path(id.to_string())).await.status(),
+            StatusCode::CONFLICT
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A connected agent holding one report. The receiver is returned because

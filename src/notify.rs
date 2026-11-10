@@ -4,7 +4,7 @@
 //!
 //! Events: a node going offline and returning, a billing period's traffic
 //! crossing the threshold and the full allowance, expiry dates approaching or
-//! rolled forward, and a sign-in to the panel.
+//! resource/probe failures and recovery, and a sign-in to the panel.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -20,16 +20,18 @@ use chrono::{DateTime, Local, NaiveDate, TimeZone, Timelike, Utc};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::api::Admin;
 use crate::{App, Shared};
 
 /// One alert. `node` lists the node names it concerns, comma-separated, and is
 /// empty for a sign-in.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Note {
-    pub event: &'static str,
+    pub event: String,
+    #[serde(default)]
+    pub id: String,
     pub node: String,
     pub title: String,
     pub message: String,
@@ -38,13 +40,10 @@ pub struct Note {
     pub time: i64,
 }
 
-/// Alerts awaiting delivery. A channel that stays down holds each alert for
-/// about a minute per channel (`ATTEMPTS` × the 15 s client timeout plus the
-/// pauses), so the queue can fill; beyond it alerts are dropped with a warning
-/// rather than held in memory without bound.
+/// Bounded wakeup hints. Events and per-channel attempts live in SQLite; losing
+/// a wakeup cannot lose an event because the worker also checks every two seconds.
 pub const QUEUE: usize = 64;
-const ATTEMPTS: u32 = 3;
-const RETRY: Duration = Duration::from_secs(10);
+const ATTEMPTS: i64 = 6;
 
 /// Nodes listed in one alert before the rest are only counted. Discord rejects a
 /// message over 2000 characters and WeCom one over 2048 bytes, and an outage on
@@ -68,7 +67,7 @@ pub const DEFAULT_BODY: &str =
 pub const DEFAULT_TEXT: &str = "{{title}}\n{{message}}";
 
 /// Numeric settings as `(key, min, max, default)`.
-const NUMBERS: [(&str, i64, i64, i64); 3] = [
+const NUMBERS: [(&str, i64, i64, i64); 7] = [
     // Minutes a node may stay away before it is reported. Agents reconnect within
     // seconds of a network or hub interruption, which one minute already covers.
     // Capped at FLAP_GRACE: a longer grace would outwait a flapping node too, and
@@ -82,6 +81,10 @@ const NUMBERS: [(&str, i64, i64, i64); 3] = [
     // Days ahead an expiry is listed; 0 disables both expiry reminders and
     // renewal notices.
     ("notify_expiry", 0, 365, 7),
+    ("notify_disk_percent", 0, 100, 90),
+    ("notify_disk_minutes", 1, 120, 10),
+    ("notify_ping_failures", 0, 20, 3),
+    ("notify_cooldown", 1, 1440, 60),
 ];
 
 /// Credentials, reported to the panel only as set or unset. A webhook URL is
@@ -172,7 +175,7 @@ pub fn setting_error(key: &str, value: &str) -> Option<String> {
 /// Values that exercise every escape the body template must survive.
 fn sample() -> Note {
     Note {
-        event: "test",
+        event: "test".into(),
         node: r#"a"b\c"#.into(),
         title: "{{message}}".into(),
         message: "line\nline".into(),
@@ -204,12 +207,13 @@ fn parse_headers(text: &str) -> Result<Vec<(HeaderName, HeaderValue)>, String> {
 fn render(template: &str, note: &Note, site: &str, json: bool) -> String {
     let time = clock(note.time);
     let fields = [
-        ("{{event}}", note.event),
+        ("{{event}}", note.event.as_str()),
         ("{{node}}", note.node.as_str()),
         ("{{title}}", note.title.as_str()),
         ("{{message}}", note.message.as_str()),
         ("{{site}}", site),
         ("{{time}}", time.as_str()),
+        ("{{id}}", note.id.as_str()),
     ];
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -317,7 +321,7 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
     // The URL is stripped from the error: Telegram's carries the bot token and a
     // webhook's is often the credential, and the error reaches both the journal
     // and the panel.
-    let mut response = request.send().await.map_err(|e| Failure {
+    let mut response = request.header("X-Cmonitor-Event-Id", &note.id).send().await.map_err(|e| Failure {
         retry: true,
         reason: format!("{:#}", anyhow::Error::from(e.without_url())),
     })?;
@@ -343,35 +347,72 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
 
 /// Queues an alert without waiting, so that sign-in and housekeeping never
 /// stall behind a slow channel.
-pub fn send(app: &App, mut note: Note) {
-    note.time = Utc::now().timestamp();
-    if let Err(mpsc::error::TrySendError::Full(note)) = app.notes.try_send(note) {
-        warn!("notification queue is full; dropped {:?}", note.title);
+fn stamp(note: &mut Note, now: i64) {
+    note.time = now;
+    if note.id.is_empty() {
+        note.id = format!("{:032x}", rand::random::<u128>());
     }
 }
 
-/// Delivers queued alerts one at a time, each channel retried independently.
-///
-/// At most once: an alert that exhausts its attempts is dropped, and the state
-/// that produced it (`down_since`, the traffic step, the digest date) already
-/// records it as sent, so it is not raised again.
+pub fn send(app: &App, mut note: Note) {
+    stamp(&mut note, Utc::now().timestamp());
+    let configured = channels(app);
+    let names: Vec<_> = configured.iter().map(Channel::name).collect();
+    if let Err(e) = app.db.queue_notifications(&[note.clone()], &names, &[], &[], None) {
+        warn!("could not persist notification: {e:#}");
+        return;
+    }
+    // Only a wakeup hint. A full or closed inbox cannot lose the persisted event.
+    let _ = app.notes.try_send(note);
+}
+
 pub async fn deliver(app: Shared, mut inbox: mpsc::Receiver<Note>) {
-    while let Some(note) = inbox.recv().await {
-        for channel in channels(&app) {
-            for attempt in 1..=ATTEMPTS {
-                match post(&app, &channel, &note).await {
-                    Ok(()) => break,
-                    Err(f) if !f.retry || attempt == ATTEMPTS => {
-                        warn!("{} alert {:?} not delivered: {}", channel.name(), note.title, f.reason);
-                        break;
-                    }
-                    Err(f) => {
-                        debug!("{} alert {:?}, attempt {attempt}: {}", channel.name(), note.title, f.reason);
-                        tokio::time::sleep(RETRY).await;
-                    }
-                }
+    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        tokio::select! { _ = ticker.tick() => {}, item = inbox.recv() => { if item.is_none() { return; } } }
+        if let Err(e) = deliver_due(&app).await {
+            warn!("notification delivery failed: {e:#}");
+        }
+    }
+}
+
+async fn deliver_due(app: &App) -> Result<()> {
+    for (id, name, payload, attempts) in app.db.due_notifications(Utc::now().timestamp())? {
+        let note: Note = serde_json::from_str(&payload)?;
+        let configured = channels(app);
+        let Some(channel) = configured.iter().find(|c| c.name() == name) else {
+            app.db.finish_notification(&id, &name, "failed", "通知渠道已移除，请配置后重试", 0)?;
+            continue;
+        };
+        match post(app, channel, &note).await {
+            Ok(()) => app.db.finish_notification(&id, &name, "delivered", "", 0)?,
+            Err(f) => {
+                // Remote bodies can echo credentials; history stores only the HTTP status.
+                let reason =
+                    f.reason.split(':').next().unwrap_or("投递失败").chars().take(120).collect::<String>();
+                let status = if !f.retry || attempts + 1 >= ATTEMPTS { "failed" } else { "pending" };
+                let next = Utc::now().timestamp() + (10_i64 * 2_i64.pow(attempts.min(8) as u32)).min(3600);
+                app.db.finish_notification(&id, &name, status, &reason, next)?;
             }
         }
+    }
+    Ok(())
+}
+
+pub async fn history(_: Admin, State(app): State<Shared>) -> Response {
+    match app.db.notification_history() {
+        Ok(items) => Json(json!({"items":items})).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+pub async fn retry(
+    _: Admin,
+    State(app): State<Shared>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match app.db.retry_notification(&id) {
+        Ok(count) => Json(json!({"retried":count})).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -383,7 +424,7 @@ pub async fn test(_: Admin, State(app): State<Shared>) -> Response {
         return (StatusCode::BAD_REQUEST, "no notification channel is configured").into_response();
     }
     let note = Note {
-        event: "test",
+        event: "test".into(),
         title: "✅ 测试通知".into(),
         message: "收到这条说明通知渠道可用".into(),
         time: Utc::now().timestamp(),
@@ -405,16 +446,7 @@ pub async fn test(_: Admin, State(app): State<Shared>) -> Response {
 pub fn signed_in(app: &App, how: &str, ip: IpAddr) {
     if app.db.get("notify_login").as_deref() != Some("off") {
         let message = format!("{how} · 来自 {ip}");
-        send(app, Note { event: "login", title: "🔑 面板登录".into(), message, ..Default::default() });
-    }
-}
-
-/// Expiry dates that housekeeping rolled forward, as `(name, "old → new")`.
-pub fn renewed(app: &App, items: Vec<(&str, String)>) {
-    if number(app, "notify_expiry") > 0 {
-        if let Some(note) = batch("renew", "🔁", "已自动续期", items) {
-            send(app, note);
-        }
+        send(app, Note { event: "login".into(), title: "🔑 面板登录".into(), message, ..Default::default() });
     }
 }
 
@@ -442,7 +474,7 @@ pub fn expiry_digest(app: &App, now: DateTime<Local>) -> Result<Option<Note>> {
         })
         .collect();
     soon.sort();
-    app.db.set("notify_expiry_sent", &today.to_string())?;
+
     let items = soon
         .iter()
         .map(|(date, name)| {
@@ -453,7 +485,19 @@ pub fn expiry_digest(app: &App, now: DateTime<Local>) -> Result<Option<Note>> {
             (name.as_str(), format!("{date} {left}"))
         })
         .collect();
-    Ok(batch("expiry", "⏳", "即将到期", items))
+    let mut note = batch("expiry", "⏳", "即将到期", items);
+    if let Some(note) = &mut note {
+        stamp(note, now.timestamp());
+    }
+    let configured = channels(app);
+    app.db.queue_notifications(
+        &note.clone().into_iter().collect::<Vec<_>>(),
+        &configured.iter().map(Channel::name).collect::<Vec<_>>(),
+        &[],
+        &[],
+        Some(&today.to_string()),
+    )?;
+    Ok(note)
 }
 
 /// One alert for any number of nodes: a list in the message, the names in
@@ -472,11 +516,11 @@ fn batch(event: &'static str, mark: &str, what: &str, items: Vec<(&str, String)>
         }
     };
     let node = items.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(", ");
-    Some(Note { event, node, title, message, ..Default::default() })
+    Some(Note { event: event.into(), node, title, message, ..Default::default() })
 }
 
 /// Sweep state that need not outlive the process.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Watch {
     /// Set after the first sweep, which records the traffic steps already reached
     /// without announcing them again after a restart.
@@ -502,7 +546,7 @@ pub async fn watch(app: Shared) {
         ticker.tick().await;
         // Synchronous database work, kept off the runtime threads like a report.
         match tokio::task::block_in_place(|| sweep(&app, &mut watch, Utc::now().timestamp())) {
-            Ok(notes) => notes.into_iter().for_each(|note| send(&app, note)),
+            Ok(_) => {}
             Err(e) => warn!("notification sweep failed: {e:#}"),
         }
     }
@@ -521,6 +565,12 @@ pub async fn watch(app: Shared) {
 /// is configured, so configuring one afterwards still reports nodes already down
 /// and traffic already past a step.
 fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
+    let mut next = watch.clone();
+    let notes = sweep_inner(app, &mut next, now)?;
+    *watch = next;
+    Ok(notes)
+}
+fn sweep_inner(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
     let online: HashSet<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
     let nodes = app.db.nodes()?;
     // Node ids are rowids, which SQLite hands to the next node created once the
@@ -535,14 +585,18 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
     let grace = number(app, "notify_grace") * 60;
     let armed = !channels(app).is_empty();
     let (mut down, mut up) = (Vec::new(), Vec::new());
+    let mut down_changes = Vec::new();
+    let mut state_changes = Vec::new();
     for node in &nodes {
         if online.contains(&node.id) {
             if watch.absent.remove(&node.id).is_some_and(|since| now - since >= grace) {
                 watch.returned.insert(node.id, now);
             }
-            if node.down_since > 0 {
-                app.db.set_down_since(node.id, 0)?;
-                up.push((node.name.as_str(), format!("离线 {}", span(now - node.down_since))));
+            if armed && node.down_since > 0 {
+                down_changes.push((node.id, 0));
+                if node.muted_until <= now {
+                    up.push((node.name.as_str(), format!("离线 {}", span(now - node.down_since))));
+                }
             }
             continue;
         }
@@ -554,8 +608,8 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
         let since = *watch.absent.entry(node.id).or_insert(now);
         let flapping = watch.returned.get(&node.id).is_some_and(|back| since - back < FLAP_WINDOW);
         let wait = if flapping { FLAP_GRACE } else { grace };
-        if armed && node.notify && node.down_since == 0 && now - since >= wait {
-            app.db.set_down_since(node.id, node.last_seen)?;
+        if armed && node.notify && node.muted_until <= now && node.down_since == 0 && now - since >= wait {
+            down_changes.push((node.id, node.last_seen));
             down.push((node.name.as_str(), format!("最后上报 {}", clock(node.last_seen))));
         }
     }
@@ -568,6 +622,9 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
     let mut metered = Vec::new();
     let traffic = if percent > 0 && armed { app.db.all_traffic() } else { HashMap::new() };
     for node in nodes.iter().filter(|n| n.traffic_limit > 0) {
+        if node.muted_until > now {
+            continue;
+        }
         let Some(t) = traffic.get(&node.id) else { continue };
         let used = match node.traffic_mode.as_str() {
             "up" => t.month_tx,
@@ -586,9 +643,13 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
         };
         // A step below the one recorded is a manual correction; storing it lets the
         // same crossing be announced again.
+        let key = format!("traffic:{}:{}", node.id, t.month_start);
+        let persisted = app.db.alert_value(&key);
         let last = watch.traffic.insert(node.id, (t.month_start.clone(), step));
+        state_changes.push((key, step));
         let told = last.is_some_and(|(period, last)| period == t.month_start && last >= step);
-        if step == 0 || told || !watch.primed {
+        if step == 0 || told || persisted.is_some_and(|p| p >= step) || (!watch.primed && persisted.is_none())
+        {
             continue;
         }
         let mode = match node.traffic_mode.as_str() {
@@ -598,8 +659,9 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
             _ => "上下行相加",
         };
         let share = used as i128 * 100 / node.traffic_limit as i128;
+        let qualifier = if t.traffic_incomplete { "已记录至少" } else { "已用" };
         let detail = format!(
-            "已用 {share}%，{} / {}（{mode}），本期自 {} 起",
+            "{qualifier} {share}%，{} / {}（{mode}），本期自 {} 起",
             gib(used),
             gib(node.traffic_limit),
             t.month_start
@@ -607,6 +669,116 @@ fn sweep(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
         metered.push((node.name.as_str(), detail));
     }
     notes.extend(batch("traffic", "⚠️", "流量提醒", metered));
+    // Resource and probe rules share the node's opt-in and maintenance pause.
+    // Persisted alarm state and deliveries commit in the same transaction below.
+    if armed {
+        let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
+        let tasks = app.db.ping_tasks()?;
+        for node in &nodes {
+            if !node.notify || node.muted_until > now || !agents.contains_key(&node.id) {
+                state_changes.push((format!("disk:{}", node.id), 0));
+                continue;
+            }
+            let Some(agent) = agents.get(&node.id) else { continue };
+            let threshold = number(app, "notify_disk_percent");
+            let total = agent.metrics["disk_total"].as_f64().unwrap_or(0.0);
+            let used = agent.metrics["disk_used"].as_f64().unwrap_or(0.0);
+            if threshold > 0 && total > 0.0 && now - agent.last_seen <= 120 {
+                let percent = used / total * 100.0;
+                let key = format!("disk:{}", node.id);
+                let active_key = format!("disk-active:{}", node.id);
+                let last_key = format!("disk-last:{}", node.id);
+                let active = app.db.alert_value(&active_key).unwrap_or(0) != 0;
+                let since = if watch.primed {
+                    app.db.alert_value(&key).filter(|v| *v > 0).unwrap_or(now)
+                } else {
+                    now
+                };
+                if percent >= threshold as f64 {
+                    state_changes.push((key, since));
+                    let cooled = now - app.db.alert_value(&last_key).unwrap_or(0)
+                        >= number(app, "notify_cooldown") * 60;
+                    if !active && cooled && now - since >= number(app, "notify_disk_minutes") * 60 {
+                        notes.push(Note {
+                            event: "disk".into(),
+                            node: node.name.clone(),
+                            title: format!("磁盘空间告警 · {}", node.name),
+                            message: format!(
+                                "磁盘已用 {percent:.1}%，持续 {} 分钟",
+                                number(app, "notify_disk_minutes")
+                            ),
+                            ..Default::default()
+                        });
+                        state_changes.push((active_key, 1));
+                        state_changes.push((last_key, now));
+                    }
+                } else {
+                    state_changes.push((key, 0));
+                    if active && percent <= (threshold - 5).max(0) as f64 {
+                        notes.push(Note {
+                            event: "disk_recovery".into(),
+                            node: node.name.clone(),
+                            title: format!("磁盘空间恢复 · {}", node.name),
+                            message: format!("磁盘已用 {percent:.1}%"),
+                            ..Default::default()
+                        });
+                        state_changes.push((active_key, 0));
+                    }
+                }
+            } else {
+                // Missing or stale observations cannot prove a continuous breach.
+                state_changes.push((format!("disk:{}", node.id), 0));
+            }
+            let failures = number(app, "notify_ping_failures") as usize;
+            if failures == 0 {
+                continue;
+            }
+            for task in tasks.iter().filter(|task| task.nodes.contains(&node.id)) {
+                let Some(reading) = agent.pings.get(&task.id) else { continue };
+                if now - reading.updated_at > task.interval * 2 + 30 {
+                    continue;
+                }
+                let key = format!("probe:{}:{}", node.id, task.id);
+                let last_key = format!("probe-last:{}:{}", node.id, task.id);
+                let active = app.db.alert_value(&key).unwrap_or(0) != 0;
+                let bad = reading.samples.len() >= failures
+                    && reading.samples.iter().rev().take(failures).all(|v| *v < 0);
+                let cooled =
+                    now - app.db.alert_value(&last_key).unwrap_or(0) >= number(app, "notify_cooldown") * 60;
+                if bad && !active && cooled {
+                    notes.push(Note {
+                        event: "probe".into(),
+                        node: node.name.clone(),
+                        title: format!("TCP 探测异常 · {}", node.name),
+                        message: format!("{} 连续 {failures} 次失败", task.name),
+                        ..Default::default()
+                    });
+                    state_changes.push((key, 1));
+                    state_changes.push((last_key, now));
+                } else if active && reading.latency >= 0 {
+                    notes.push(Note {
+                        event: "probe_recovery".into(),
+                        node: node.name.clone(),
+                        title: format!("TCP 探测恢复 · {}", node.name),
+                        message: format!("{} 当前 {} ms", task.name, reading.latency),
+                        ..Default::default()
+                    });
+                    state_changes.push((key, 0));
+                }
+            }
+        }
+    }
+    for note in &mut notes {
+        stamp(note, now);
+    }
+    let configured = channels(app);
+    app.db.queue_notifications(
+        &notes,
+        &configured.iter().map(Channel::name).collect::<Vec<_>>(),
+        &down_changes,
+        &state_changes,
+        None,
+    )?;
     watch.primed = true;
     Ok(notes)
 }
@@ -663,6 +835,140 @@ mod tests {
     /// Offline alerts are only marked while a channel exists to carry them.
     fn with_channel(app: &App) {
         app.db.set("notify_webhook_url", "http://127.0.0.1:9/").unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_channel_is_visible_and_manual_retry_delivers_only_that_channel() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let count = seen.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert!(headers.contains_key("x-cmonitor-event-id"));
+                    if count == 0 {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let app = app();
+        app.db.set("notify_webhook_url", &format!("http://{addr}/")).unwrap();
+        send(&app, Note { event: "test".into(), title: "local only".into(), ..Default::default() });
+        deliver_due(&app).await.unwrap();
+        let row = app.db.notification_history().unwrap().remove(0);
+        assert_eq!(row["status"], "failed");
+        assert_eq!(row["attempts"], 1);
+        assert_eq!(app.db.retry_notification(row["id"].as_str().unwrap()).unwrap(), 1);
+        deliver_due(&app).await.unwrap();
+        deliver_due(&app).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(app.db.notification_history().unwrap()[0]["status"], "delivered");
+        server.abort();
+    }
+
+    #[test]
+    fn disk_alarm_requires_duration_recovers_with_hysteresis_and_obeys_maintenance() {
+        let app = app();
+        with_channel(&app);
+        let now = 1_000_000;
+        let id = node(&app, "disk", true, now);
+        connect(&app, id);
+        let report = |used, ts| {
+            let mut agents = app.agents.write().unwrap();
+            let agent = agents.get_mut(&id).unwrap();
+            agent.last_seen = ts;
+            agent.metrics = json!({"disk_total":100,"disk_used":used});
+        };
+        let mut watch = Watch::default();
+        report(95, now);
+        assert!(sweep(&app, &mut watch, now).unwrap().is_empty());
+        report(95, now + 599);
+        assert!(sweep(&app, &mut watch, now + 599).unwrap().is_empty());
+        report(95, now + 600);
+        assert_eq!(sweep(&app, &mut watch, now + 600).unwrap()[0].event, "disk");
+        report(88, now + 630);
+        assert!(sweep(&app, &mut watch, now + 630).unwrap().is_empty());
+        report(80, now + 660);
+        assert_eq!(sweep(&app, &mut watch, now + 660).unwrap()[0].event, "disk_recovery");
+        app.db.update_node(id, &NodePatch { muted_until: Some(now + 10000), ..Default::default() }).unwrap();
+        report(99, now + 5000);
+        assert!(sweep(&app, &mut watch, now + 5000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_observations_restart_the_disk_duration() {
+        let app = app();
+        with_channel(&app);
+        let now = 1_000_000;
+        let id = node(&app, "disk-gap", true, now);
+        connect(&app, id);
+        let report = |ts| {
+            let mut agents = app.agents.write().unwrap();
+            let agent = agents.get_mut(&id).unwrap();
+            agent.last_seen = ts;
+            agent.metrics = json!({"disk_total":100,"disk_used":95});
+        };
+        let mut watch = Watch::default();
+        report(now);
+        assert!(sweep(&app, &mut watch, now).unwrap().is_empty());
+        assert!(sweep(&app, &mut watch, now + 300).unwrap().is_empty(), "stale metrics break continuity");
+        report(now + 900);
+        assert!(sweep(&app, &mut watch, now + 900).unwrap().is_empty(), "the unobserved gap is not counted");
+        report(now + 1500);
+        assert_eq!(sweep(&app, &mut watch, now + 1500).unwrap()[0].event, "disk");
+    }
+
+    #[test]
+    fn probe_alarm_requires_consecutive_failures_and_recovers_after_maintenance() {
+        use crate::agent_ws::PingReading;
+        use crate::db::PingTask;
+        let app = app();
+        with_channel(&app);
+        let now = 1_000_000;
+        let id = node(&app, "tcp", true, now);
+        connect(&app, id);
+        let task = app
+            .db
+            .save_ping_task(&PingTask {
+                id: 0,
+                name: "service".into(),
+                target: "127.0.0.1:443".into(),
+                interval: 60,
+                nodes: vec![id],
+            })
+            .unwrap();
+        let reading = |samples: &[i64], ts| {
+            app.agents.write().unwrap().get_mut(&id).unwrap().pings.insert(
+                task,
+                PingReading {
+                    latency: *samples.last().unwrap(),
+                    updated_at: ts,
+                    samples: samples.iter().copied().collect(),
+                },
+            );
+        };
+        let mut watch = Watch::default();
+        reading(&[-1, 20, -1], now);
+        assert!(sweep(&app, &mut watch, now).unwrap().is_empty());
+        reading(&[-1, -1, -1], now + 30);
+        assert_eq!(sweep(&app, &mut watch, now + 30).unwrap()[0].event, "probe");
+        assert!(sweep(&app, &mut watch, now + 60).unwrap().is_empty(), "one alarm per incident");
+        app.db.update_node(id, &NodePatch { muted_until: Some(now + 300), ..Default::default() }).unwrap();
+        reading(&[20], now + 90);
+        assert!(sweep(&app, &mut watch, now + 90).unwrap().is_empty(), "maintenance is quiet");
+        reading(&[20], now + 300);
+        assert_eq!(sweep(&app, &mut watch, now + 300).unwrap()[0].event, "probe_recovery");
     }
 
     #[test]
@@ -776,7 +1082,7 @@ mod tests {
         with_channel(&app);
         let id = node(&app, "flappy", true, t);
         let mut watch = Watch { primed: true, ..Default::default() };
-        let mut at = |now: i64| -> Vec<&'static str> {
+        let mut at = |now: i64| -> Vec<String> {
             sweep(&app, &mut watch, now).unwrap().into_iter().map(|n| n.event).collect()
         };
         let back = |now| {
@@ -835,7 +1141,7 @@ mod tests {
             app.db.set_traffic(id, &patch).unwrap();
         };
         let mut watch = Watch { primed: true, ..Default::default() };
-        let mut at = |now: i64| -> Vec<&'static str> {
+        let mut at = |now: i64| -> Vec<String> {
             sweep(&app, &mut watch, now).unwrap().into_iter().map(|n| n.event).collect()
         };
 

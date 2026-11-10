@@ -265,7 +265,10 @@ pub async fn login(
 
 pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Response {
     if let Some(token) = cookie_value(&headers, COOKIE) {
-        let _ = app.db.drop_session(&sha256(&token));
+        if let Err(e) = app.db.drop_session(&sha256(&token)) {
+            tracing::warn!("session revocation failed: {e:#}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "退出失败，请重试").into_response();
+        }
     }
     app.terminals.revoke_invalid(&app.db);
     with_cookies(

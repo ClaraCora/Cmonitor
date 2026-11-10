@@ -1,0 +1,14 @@
+[Unit]
+Description=Verified Cmonitor SQLite backup
+After=monitor-hub.service
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/monitor/backup.py --db /opt/monitor/data/monitor.db --directory /opt/monitor/backups --keep 7 --hub /opt/monitor/monitor-hub
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true

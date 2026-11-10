@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react"
+import { Children, cloneElement, isValidElement, useEffect, useId, useRef, useState } from "react"
+import { DropdownMenu } from "radix-ui"
 import { flushSync } from "react-dom"
-import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, Eye, EyeOff, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Terminal as TerminalIcon, Trash2, Upload, Users } from "lucide-react"
+import { Bell, CalendarClock, MoreHorizontal, ChevronRight, Copy, Database, Download, Eye, EyeOff, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Terminal as TerminalIcon, Trash2, Upload, Users } from "lucide-react"
 import { FitAddon } from "@xterm/addon-fit"
 import { Terminal as XTerm } from "@xterm/xterm"
 import "@xterm/xterm/css/xterm.css"
@@ -17,13 +18,14 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { addresses, api, changes, GIB, provisioningSite, supportsTerminal, trafficCorrection, upload, type Node, type PingTask, type VisitorRow } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
+import { trackRestore, useRestoreOperation } from "@/lib/restore"
 
 // Counters the panel can correct after migration or an accounting error.
 const TRAFFIC_FIELDS = [
   ["total_rx", "累计下行"],
   ["total_tx", "累计上行"],
-  ["month_rx", "本月下行"],
-  ["month_tx", "本月上行"],
+  ["month_rx", "本期下行"],
+  ["month_tx", "本期上行"],
 ] as const
 const TRAFFIC_MODES: Record<string, string> = {
   sum: "上下行相加",
@@ -70,13 +72,51 @@ function Addresses({ node }: { node: Node }) {
 }
 
 function Field({ label, hint, className = "", children }: { label: string; hint?: React.ReactNode; className?: string; children: React.ReactNode }) {
+  const id = useId()
+  const link = (content: React.ReactNode, linked = false): [React.ReactNode, boolean] => {
+    const result: React.ReactNode[] = []
+    for (const child of Children.toArray(content)) {
+      if (!isValidElement<Record<string, unknown>>(child)) { result.push(child); continue }
+      if (!linked && (child.type === Input || child.type === SelectTrigger || child.type === "textarea")) {
+        result.push(cloneElement(child, { id, "aria-describedby": hint ? `${id}-hint` : undefined })); linked = true
+      } else if (child.props.children) {
+        const [children, found] = link(child.props.children as React.ReactNode, linked)
+        result.push(cloneElement(child, {}, children)); linked = found
+      } else result.push(child)
+    }
+    return [result, linked]
+  }
+  const [controls] = link(children)
   return (
     <div className={`space-y-2 ${className}`}>
-      <Label className="text-sm font-medium">{label}</Label>
-      {children}
-      {hint && <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
+      <Label htmlFor={id} className="text-sm font-medium">{label}</Label>
+      {controls}
+      {hint && <p id={`${id}-hint`} className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
     </div>
   )
+}
+
+function LoadState({ error, retry }: { error: string; retry: () => void }) {
+  return <div role={error ? "alert" : "status"} className="flex flex-wrap items-center gap-3 rounded-lg border p-4 text-sm">
+    <span>{error ? `加载失败：${error}` : "正在加载…"}</span>
+    {error && <Button size="sm" variant="outline" onClick={retry}>重新加载</Button>}
+  </div>
+}
+
+function useDirtyGuard(dirty: boolean, busy = false) {
+  useEffect(() => {
+    if (!dirty && !busy) return
+    const unload = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = "" }
+    const navigate = (event: Event & { discarded?: boolean }) => {
+      if (event.defaultPrevented || event.discarded) return
+      if (busy || !window.confirm("有尚未保存的修改，确定放弃并离开？")) event.preventDefault()
+      else event.discarded = true
+    }
+    addEventListener("beforeunload", unload)
+    addEventListener("cmonitor:navigate", navigate)
+    return () => { removeEventListener("beforeunload", unload); removeEventListener("cmonitor:navigate", navigate) }
+  }, [dirty, busy])
+  return () => !busy && (!dirty || window.confirm("有尚未保存的修改，确定放弃？"))
 }
 
 
@@ -111,6 +151,9 @@ function CreateNode({ onClose, onSaved }: {
   const [name, setName] = useState("")
   const [saving, setSaving] = useState(false)
 
+  const canClose = useDirtyGuard(!!name, saving)
+  const close = () => { if (canClose()) onClose() }
+
   async function save(e: React.FormEvent) {
     e.preventDefault()
     if (!name.trim()) return toast.error("请填写节点名称")
@@ -131,7 +174,7 @@ function CreateNode({ onClose, onSaved }: {
   }
 
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
+    <Dialog open onOpenChange={(open) => !open && close()}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>添加节点</DialogTitle>
@@ -141,7 +184,7 @@ function CreateNode({ onClose, onSaved }: {
             <Input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="香港 · 甲商家" />
           </Field>
           <DialogFooter className="border-t pt-4">
-            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            <Button type="button" variant="ghost" onClick={close}>取消</Button>
             <Button type="submit" disabled={saving}>添加</Button>
           </DialogFooter>
         </form>
@@ -156,6 +199,7 @@ function NodeForm({ node, onClose, onSaved }: {
   onSaved: () => void
 }) {
   const [form, setForm] = useState(node)
+  const [calibrate, setCalibrate] = useState(false)
   const [limitGib, setLimitGib] = useState(String(node.traffic_limit / GIB || ""))
   const [saving, setSaving] = useState(false)
   const gib = (bytes: number) => String(Number((bytes / GIB).toFixed(3)))
@@ -164,8 +208,11 @@ function NodeForm({ node, onClose, onSaved }: {
   )
   // Compared as entered rather than as bytes: rounding to GB would read as an
   // edit and zero a node that has transferred a few MB.
-  const pristine = useRef(traffic)
+  const [pristine] = useState(traffic)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
+
+  const canClose = useDirtyGuard(calibrate || JSON.stringify(form) !== JSON.stringify(node) || limitGib !== String(node.traffic_limit / GIB || "") || JSON.stringify(traffic) !== JSON.stringify(pristine), saving)
+  const close = () => { if (canClose()) onClose() }
 
   async function save() {
     if (!form.name.trim()) return toast.error("请填写节点名称")
@@ -179,24 +226,17 @@ function NodeForm({ node, onClose, onSaved }: {
       traffic_limit: Math.round(Number(limitGib) * GIB),
       traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.traffic_reset_day) || 1))),
       notify: !!form.notify,
+      muted_until: form.muted_until || 0,
     })
-    const correction = trafficCorrection(pristine.current, traffic)
+    const correction = trafficCorrection(pristine, traffic)
+    if (calibrate) { correction.month_rx=Math.round(Number(traffic.month_rx)*GIB); correction.month_tx=Math.round(Number(traffic.month_tx)*GIB) }
     if ([patch.traffic_limit, ...Object.values(correction)].some((v) => v !== undefined && (!Number.isSafeInteger(v) || v < 0))) {
       return toast.error("流量必须是有效的非负数，且不能超出精确计数范围")
     }
+    if (patch.traffic_reset_day !== undefined && !window.confirm("修改重置日将按已保存的每日明细汇总本期流量。历史不足时会标记为不完整，可手动校正；累计流量不变。继续保存？")) return
     setSaving(true)
     try {
-      // The correction belongs to the new reset period, so its day is saved
-      // first.
-      if (Object.keys(patch).length) {
-        await api(`/nodes/${node.id}`, { method: "PUT", body: JSON.stringify(patch) })
-      }
-      if (Object.keys(correction).length) {
-        await api(`/nodes/${node.id}/traffic`, {
-          method: "PUT",
-          body: JSON.stringify(correction),
-        })
-      }
+      await api(`/nodes/${node.id}`, { method: "PUT", body: JSON.stringify({ ...patch, traffic_correction: correction }) })
       toast.success("节点设置已保存")
       onClose()
       onSaved()
@@ -208,7 +248,7 @@ function NodeForm({ node, onClose, onSaved }: {
   }
 
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
+    <Dialog open onOpenChange={(open) => !open && close()}>
       <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
@@ -254,18 +294,20 @@ function NodeForm({ node, onClose, onSaved }: {
             </Field>
           </div>
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="每月重置日" hint="1–31。本月流量按新周期重算，总流量不变">
+            <Field label="每月重置日" hint="1–31。更改后按每日记录汇总；历史不足会标注，累计流量不变">
               <Input type="number" min={1} max={31} value={form.traffic_reset_day} onChange={(e) => set("traffic_reset_day", Number(e.target.value))} />
             </Field>
             <Field label="备注" hint="仅管理员可见">
               <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途" />
             </Field>
           </div>
+          {node.traffic_incomplete && <p role="status" className="text-sm text-muted-foreground">本期流量历史不完整，当前仅包含已记录的用量。请同时校正本期上下行以确认完整计数。</p>}
           <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
             <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
             <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
               按 GB 填入需要校正的值，未修改的计数器继续正常累计。
             </p>
+            <label className="mt-3 flex items-center gap-3 text-sm"><Switch checked={calibrate} onCheckedChange={setCalibrate} />确认本期上下行是完整用量</label>
             <div className="mt-3 grid gap-4 sm:grid-cols-2">
               {TRAFFIC_FIELDS.map(([key, label]) => (
                 <Field key={key} label={`${label} (GB)`}>
@@ -286,16 +328,26 @@ function NodeForm({ node, onClose, onSaved }: {
             </span>
             <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
           </label>
+          <Field label="维护期间暂停通知" hint="到时自动恢复；只暂停这台节点的异常与流量通知。">
+            <Select value={(form.muted_until || 0) > Date.now()/1000 ? String(form.muted_until) : "0"} onValueChange={(value) => set("muted_until", Number(value))}>
+              <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="0">正常接收</SelectItem>
+                {(form.muted_until || 0)>Date.now()/1000 && <SelectItem value={String(form.muted_until)}>暂停至 {new Date(form.muted_until!*1000).toLocaleString("zh-CN")}</SelectItem>}
+                {[1,4,24].map(hours => <SelectItem key={hours} value={String(Math.floor(Date.now()/1000)+hours*3600)}>暂停 {hours} 小时</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </Field>
           <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
             <span>
-              <span className="block font-medium">离线通知</span>
-              <span className="mt-0.5 block text-xs text-muted-foreground">掉线超过宽限期推送一条，恢复在线时再推一条</span>
+              <span className="block font-medium">异常通知</span>
+              <span className="mt-0.5 block text-xs text-muted-foreground">接收离线、磁盘和 TCP 探测异常及恢复通知</span>
             </span>
             <Switch checked={!!form.notify} onCheckedChange={(v) => set("notify", v)} />
           </label>
         </div>
-        <DialogFooter>
-          <Button variant="ghost" onClick={onClose}>取消</Button>
+        <DialogFooter className="sticky -bottom-6 border-t bg-background py-3">
+          <Button variant="ghost" onClick={close}>取消</Button>
           <Button onClick={save} disabled={saving}>保存</Button>
         </DialogFooter>
       </DialogContent>
@@ -315,7 +367,23 @@ function BillingForm({ node, onClose, onSaved }: {
   const [saving, setSaving] = useState(false)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
 
+  const dirty = JSON.stringify(form) !== JSON.stringify(node) || price !== (node.price > 0 ? String(node.price) : "")
+  const canClose = useDirtyGuard(dirty, saving)
+  const close = () => { if (canClose()) onClose() }
+  const [history, setHistory] = useState<{ old_date: string; new_date: string; created_at: number }[]>([])
+  useEffect(() => { api<{ history: typeof history }>(`/nodes/${node.id}/renewals`).then(d => setHistory(d.history)).catch((e: Error) => toast.error(`续费记录加载失败：${e.message}`)) }, [node.id])
+  async function renew() {
+    if (dirty) return toast.info("请先保存付款周期和到期时间，再确认续费")
+    if (!window.confirm("确认已经完成付款？系统将按当前付款周期顺延一次，并保存记录。")) return
+    setSaving(true)
+    try {
+      await api(`/nodes/${node.id}/renew`, { method: "POST", body: JSON.stringify({ expected_expiry: node.expires_at }) })
+      toast.success("已确认续费并记录")
+      onSaved(); onClose()
+    } catch (e) { toast.error((e as Error).message) } finally { setSaving(false) }
+  }
   async function save() {
+    if (!Number.isFinite(Number(price)) || Number(price)<0) return toast.error("价格必须是有效的非负数")
     setSaving(true)
     try {
       await api(`/nodes/${node.id}`, {
@@ -325,6 +393,7 @@ function BillingForm({ node, onClose, onSaved }: {
           currency: form.currency,
           billing_cycle: form.billing_cycle,
           expires_at: form.expires_at || null,
+          permanent: !!form.permanent,
         })),
       })
       toast.success("续费设置已保存")
@@ -338,7 +407,7 @@ function BillingForm({ node, onClose, onSaved }: {
   }
 
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
+    <Dialog open onOpenChange={(open) => !open && close()}>
       <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
@@ -377,13 +446,21 @@ function BillingForm({ node, onClose, onSaved }: {
                 </SelectContent>
               </Select>
             </Field>
-            <Field label="到期时间">
-              <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
+            <Field label="到期类型">
+              <Select value={form.permanent ? "permanent" : "dated"} onValueChange={(value) => { set("permanent", value === "permanent"); if (value === "permanent") set("expires_at", null) }}>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent><SelectItem value="dated">按日期 / 未设置</SelectItem><SelectItem value="permanent">永久有效</SelectItem></SelectContent>
+              </Select>
+            </Field>
+            <Field label="到期时间" hint="留空表示未设置。在线不会自动顺延到期日。">
+              <Input type="date" disabled={!!form.permanent} value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
             </Field>
           </div>
         </div>
-        <DialogFooter>
-          <Button variant="ghost" onClick={onClose}>取消</Button>
+        {history.length > 0 && <details className="text-sm"><summary className="cursor-pointer">最近续费记录</summary><ul className="mt-2 space-y-1 text-xs text-muted-foreground">{history.map((item, index) => <li key={index}>{new Date(item.created_at * 1000).toLocaleString("zh-CN")} · {item.old_date} → {item.new_date}</li>)}</ul></details>}
+        <DialogFooter className="sticky -bottom-6 border-t bg-background py-3">
+          <Button variant="secondary" onClick={renew} disabled={saving || dirty || !node.expires_at || ["once", "free"].includes(node.billing_cycle)}>确认已续费</Button>
+          <Button variant="ghost" onClick={close}>取消</Button>
           <Button onClick={save} disabled={saving}>保存</Button>
         </DialogFooter>
       </DialogContent>
@@ -855,7 +932,36 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
         </Button>
       </div>
 
-      <Card className="overflow-x-auto p-0">
+      <div className="divide-y rounded-xl border bg-card md:hidden">
+        {visible.map((n) => {
+          const index = order.findIndex(item => item.id === n.id)
+          const moveBy = (delta: number) => { orderBeforeDrag.current = order.map(node => node.id); const ids = move(index,index+delta); if (ids) save(ids) }
+          const action = "w-full cursor-pointer rounded-md px-3 py-2.5 text-left text-sm outline-none data-[highlighted]:bg-muted data-[disabled]:pointer-events-none data-[disabled]:opacity-40"
+          return <div key={n.id} className="space-y-2 p-4">
+            <div className="flex items-start gap-3">
+              <div className="min-w-0 flex-1"><p className="break-words font-medium">{n.name}</p><p className="mt-1 text-xs text-muted-foreground">{n.online ? "在线" : "离线"} · {n.permanent ? "永久有效" : n.expires_at || "未设置到期日"}{!n.public && " · 不公开"}</p></div>
+              <Button size="sm" variant="secondary" onClick={() => setEditing(n)}>编辑</Button>
+              <DropdownMenu.Root><DropdownMenu.Trigger asChild><Button variant="ghost" size="icon" aria-label={`${n.name} 更多操作`}><MoreHorizontal /></Button></DropdownMenu.Trigger>
+                <DropdownMenu.Portal><DropdownMenu.Content align="end" sideOffset={6} className="z-50 min-w-40 rounded-lg border bg-popover p-1 text-popover-foreground shadow-md">
+                  <DropdownMenu.Item className={action} onSelect={() => setBilling(n)}>续费设置</DropdownMenu.Item>
+                  <DropdownMenu.Item className={action} onSelect={() => togglePublic(n)}>{n.public ? "隐藏节点" : "公开节点"}</DropdownMenu.Item>
+                  <DropdownMenu.Item className={action} disabled={!n.online || !supportsTerminal(n.agent_version)} onSelect={() => setTerminal(n)}>打开终端</DropdownMenu.Item>
+                  <DropdownMenu.Item className={action} disabled={!canProvision} onSelect={() => setInstalling(n)}>安装 Agent</DropdownMenu.Item>
+                  <DropdownMenu.Separator className="my-1 h-px bg-border" />
+                  <DropdownMenu.Item className={action} disabled={!!needle || index===0} onSelect={() => moveBy(-1)}>上移</DropdownMenu.Item>
+                  <DropdownMenu.Item className={action} disabled={!!needle || index===order.length-1} onSelect={() => moveBy(1)}>下移</DropdownMenu.Item>
+                  <DropdownMenu.Separator className="my-1 h-px bg-border" />
+                  <DropdownMenu.Item className={`${action} text-destructive`} onSelect={() => setDeleting(n)}>删除节点</DropdownMenu.Item>
+                </DropdownMenu.Content></DropdownMenu.Portal>
+              </DropdownMenu.Root>
+            </div>
+            <Addresses node={n} />
+            <p className="text-xs text-muted-foreground">本期流量 {n.traffic_incomplete ? "≥ " : ""}{bytes(monthUsage(n))}{n.traffic_incomplete && "（历史不完整）"} · {n.price>0 ? money(n.price,n.currency) : "免费"}</p>
+          </div>
+        })}
+        {visible.length===0 && <p className="p-6 text-center text-sm text-muted-foreground">{needle ? "没有匹配的节点" : "还没有节点，先添加一台服务器"}</p>}
+      </div>
+      <Card className="hidden overflow-x-auto p-0 md:block">
         <Table>
           <TableHeader>
             {/* Percentages, or the address column swallows every spare pixel
@@ -941,15 +1047,16 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 {/* Counted by the node's own billing rule, as on the public
                     page. */}
                 <TableCell className="tnum text-sm">
-                  {bytes(monthUsage(n))}
+                  {n.traffic_incomplete ? "≥ " : ""}{bytes(monthUsage(n))}
                   <span className="text-muted-foreground">
                     {" / "}{n.traffic_limit > 0 ? bytes(n.traffic_limit) : FOREVER}
+                    {n.traffic_incomplete && <span className="block text-xs">本期历史不完整</span>}
                   </span>
                 </TableCell>
                 <TableCell className="tnum text-sm">
                   {n.price > 0 ? money(n.price, n.currency) : "免费"}
                 </TableCell>
-                <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
+                <TableCell className="text-sm">{n.permanent ? "永久" : n.expires_at || "未设置"}</TableCell>
                 {/* Wraps to a second row before it clips: on a narrow window
                     the table scrolls only once the icons no longer fit two
                     across. */}
@@ -1071,8 +1178,9 @@ function Visitors() {
   const [rows, setRows] = useState<VisitorRow[] | null>(null)
   const [confirmClear, setConfirmClear] = useState(false)
   const [clearing, setClearing] = useState(false)
-  const load = () => api<{ visits: VisitorRow[] }>("/visitor-log").then((d) => setRows(d.visits)).catch(() => {})
-  useEffect(() => { load() }, [])
+  const [error, setError] = useState("")
+  const load = () => { setError(""); return api<{ visits: VisitorRow[] }>("/visitor-log").then((d) => setRows(d.visits)).catch((e: Error) => setError(e.message || "网络错误")) }
+  useEffect(() => { queueMicrotask(load) }, [])
 
   const clear = async () => {
     setClearing(true)
@@ -1101,6 +1209,7 @@ function Visitors() {
           </Button>
         </div>
       </div>
+      {(error || rows === null) && <LoadState error={error} retry={load} />}
       <Table>
         <TableHeader>
           <TableRow>
@@ -1157,13 +1266,19 @@ function Visitors() {
 function Ping({ nodes }: { nodes: Node[] }) {
   const [tasks, setTasks] = useState<PingTask[]>([])
   const [editing, setEditing] = useState<Partial<PingTask> | null>(null)
+  const [initialEditing, setInitialEditing] = useState<Partial<PingTask> | null>(null)
+  const openEditor = (value: Partial<PingTask>) => { setInitialEditing(value); setEditing(value) }
   const [deleting, setDeleting] = useState<PingTask | null>(null)
   const [saving, setSaving] = useState(false)
   const [removing, setRemoving] = useState(false)
 
-  const load = () => api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => setTasks(d.tasks)).catch(() => {})
-  useEffect(() => { load() }, [])
+  const [error, setError] = useState("")
+  const [loaded, setLoaded] = useState(false)
+  const load = () => { setError(""); return api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => { setTasks(d.tasks); setLoaded(true) }).catch((e: Error) => setError(e.message || "网络错误")) }
+  useEffect(() => { queueMicrotask(load) }, [])
 
+  const canClose = useDirtyGuard(editing !== null && JSON.stringify(editing) !== JSON.stringify(initialEditing), saving)
+  const closeEditor = () => { if (canClose()) setEditing(null) }
   async function save() {
     if (!editing) return
     if (!editing.name?.trim() || !editing.target?.trim()) return toast.error("请填写名称和目标")
@@ -1204,8 +1319,9 @@ function Ping({ nodes }: { nodes: Node[] }) {
 
   return (
     <div className="space-y-4">
+      {(error || !loaded) && <LoadState error={error} retry={load} />}
       <div className="flex justify-end">
-        <Button onClick={() => setEditing({ name: "", target: "", interval: 60, nodes: [] })}>
+        <Button onClick={() => openEditor({ name: "", target: "", interval: 60, nodes: [] })}>
           <Plus /> 添加监控
         </Button>
       </div>
@@ -1229,14 +1345,14 @@ function Ping({ nodes }: { nodes: Node[] }) {
                 <TableCell className="tnum text-sm">{t.interval}s</TableCell>
                 <TableCell className="text-sm text-muted-foreground">{t.nodes.length} 个</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
-                  <Button variant="ghost" size="icon" onClick={() => setEditing(t)} title="编辑监控" aria-label="编辑监控"><Pencil /></Button>
+                  <Button variant="ghost" size="icon" onClick={() => openEditor(t)} title="编辑监控" aria-label="编辑监控"><Pencil /></Button>
                   <Button variant="ghost" size="icon" onClick={() => setDeleting(t)} title="删除监控" aria-label="删除监控">
                     <Trash2 className="text-destructive" />
                   </Button>
                 </TableCell>
               </TableRow>
             ))}
-            {tasks.length === 0 && (
+            {loaded && !error && tasks.length === 0 && (
               <TableRow>
                 <TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">
                   还没有延迟监控。每个节点独立 TCP 连接目标端口并上报耗时。
@@ -1248,7 +1364,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
       </Card>
 
       {editing && (
-        <Dialog open onOpenChange={(open) => !open && setEditing(null)}>
+        <Dialog open onOpenChange={(open) => !open && closeEditor()}>
           <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
             <DialogHeader>
               <DialogTitle>{editing.id ? "编辑监控" : "添加监控"}</DialogTitle>
@@ -1286,7 +1402,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
               </div>
             </div>
             <DialogFooter>
-              <Button variant="ghost" onClick={() => setEditing(null)}>取消</Button>
+              <Button variant="ghost" onClick={closeEditor}>取消</Button>
               <Button onClick={save} disabled={saving}>保存</Button>
             </DialogFooter>
           </DialogContent>
@@ -1326,9 +1442,9 @@ function Themes() {
   const [zoomed, setZoomed] = useState<Theme | null>(null)
   const picker = useRef<HTMLInputElement>(null)
 
-  const load = () =>
-    api<{ themes: Theme[] }>("/themes").then((data) => setThemes(data.themes)).catch(() => setThemes([]))
-  useEffect(() => { load() }, [])
+  const [error, setError] = useState("")
+  const load = () => { setError(""); return api<{ themes: Theme[] }>("/themes").then((data) => setThemes(data.themes)).catch((e: Error) => setError(e.message || "网络错误")) }
+  useEffect(() => { queueMicrotask(load) }, [])
 
   async function select(short: string) {
     try {
@@ -1389,9 +1505,10 @@ function Themes() {
     }
   }
 
-  if (!themes) return null
+  if (!themes) return <LoadState error={error} retry={load} />
   return (
     <div className="space-y-4">
+      {error && <LoadState error={error} retry={load} />}
       <Card className="gap-4 p-5">
         <div>
           <h3 className="text-sm font-medium">安装主题</h3>
@@ -1532,12 +1649,19 @@ type Settings = Record<string, string | boolean>
 // Two pages write settings, and each loads only what it displays.
 function useSettings() {
   const [saving, setSaving] = useState(false)
+  const inFlight = useRef(false)
   const [s, setS] = useState<Settings | null>(null)
-  useEffect(() => { api<Settings>("/settings").then(setS).catch(() => {}) }, [])
+  const [error, setError] = useState("")
+  const [baseline, setBaseline] = useState<Settings | null>(null)
+  const load = () => { setError(""); api<Settings>("/settings").then(data => { setBaseline(data); setS(data) }).catch((e: Error) => setError(e.message || "网络错误")) }
+  useEffect(() => { queueMicrotask(load) }, [])
+  useDirtyGuard(s !== null && JSON.stringify(s) !== JSON.stringify(baseline), saving)
   return {
-    s, saving,
+    s, saving, error, load,
     set: (k: string, v: string) => setS((old) => ({ ...(old ?? {}), [k]: v })),
     save: async (patch: Record<string, string>) => {
+      if (inFlight.current) return false
+      inFlight.current = true
       setSaving(true)
       try {
         const result = await api<{ reauth_required?: boolean }>("/settings", { method: "PUT", body: JSON.stringify(patch) })
@@ -1549,7 +1673,19 @@ function useSettings() {
         // Only the saved keys and the `*_set` flags are taken from the hub: a
         // credential comes back as a flag, so the typed value must not linger,
         // while another card's unsaved edits on the same page must survive.
-        const fresh = await api<Settings>("/settings")
+        const fresh = await api<Settings>("/settings").catch(() => {
+          toast.info("设置已保存，最新状态读取失败，请刷新页面确认")
+          const known: Settings = { ...s, ...patch }
+          for (const key of ["notify_telegram_token","notify_webhook_url","notify_webhook_headers","github_secret"]) {
+            if (key in patch) { known[key] = ""; known[`${key}_set`] = !!patch[key] }
+          }
+          return known
+        })
+        setBaseline(old => {
+          const next = { ...old, ...Object.fromEntries(Object.keys(patch).map(key => [key, fresh[key]])) }
+          for (const [key,value] of Object.entries(fresh)) if (key.endsWith("_set") || ["github_ready","github_verified","password_login"].includes(key)) next[key] = value
+          return next
+        })
         setS((old) => {
           const next = { ...old }
           for (const key of Object.keys(patch)) next[key] = fresh[key]
@@ -1561,6 +1697,7 @@ function useSettings() {
         toast.error((e as Error).message)
         return false
       } finally {
+        inFlight.current = false
         setSaving(false)
       }
     },
@@ -1568,8 +1705,8 @@ function useSettings() {
 }
 
 function SettingsTab() {
-  const { s, set, save } = useSettings()
-  if (!s) return null
+  const { s, set, save, error, load } = useSettings()
+  if (!s) return <LoadState error={error} retry={load} />
 
   return (
     <div className="space-y-4">
@@ -1613,7 +1750,7 @@ function SettingsTab() {
             checked={s.visitor_card !== "off"}
             onCheckedChange={(v) => set("visitor_card", v ? "on" : "off")}
           />
-          <span id="visitor-card-label">状态页显示访客欢迎卡片（访客 IP 与归属地）</span>
+          <span id="visitor-card-label">状态页底部显示可展开的访客信息</span>
         </div>
         <div>
           <Button
@@ -1748,10 +1885,28 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
   )
 }
 
+type Delivery = { id: string; title: string; created_at: number; channel: string; status: string; attempts: number; last_error: string }
+function NotificationHistory() {
+  const [items,setItems] = useState<Delivery[] | null>(null)
+  const [error,setError] = useState("")
+  const [busy,setBusy] = useState("")
+  const load = () => { setError(""); api<{ items: Delivery[] }>("/notify/history").then(d => setItems(d.items)).catch((e: Error) => setError(e.message || "网络错误")) }
+  useEffect(() => { queueMicrotask(load); const timer=setInterval(load,15000); return () => clearInterval(timer) },[])
+  return <Card className="gap-3 p-5">
+    <div className="flex items-center justify-between gap-3"><h3 className="text-sm font-medium">最近投递记录</h3><Button size="sm" variant="ghost" onClick={load}>刷新</Button></div>
+    {(error || !items) && <LoadState error={error} retry={load} />}
+    {items?.length===0 && <p className="text-sm text-muted-foreground">还没有投递记录。配置渠道并开启节点通知后，事件会保存在这里。</p>}
+    <div className="max-h-96 divide-y overflow-y-auto">{items?.map(item => <div key={`${item.id}:${item.channel}`} className="flex items-start gap-3 py-3">
+      <div className="min-w-0 flex-1"><p className="break-words text-sm">{item.title}</p><p className="mt-1 text-xs text-muted-foreground">{new Date(item.created_at*1000).toLocaleString("zh-CN")} · {item.channel} · {{pending:"等待重试",delivered:"已送达",failed:"投递失败"}[item.status] || item.status} · 尝试 {item.attempts} 次</p>{item.last_error && <p className="mt-1 break-words text-xs text-destructive">{item.last_error}</p>}</div>
+      {item.status==="failed" && <Button size="sm" variant="outline" disabled={!!busy} onClick={async () => { setBusy(item.id); try { await api(`/notify/${item.id}/retry`,{method:"POST"}); load() } catch(e) { toast.error((e as Error).message) } finally { setBusy("") } }}>重试</Button>}
+    </div>)}</div>
+  </Card>
+}
+
 function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
-  const { s, set, save } = useSettings()
+  const { s, set, save, error, load } = useSettings()
   const [testing, setTesting] = useState(false)
-  if (!s) return null
+  if (!s) return <LoadState error={error} retry={load} />
   const text = (k: string) => String(s[k] ?? "")
   // A credential is sent only when something was typed: the field starts empty
   // because the hub never returns the stored value.
@@ -1870,6 +2025,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
         </div>
       </ChannelCard>
 
+      <NotificationHistory />
       <OfflineNodes nodes={nodes} refresh={refresh} />
 
       <Card className="gap-4 p-5">
@@ -1881,9 +2037,12 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           <Field label="流量提醒（%）" hint="本期用量达到该比例和 100% 时各提醒一次，0 关闭">
             <Input type="number" min={0} max={100} value={text("notify_traffic")} onChange={(e) => set("notify_traffic", e.target.value)} />
           </Field>
-          <Field label="到期提醒（天）" hint="每天 9 点汇总这么多天内到期的节点，自动续期时也提醒，0 关闭">
+          <Field label="到期提醒（天）" hint="每天 9 点汇总这么多天内到期的节点，0 关闭">
             <Input type="number" min={0} max={365} value={text("notify_expiry")} onChange={(e) => set("notify_expiry", e.target.value)} />
           </Field>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          {[["notify_disk_percent","磁盘告警阈值（%）","0 关闭；恢复阈值低 5 个百分点"],["notify_disk_minutes","磁盘持续时间（分钟）","达到阈值并持续这么久才提醒"],["notify_ping_failures","TCP 连续失败次数","0 关闭；成功后发恢复通知"],["notify_cooldown","重复告警冷却（分钟）","恢复后再次异常的最短提醒间隔"]].map(([key,label,hint]) => <Field key={key} label={label} hint={hint}><Input type="number" min={0} value={text(key)} onChange={e => set(key,e.target.value)} /></Field>)}
         </div>
         <div className="flex items-center gap-2 text-sm">
           <Switch aria-labelledby="notify-login-label" checked={s.notify_login !== "off"} onCheckedChange={(v) => set("notify_login", v ? "on" : "off")} />
@@ -1897,6 +2056,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
                 notify_grace: text("notify_grace"),
                 notify_traffic: text("notify_traffic"),
                 notify_expiry: text("notify_expiry"),
+                ...Object.fromEntries(["notify_disk_percent","notify_disk_minutes","notify_ping_failures","notify_cooldown"].map(key => [key,text(key)])),
                 notify_login: s.notify_login === "off" ? "off" : "on",
               })
             }
@@ -1917,8 +2077,9 @@ function Sessions() {
   const [rows, setRows] = useState<Session[] | null>(null)
   const [busy, setBusy] = useState("")
 
-  const load = () => api<Session[]>("/sessions").then(setRows).catch((e: Error) => toast.error(e.message))
-  useEffect(() => { load() }, [])
+  const [error, setError] = useState("")
+  const load = () => { setError(""); return api<Session[]>("/sessions").then(setRows).catch((e: Error) => setError(e.message || "网络错误")) }
+  useEffect(() => { queueMicrotask(load) }, [])
 
   async function remove(id: string) {
     setBusy(id)
@@ -1933,9 +2094,10 @@ function Sessions() {
     }
   }
 
-  if (!rows) return null
+  if (!rows) return <LoadState error={error} retry={load} />
   return (
     <Card className="gap-4 p-5">
+      {error && <LoadState error={error} retry={load} />}
       <div>
         <h3 className="text-sm font-medium">登录会话</h3>
         <p className="mt-1 text-xs text-muted-foreground">
@@ -1964,10 +2126,11 @@ function Sessions() {
 }
 
 function Security({ site }: { site: string }) {
-  const { s, set, save, saving } = useSettings()
+  const { s, set, save, saving, error, load } = useSettings()
   const [password, setPassword] = useState("")
+  useDirtyGuard(password.length > 0)
   const [githubDirty, setGithubDirty] = useState(false)
-  if (!s) return null
+  if (!s) return <LoadState error={error} retry={load} />
   const passwordEnabled = s.password_login !== "off"
   const verified = !!s.github_verified && !githubDirty
   const callback = `${site}/api/auth/github/callback`
@@ -2064,6 +2227,8 @@ type DbInfo = {
   /** Timestamp of the earliest history row, null on a database with none. */
   oldest: number | null
   retention: number
+  backup_success?: string | null
+  backup_error?: string | null
   rows: Record<string, number>
 }
 
@@ -2081,14 +2246,17 @@ function Data() {
   const [confirm, setConfirm] = useState<"vacuum" | null>(null)
   const [pending, setPending] = useState<File | null>(null)
   const [sent, setSent] = useState(0)
+  const [phase, setPhase] = useState("")
+  const operation = useRestoreOperation()
   // Closing the dialog must stop the upload rather than merely hide it: restore
   // is the one irreversible action here, and it takes minutes on a large
   // backup.
   const abort = useRef<AbortController | null>(null)
   const picker = useRef<HTMLInputElement>(null)
 
-  const load = () => api<DbInfo>("/db").then(setInfo).catch((e: Error) => toast.error(e.message))
-  useEffect(() => { load() }, [])
+  const [error, setError] = useState("")
+  const load = () => { setError(""); return api<DbInfo>("/db").then(setInfo).catch((e: Error) => setError(e.message || "网络错误")) }
+  useEffect(() => { queueMicrotask(load) }, [])
 
   async function vacuum() {
     setBusy("vacuum")
@@ -2104,28 +2272,37 @@ function Data() {
     }
   }
 
+  useDirtyGuard(busy === "restore")
   async function restore(file: File) {
-    setBusy("restore")
-    setSent(0)
+    setBusy("restore"); setSent(0); setPhase("uploading")
     abort.current = new AbortController()
+    let submitted = false
+    const id = crypto.randomUUID().replaceAll("-", "")
     try {
-      await upload("/db/restore", file, setSent, abort.current.signal)
-      toast.success("已恢复，正在重新加载")
-      // Every node, setting and session on the page came from the database just
-      // replaced.
-      setTimeout(() => location.reload(), 800)
+      // Unique staging keeps abandoned uploads separate from a later attempt.
+      await upload("/db/restore", file, setSent, abort.current.signal, { "x-cmonitor-restore-id": id })
+      // Upload cancellation cannot reach the separate apply endpoint.
+      if (abort.current.signal.aborted) throw new DOMException("aborted", "AbortError")
+      submitted = true
+      trackRestore(id)
+      setPhase("validating"); setPending(null)
+      await api(`/db/restore/${id}/apply`, { method: "POST", signal: AbortSignal.timeout(15_000) })
     } catch (e) {
-      // Aborting partway is not a failure: the hub replaces nothing until the
-      // last chunk, so the original database remains.
-      const aborted = (e as Error).name === "AbortError"
-      if (aborted) toast.info("已取消，数据库没有改动")
-      else toast.error((e as Error).message)
-      setBusy("")
-    }
-    setPending(null)
+      if (submitted) {
+        setPhase("unknown")
+        toast.info("恢复结果待确认，正在查询操作状态。请勿重复导入。")
+      } else {
+        setBusy(""); setPhase(""); setPending(null)
+        if ((e as Error).name === "AbortError") {
+          api(`/db/restore/${id}`,{method:"DELETE"}).catch(() => {})
+          toast.info("上传已取消，尚未提交恢复")
+        }
+        else toast.error((e as Error).message)
+      }
+    } finally { setBusy("") }
   }
 
-  if (!info) return null
+  if (!info) return <LoadState error={error} retry={load} />
   const stat = (label: string, value: string) => (
     <div key={label}>
       <div className="text-xs text-muted-foreground">{label}</div>
@@ -2135,6 +2312,7 @@ function Data() {
 
   return (
     <div className="space-y-4">
+      {error && <LoadState error={error} retry={load} />}
       <Card className="gap-4 p-5">
         <h3 className="text-sm font-medium">数据库</h3>
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
@@ -2161,7 +2339,7 @@ function Data() {
           </p>
         </div>
         <div>
-          <Button size="sm" variant="secondary" disabled={!!busy} onClick={() => setConfirm("vacuum")}>
+          <Button size="sm" variant="secondary" disabled={!!busy || !!operation} onClick={() => setConfirm("vacuum")}>
             {busy === "vacuum" ? "回收中…" : "立即回收"}
           </Button>
         </div>
@@ -2170,6 +2348,8 @@ function Data() {
       <Card className="gap-4 p-5">
         <div>
           <h3 className="text-sm font-medium">备份</h3>
+          <p className="mt-2 text-sm">定时备份：{info.backup_success ? `最近成功 ${new Date(Number(info.backup_success)*1000).toLocaleString("zh-CN")}` : "尚无运行记录，请按部署文档启用定时备份"}</p>
+          {info.backup_error && <p role="alert" className="mt-1 text-sm text-destructive">最近备份失败：{info.backup_error}</p>}
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
             导出的是整个数据库，含节点凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，
             当前节点、设置、历史全部作废，所有设备需要重新登录。
@@ -2185,7 +2365,7 @@ function Data() {
               <Download /> 导出备份
             </a>
           </Button>
-          <Button size="sm" variant="secondary" disabled={!!busy} onClick={() => picker.current?.click()}>
+          <Button size="sm" variant="secondary" disabled={!!busy || !!operation} onClick={() => picker.current?.click()}>
             <Upload /> 导入备份
           </Button>
           <input
@@ -2214,10 +2394,10 @@ function Data() {
       {pending && (
         <ConfirmDialog
           title="用备份覆盖当前数据？"
-          description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的节点、设置和历史全部丢失，且无法撤销。`}
+          description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。校验通过后整体覆盖当前数据；应用前自动保存一份恢复前副本。`}
           confirmLabel={busy === "restore" ? `已上传 ${bytes(sent)} / ${bytes(pending.size)}` : "确认恢复"}
           busy={!!busy}
-          onClose={() => { abort.current?.abort(); setPending(null) }}
+          onClose={() => { if (!phase || phase === "uploading") { abort.current?.abort(); setPending(null) } }}
           onConfirm={() => restore(pending)}
         />
       )}
