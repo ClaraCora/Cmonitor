@@ -28,7 +28,7 @@ async function main() {
   const browser = await chromium.launch({ headless: true, ...(process.env.UX_BROWSER_CHANNEL ? { channel: process.env.UX_BROWSER_CHANNEL } : {}) })
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, locale: 'zh-CN', hasTouch: true })
   let settingsFail = false, pingFail = false, outage = false, authed = true, restorePhase = 'applying', restoreId = ''
-  let backupState = 'active', backupFail = false, backupError = ''
+  let backupState = 'active', backupFail = false, backupError = '', backupStale = false
   const sockets = new Set(), timers = new Set(), writes = [], historyCalls = []
   const errors = []
   try {
@@ -54,7 +54,7 @@ async function main() {
       let data = {}
       if (pathname === '/api/me') data = {...me,authed}
       else if (pathname === '/api/nodes') data = {nodes,admin:authed}
-      else if (pathname === '/api/db') data = {path:'fixture.db',size:1024,wal:0,free:0,oldest:null,retention:7,rows:{},backup_success:'1794280900',backup_error:backupError,scheduled_backup:{scheduler:{state:backupState,boot_enabled:true,calendar:'*-*-* 03:20:00',random_delay:'10min',next_run:backupState==='active'?'Wed 2026-11-11 03:21:27 CST':null},policy:{directory:'/opt/monitor/backups',keep:7,offsite:false},copies:1,checked_at:1794280900,timezone:'UTC+08:00'}}
+      else if (pathname === '/api/db') data = {path:'fixture.db',size:1024,wal:0,free:0,oldest:null,retention:7,rows:{},backup_success:'1794280900',backup_error:backupError,scheduled_backup:{scheduler:{state:backupState,boot_enabled:true,calendar:'*-*-* 03:20:00',random_delay:'10min',next_run:backupState==='active'?'Wed 2026-11-11 03:21:27 CST':null},policy:{directory:'/opt/monitor/backups',keep:7,offsite:false},copies:1,checked_at:1794280900,timezone:'UTC+08:00',stale:backupStale}}
       else if (/^\/api\/db\/restore\/[a-f0-9]{32}$/.test(pathname)) data = {phase:restorePhase}
       else if (pathname === '/api/settings') data = settings
       else if (pathname.endsWith('/metrics')) {
@@ -145,11 +145,12 @@ async function main() {
       await page.getByRole('button',{name:'刷新备份状态',exact:true}).click()
       await page.getByText('加载失败：模拟备份状态加载失败').waitFor()
       await page.getByText('最近 7 份成功备份',{exact:true}).waitFor()
-      backupFail=false; backupState='unavailable'; backupError='模拟备份失败'
+      backupFail=false; backupState='unavailable'; backupError='模拟备份失败'; backupStale=true
       await page.getByRole('button',{name:'刷新备份状态',exact:true}).click()
       await page.getByText('无法确认定时任务状态',{exact:true}).waitFor()
       await page.getByRole('alert').filter({hasText:'最近备份失败：模拟备份失败'}).waitFor()
-      backupState='active'; backupError=''
+      await page.getByRole('alert').filter({hasText:'备份状态尚未上报或已过期'}).waitFor()
+      backupState='active'; backupError=''; backupStale=false
       await page.getByRole('button',{name:'刷新备份状态',exact:true}).click()
       await page.getByText('已启用',{exact:true}).waitFor()
       await page.getByRole('button',{name:'导入备份',exact:true}).waitFor()

@@ -15,6 +15,35 @@ spec.loader.exec_module(module)
 
 
 class BackupTests(unittest.TestCase):
+    def test_reporter_reads_schedule_and_inventory_without_creating_a_backup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            live, copies = root / "live.db", root / "copies"
+            with closing(sqlite3.connect(live)) as conn, conn:
+                conn.executescript("CREATE TABLE node(id); CREATE TABLE traffic(id); CREATE TABLE setting(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE session(id);")
+            module.backup(live, copies)
+            before = set(copies.iterdir())
+            timer = "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\nTimersCalendar={ OnCalendar=*-*-* 03:20:00 ; next_elapse=tomorrow }\nNextElapseUSecRealtime=tomorrow\nRandomizedDelayUSec=10min\n"
+            with patch.object(module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=timer)):
+                status = module.report_status(live)
+            self.assertEqual(status["scheduler"]["state"], "active")
+            self.assertEqual(status["scheduler"]["calendar"], "*-*-* 03:20:00")
+            self.assertEqual(status["copies"], 1)
+            self.assertEqual(status["policy"]["keep"], 7)
+            self.assertEqual(set(copies.iterdir()), before)
+            with patch.object(module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=timer.replace("ActiveState=active", "ActiveState=inactive"))):
+                self.assertIsNone(module.report_status(live)["scheduler"]["next_run"])
+
+    def test_a_failed_timer_query_reports_unknown_instead_of_enabled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            live = Path(temporary) / "live.db"
+            with closing(sqlite3.connect(live)) as conn, conn:
+                conn.execute("CREATE TABLE setting(key TEXT PRIMARY KEY,value TEXT)")
+            with patch.object(module.subprocess, "run", side_effect=subprocess.TimeoutExpired(["systemctl"], 2)):
+                self.assertEqual(module.report_status(live)["scheduler"]["state"], "unavailable")
+        self.assertEqual(module.parse_timer("LoadState=not-found\n")["state"], "not_installed")
+        self.assertEqual(module.parse_timer("LoadState=masked\nActiveState=inactive\n")["state"], "inactive")
+
     def test_real_hub_can_migrate_and_read_the_isolated_snapshot(self):
         executable = Path(os.environ.get("MONITOR_HUB", Path(__file__).resolve().parents[1] / "target" / "debug" / ("monitor-hub.exe" if os.name == "nt" else "monitor-hub"))).resolve()
         self.assertTrue(executable.is_file(), "build the Hub before running backup integration tests")
