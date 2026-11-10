@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS node (
   remark        TEXT    NOT NULL DEFAULT '',
   tags          TEXT    NOT NULL DEFAULT '',
   website       TEXT    NOT NULL DEFAULT '',
+  permanent INTEGER NOT NULL DEFAULT 0,
+  muted_until INTEGER NOT NULL DEFAULT 0,
   traffic_limit INTEGER NOT NULL DEFAULT 0,
   traffic_mode  TEXT    NOT NULL DEFAULT 'sum',
   traffic_reset_day INTEGER NOT NULL DEFAULT 1,
@@ -86,7 +88,9 @@ CREATE TABLE IF NOT EXISTS traffic (
   month_start TEXT NOT NULL DEFAULT '',
   day_rx INTEGER NOT NULL DEFAULT 0,
   day_tx INTEGER NOT NULL DEFAULT 0,
-  day_start TEXT NOT NULL DEFAULT ''
+  day_start TEXT NOT NULL DEFAULT '',
+  history_since TEXT NOT NULL DEFAULT '',
+  period_incomplete INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS metric (
@@ -142,10 +146,38 @@ CREATE TABLE IF NOT EXISTS visitor_log (
 );
 "#;
 
+const EXTRA_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS traffic_daily (
+ node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+ day TEXT NOT NULL, rx INTEGER NOT NULL DEFAULT 0, tx INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(node_id,day)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS renewal_history (
+ id INTEGER PRIMARY KEY, node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+ old_date TEXT NOT NULL, new_date TEXT NOT NULL, created_at INTEGER NOT NULL,
+ actor TEXT NOT NULL DEFAULT 'admin'
+);
+CREATE TABLE IF NOT EXISTS notification_event (
+ id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notification_delivery (
+ event_id TEXT NOT NULL REFERENCES notification_event(id) ON DELETE CASCADE,
+ channel TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+ next_attempt_at INTEGER NOT NULL, last_error TEXT NOT NULL DEFAULT '', delivered_at INTEGER,
+ PRIMARY KEY(event_id,channel)
+);
+CREATE INDEX IF NOT EXISTS notification_due ON notification_delivery(status,next_attempt_at);
+CREATE TABLE IF NOT EXISTS alert_state (
+ key TEXT PRIMARY KEY, value INTEGER NOT NULL
+);
+"#;
+const EXTRA_TABLES: [&str; 5] =
+    ["traffic_daily", "renewal_history", "notification_event", "notification_delivery", "alert_state"];
+
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -276,6 +308,17 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 7 {
         add_column(conn, "node", "website TEXT NOT NULL DEFAULT ''")?;
     }
+    if from < 8 {
+        add_column(conn, "node", "permanent INTEGER NOT NULL DEFAULT 0")?;
+        add_column(conn, "node", "muted_until INTEGER NOT NULL DEFAULT 0")?;
+        add_column(conn, "traffic", "history_since TEXT NOT NULL DEFAULT ''")?;
+        add_column(conn, "traffic", "period_incomplete INTEGER NOT NULL DEFAULT 0")?;
+        conn.execute(
+            "UPDATE traffic SET history_since=?1 WHERE history_since=''",
+            [(Local::now().date_naive() + chrono::Days::new(1)).to_string()],
+        )?;
+    }
+    conn.execute_batch(EXTRA_SCHEMA)?;
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
 }
@@ -320,6 +363,10 @@ pub struct Node {
     /// Provider website, included only in authenticated views.
     #[serde(default)]
     pub website: String,
+    #[serde(default)]
+    pub permanent: bool,
+    #[serde(default)]
+    pub muted_until: i64,
     /// Monthly allowance in bytes; 0 means unmetered.
     #[serde(default)]
     pub traffic_limit: i64,
@@ -395,6 +442,9 @@ pub struct NodePatch {
     pub remark: Option<String>,
     pub tags: Option<String>,
     pub website: Option<String>,
+    pub permanent: Option<bool>,
+    pub muted_until: Option<i64>,
+    pub traffic_correction: Option<TrafficPatch>,
     pub traffic_limit: Option<i64>,
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
@@ -432,6 +482,7 @@ pub struct Traffic {
     pub month_rx: i64,
     pub month_tx: i64,
     pub month_start: String,
+    pub traffic_incomplete: bool,
     pub day_rx: i64,
     pub day_tx: i64,
 }
@@ -465,6 +516,8 @@ fn restrict(path: &str) {
 /// which is the entire credential store in one portable file, created under the
 /// umask like any other.
 fn own_only(file: &str) {
+    #[cfg(not(unix))]
+    let _ = file;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -643,7 +696,10 @@ impl Db {
             ],
         )?;
         let id = tx.last_insert_rowid();
-        tx.execute("INSERT INTO traffic (node_id) VALUES (?1)", [id])?;
+        tx.execute(
+            "INSERT INTO traffic (node_id,history_since) VALUES (?1,?2)",
+            params![id, Local::now().date_naive().to_string()],
+        )?;
         tx.commit()?;
         Ok(id)
     }
@@ -663,7 +719,11 @@ impl Db {
 
     /// False when no node has this id.
     pub fn update_node(&self, id: i64, n: &NodePatch) -> Result<bool> {
-        let found = self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let old_day: Option<u32> =
+            tx.query_row("SELECT traffic_reset_day FROM node WHERE id=?1", [id], |r| r.get(0)).optional()?;
+        let found = tx.execute(
             "UPDATE node SET name=COALESCE(?2,name), sort=COALESCE(?3,sort), public=COALESCE(?4,public),
                              price=COALESCE(?5,price), currency=COALESCE(?6,currency),
                              billing_cycle=COALESCE(?7,billing_cycle),
@@ -672,7 +732,8 @@ impl Db {
                              traffic_limit=COALESCE(?12,traffic_limit),
                              traffic_mode=COALESCE(?13,traffic_mode),
                              traffic_reset_day=COALESCE(?14,traffic_reset_day),
-                             notify=COALESCE(?15,notify), website=COALESCE(?16,website)
+                             notify=COALESCE(?15,notify), website=COALESCE(?16,website),
+                             permanent=COALESCE(?17,permanent), muted_until=COALESCE(?18,muted_until)
              WHERE id=?1",
             params![
                 id,
@@ -690,19 +751,148 @@ impl Db {
                 n.traffic_mode,
                 n.traffic_reset_day,
                 n.notify,
-                n.website
+                n.website,
+                n.permanent,
+                n.muted_until
             ],
         )?;
+        if found > 0 {
+            if let Some(day) = n.traffic_reset_day.filter(|d| Some(*d) != old_day) {
+                let period = period_start(Local::now().date_naive(), day).to_string();
+                tx.execute("UPDATE traffic SET month_rx=(SELECT COALESCE(SUM(rx),0) FROM traffic_daily WHERE node_id=?1 AND day>=?2),
+                    month_tx=(SELECT COALESCE(SUM(tx),0) FROM traffic_daily WHERE node_id=?1 AND day>=?2),
+                    month_start=?2, period_incomplete=(history_since='' OR history_since>?2) WHERE node_id=?1 AND month_start<>?2", params![id, period])?;
+            }
+            if let Some(p) = &n.traffic_correction {
+                apply_traffic(&tx, id, p)?;
+            }
+        }
+        tx.commit()?;
         Ok(found > 0)
     }
 
-    pub fn set_expiry(&self, id: i64, date: &str) -> Result<()> {
-        self.conn().execute("UPDATE node SET expires_at=?2 WHERE id=?1", params![id, date])?;
+    /// Event insertion and trigger state changes commit together. Payloads contain no channel credentials.
+    pub fn queue_notifications(
+        &self,
+        notes: &[crate::notify::Note],
+        channels: &[&str],
+        down: &[(i64, i64)],
+        state: &[(String, i64)],
+        digest: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for note in notes {
+            tx.execute(
+                "INSERT OR IGNORE INTO notification_event(id,created_at,payload) VALUES(?1,?2,?3)",
+                params![note.id, note.time, serde_json::to_string(note)?],
+            )?;
+            for channel in channels {
+                tx.execute("INSERT OR IGNORE INTO notification_delivery(event_id,channel,next_attempt_at) VALUES(?1,?2,?3)", params![note.id,channel,note.time])?;
+            }
+        }
+        for (id, since) in down {
+            tx.execute("UPDATE node SET down_since=?2 WHERE id=?1", params![id, since])?;
+        }
+        for (key, value) in state {
+            tx.execute("INSERT INTO alert_state(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,value])?;
+        }
+        if let Some(date) = digest {
+            tx.execute("INSERT OR REPLACE INTO setting(key,value) VALUES('notify_expiry_sent',?1)", [date])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
-    pub fn set_down_since(&self, id: i64, ts: i64) -> Result<()> {
-        self.conn().execute("UPDATE node SET down_since=?2 WHERE id=?1", params![id, ts])?;
+    pub fn due_notifications(&self, now: i64) -> Result<Vec<(String, String, String, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT e.id,d.channel,e.payload,d.attempts FROM notification_delivery d JOIN notification_event e ON e.id=d.event_id WHERE d.status='pending' AND d.next_attempt_at<=?1 ORDER BY d.next_attempt_at,e.created_at LIMIT 16")?;
+        let rows = stmt.query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn finish_notification(
+        &self,
+        id: &str,
+        channel: &str,
+        status: &str,
+        error: &str,
+        next: i64,
+    ) -> Result<()> {
+        self.conn().execute("UPDATE notification_delivery SET status=?3,attempts=attempts+1,last_error=?4,next_attempt_at=?5,delivered_at=CASE WHEN ?3='delivered' THEN ?6 ELSE NULL END WHERE event_id=?1 AND channel=?2", params![id,channel,status,error,next,Utc::now().timestamp()])?;
+        Ok(())
+    }
+
+    pub fn notification_history(&self) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT e.id,e.created_at,e.payload,d.channel,d.status,d.attempts,d.last_error,d.next_attempt_at FROM notification_event e JOIN notification_delivery d ON d.event_id=e.id ORDER BY e.created_at DESC,e.id DESC,d.channel LIMIT 100")?;
+        let rows = stmt.query_map([], |r| {
+            let payload: String = r.get(2)?;
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+            Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"created_at":r.get::<_,i64>(1)?,"title":payload["title"],"channel":r.get::<_,String>(3)?,"status":r.get::<_,String>(4)?,"attempts":r.get::<_,i64>(5)?,"last_error":r.get::<_,String>(6)?,"next_attempt_at":r.get::<_,i64>(7)?}))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn retry_notification(&self, id: &str) -> Result<usize> {
+        Ok(self.conn().execute("UPDATE notification_delivery SET status='pending',attempts=0,next_attempt_at=?2,last_error='' WHERE event_id=?1 AND status='failed'", params![id,Utc::now().timestamp()])?)
+    }
+
+    pub fn alert_value(&self, key: &str) -> Option<i64> {
+        self.conn()
+            .query_row("SELECT value FROM alert_state WHERE key=?1", [key], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn renew_node(&self, id: i64, expected: &str) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row: Option<(Option<String>, String)> = tx
+            .query_row("SELECT expires_at,billing_cycle FROM node WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let Some((Some(old), cycle)) = row else {
+            anyhow::bail!("请先设置到期日");
+        };
+        if old != expected {
+            anyhow::bail!("到期日已变化，请刷新后确认");
+        }
+        let months = match cycle.as_str() {
+            "monthly" => 1,
+            "quarterly" => 3,
+            "semiannual" => 6,
+            "yearly" => 12,
+            "biennial" => 24,
+            "triennial" => 36,
+            _ => anyhow::bail!("当前付款周期不支持续费"),
+        };
+        let next = old
+            .parse::<NaiveDate>()?
+            .checked_add_months(chrono::Months::new(months))
+            .context("到期日期超出范围")?
+            .to_string();
+        tx.execute("UPDATE node SET expires_at=?2,permanent=0 WHERE id=?1", params![id, next])?;
+        tx.execute(
+            "INSERT INTO renewal_history(node_id,old_date,new_date,created_at) VALUES(?1,?2,?3,?4)",
+            params![id, old, next, Utc::now().timestamp()],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn renewals(&self, id: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT old_date,new_date,created_at,actor FROM renewal_history WHERE node_id=?1 ORDER BY id DESC LIMIT 20")?;
+        let rows = stmt.query_map([id], |r| Ok(serde_json::json!({"old_date":r.get::<_,String>(0)?,"new_date":r.get::<_,String>(1)?,"created_at":r.get::<_,i64>(2)?,"actor":r.get::<_,String>(3)?})))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    #[cfg(test)]
+    pub fn set_expiry(&self, id: i64, date: &str) -> Result<()> {
+        self.conn().execute("UPDATE node SET expires_at=?2 WHERE id=?1", params![id, date])?;
         Ok(())
     }
 
@@ -734,6 +924,12 @@ impl Db {
         // deleted node's id to the next node created, which would otherwise
         // inherit the removed machine's latency chart.
         conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
+        for prefix in ["disk", "disk-active", "disk-last"] {
+            conn.execute("DELETE FROM alert_state WHERE key=?1", [format!("{prefix}:{id}")])?;
+        }
+        for prefix in ["traffic", "probe", "probe-last"] {
+            conn.execute("DELETE FROM alert_state WHERE key LIKE ?1", [format!("{prefix}:{id}:%")])?;
+        }
         Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? > 0)
     }
 
@@ -824,7 +1020,7 @@ impl Db {
         let conn = self.conn();
         let Ok(mut stmt) = conn.prepare_cached(
             "SELECT t.node_id, t.total_rx, t.total_tx, t.month_rx, t.month_tx, t.month_start,
-                    t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day
+                    t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day, t.period_incomplete, t.history_since
                  FROM traffic t JOIN node n ON n.id = t.node_id",
         ) else {
             return HashMap::new();
@@ -851,6 +1047,14 @@ impl Db {
                     total_tx: r.get(2)?,
                     month_rx,
                     month_tx,
+                    traffic_incomplete: if r.get::<_, String>(5)? == period {
+                        r.get(10)?
+                    } else {
+                        {
+                            let since: String = r.get(11)?;
+                            since.is_empty() || since > period
+                        }
+                    },
                     month_start: period,
                     day_rx,
                     day_tx,
@@ -870,7 +1074,8 @@ impl Db {
     /// from a row this already reads, and fetching it separately would cost every
     /// report a second acquisition of the single write connection.
     pub fn accumulate(&self, node_id: i64, boot_id: &str, counters: Option<(i64, i64)>) -> Result<Traffic> {
-        let conn = self.conn();
+        let mut connection = self.conn();
+        let conn = connection.transaction()?;
         let (
             prev_boot,
             last_rx,
@@ -884,10 +1089,12 @@ impl Db {
             mut day_tx,
             day_start,
             reset_day,
+            history_since,
+            mut traffic_incomplete,
         ) = conn
             .prepare_cached(
                 "SELECT t.boot_id, t.last_rx, t.last_tx, t.total_rx, t.total_tx, t.month_rx, t.month_tx,
-                    t.month_start, t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day
+                    t.month_start, t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day, t.history_since, t.period_incomplete
                  FROM traffic t JOIN node n ON n.id = t.node_id WHERE t.node_id=?1",
             )?
             .query_row([node_id], |r| {
@@ -904,6 +1111,8 @@ impl Db {
                     r.get::<_, i64>(9)?,
                     r.get::<_, String>(10)?,
                     r.get::<_, u32>(11)?,
+                    r.get::<_, String>(12)?,
+                    r.get::<_, bool>(13)?,
                 ))
             })?;
 
@@ -955,6 +1164,7 @@ impl Db {
         let period = period_start(Local::now().date_naive(), reset_day).to_string();
         if month_start != period {
             // A new billing period restarts the month counter but not the total.
+            traffic_incomplete = history_since.is_empty() || history_since > period;
             month_rx = d_rx;
             month_tx = d_tx;
         }
@@ -968,14 +1178,37 @@ impl Db {
             conn.prepare_cached(
                 "UPDATE traffic SET boot_id=?2, last_rx=?3, last_tx=?4, total_rx=?5, total_tx=?6,
                                 month_rx=?7, month_tx=?8, month_start=?9, day_rx=?10, day_tx=?11,
-                                day_start=?12 WHERE node_id=?1",
+                                day_start=?12, period_incomplete=?13 WHERE node_id=?1",
             )?
             .execute(params![
-                node_id, boot_id, rx, tx, total_rx, total_tx, month_rx, month_tx, period, day_rx, day_tx,
-                today
+                node_id,
+                boot_id,
+                rx,
+                tx,
+                total_rx,
+                total_tx,
+                month_rx,
+                month_tx,
+                period,
+                day_rx,
+                day_tx,
+                today,
+                traffic_incomplete
             ])?;
         }
-        Ok(Traffic { total_rx, total_tx, month_rx, month_tx, month_start: period, day_rx, day_tx })
+        conn.execute("INSERT INTO traffic_daily(node_id,day,rx,tx) VALUES(?1,?2,?3,?4)
+            ON CONFLICT(node_id,day) DO UPDATE SET rx=MIN(9223372036854775807,rx+excluded.rx), tx=MIN(9223372036854775807,tx+excluded.tx)", params![node_id,today,d_rx,d_tx])?;
+        conn.commit()?;
+        Ok(Traffic {
+            total_rx,
+            total_tx,
+            month_rx,
+            month_tx,
+            month_start: period,
+            traffic_incomplete,
+            day_rx,
+            day_tx,
+        })
     }
 
     /// Allows the panel to correct a total, for example after moving a node to
@@ -988,22 +1221,11 @@ impl Db {
     ///
     /// False when no node has this id.
     pub fn set_traffic(&self, node_id: i64, p: &TrafficPatch) -> Result<bool> {
-        let conn = self.conn();
-        let Some(reset_day): Option<u32> = conn
-            .query_row("SELECT traffic_reset_day FROM node WHERE id=?1", [node_id], |r| r.get(0))
-            .optional()?
-        else {
-            return Ok(false);
-        };
-        let period = period_start(Local::now().date_naive(), reset_day).to_string();
-        conn.execute(
-            "UPDATE traffic SET total_rx=COALESCE(?2,total_rx), total_tx=COALESCE(?3,total_tx),
-                 month_rx=COALESCE(?4,CASE WHEN month_start=?6 THEN month_rx ELSE 0 END),
-                 month_tx=COALESCE(?5,CASE WHEN month_start=?6 THEN month_tx ELSE 0 END), month_start=?6
-             WHERE node_id=?1",
-            params![node_id, p.total_rx, p.total_tx, p.month_rx, p.month_tx, period],
-        )?;
-        Ok(true)
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let found = apply_traffic(&tx, node_id, p)?;
+        tx.commit()?;
+        Ok(found)
     }
 
     // ---- metrics ----
@@ -1075,6 +1297,11 @@ impl Db {
         let conn = self.conn();
         let a = conn.execute("DELETE FROM metric WHERE ts < ?1", [cutoff])?;
         let b = conn.execute("DELETE FROM ping_record WHERE ts < ?1", [cutoff])?;
+        conn.execute(
+            "DELETE FROM traffic_daily WHERE day < ?1",
+            [(Local::now().date_naive() - chrono::Days::new(400)).to_string()],
+        )?;
+        conn.execute("DELETE FROM notification_event WHERE created_at < ?1 AND NOT EXISTS(SELECT 1 FROM notification_delivery d WHERE d.event_id=notification_event.id AND d.status!='delivered')", [Utc::now().timestamp()-30*86400])?;
         Ok(a + b)
     }
 
@@ -1355,6 +1582,8 @@ impl Db {
         // Before acquiring the connection: `conn()` returns a guard on a plain
         // Mutex, and `retention_days` acquires the same one.
         let retention = self.retention_days();
+        let backup_success = self.get("backup_last_success");
+        let backup_error = self.get("backup_last_error");
         let conn = self.conn();
         let file = main_file(&conn);
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
@@ -1379,6 +1608,8 @@ impl Db {
             "free": free_pages * page_size,
             "oldest": oldest,
             "retention": retention,
+            "backup_success": backup_success,
+            "backup_error": backup_error,
             "rows": rows,
         }))
     }
@@ -1508,7 +1739,7 @@ impl Db {
         let reference = Connection::open_in_memory()?;
         reference.execute_batch(SCHEMA)?;
         migrate(&reference, SCHEMA_VERSION)?;
-        for table in TABLES {
+        for table in TABLES.iter().chain(EXTRA_TABLES.iter()) {
             let want = columns_of(&reference, table)?;
             let got = columns_of(&candidate, table)?;
             let mut missing: Vec<&str> = want.difference(&got).map(String::as_str).collect();
@@ -1530,6 +1761,10 @@ impl Db {
     /// fail. Like the other two, this reads and writes the whole file and belongs
     /// off the runtime.
     pub fn restore_from(&self, src: &str) -> Result<()> {
+        let candidate = Connection::open(src)?;
+        candidate.execute("DELETE FROM session", [])?;
+        candidate.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        drop(candidate);
         let mut conn = self.conn();
         conn.restore(rusqlite::MAIN_DB, src, None::<fn(rusqlite::backup::Progress)>)?;
         Ok(())
@@ -1642,6 +1877,8 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         remark: s("remark"),
         tags: s("tags"),
         website: s("website"),
+        permanent: n("permanent") != 0,
+        muted_until: n("muted_until"),
         traffic_limit: n("traffic_limit"),
         traffic_mode: s("traffic_mode"),
         traffic_reset_day: n("traffic_reset_day") as u32,
@@ -1665,6 +1902,34 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         down_since: n("down_since"),
         token: s("token"),
     }
+}
+
+fn apply_traffic(conn: &Connection, node_id: i64, p: &TrafficPatch) -> Result<bool> {
+    if [p.total_rx, p.total_tx, p.month_rx, p.month_tx].into_iter().flatten().any(|v| v < 0) {
+        anyhow::bail!("traffic must be non-negative");
+    }
+    let Some(reset_day): Option<u32> = conn
+        .query_row("SELECT traffic_reset_day FROM node WHERE id=?1", [node_id], |r| r.get(0))
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    let period = period_start(Local::now().date_naive(), reset_day).to_string();
+    conn.execute(
+            "UPDATE traffic SET total_rx=COALESCE(?2,total_rx), total_tx=COALESCE(?3,total_tx),
+                 month_rx=COALESCE(?4,CASE WHEN month_start=?6 THEN month_rx ELSE 0 END),
+                 month_tx=COALESCE(?5,CASE WHEN month_start=?6 THEN month_tx ELSE 0 END), month_start=?6,
+                 period_incomplete=CASE WHEN ?4 IS NOT NULL AND ?5 IS NOT NULL THEN 0 WHEN month_start=?6 THEN period_incomplete ELSE (history_since='' OR history_since>?6) END
+             WHERE node_id=?1",
+            params![node_id, p.total_rx, p.total_tx, p.month_rx, p.month_tx, period],
+        )?;
+    if p.month_rx.is_some() || p.month_tx.is_some() {
+        conn.execute(
+            "UPDATE traffic SET history_since=?2 WHERE node_id=?1",
+            params![node_id, (Local::now().date_naive() + chrono::Days::new(1)).to_string()],
+        )?;
+    }
+    Ok(true)
 }
 
 /// Start of the billing period containing `today`, given a reset day of month.
@@ -1696,6 +1961,102 @@ mod tests {
 
     fn db() -> Db {
         Db::open(":memory:").unwrap()
+    }
+
+    #[test]
+    fn a_bad_correction_rolls_back_metadata_and_period_changes() {
+        let db = db();
+        let id = db
+            .create_node(
+                &Node { name: "original".into(), traffic_reset_day: 1, ..Default::default() },
+                "atomic",
+            )
+            .unwrap();
+        let result = db.update_node(
+            id,
+            &NodePatch {
+                name: Some("changed".into()),
+                traffic_reset_day: Some(5),
+                traffic_correction: Some(TrafficPatch { month_rx: Some(-1), ..Default::default() }),
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err());
+        let node = db.node(id).unwrap().unwrap();
+        assert_eq!(node.name, "original");
+        assert_eq!(node.traffic_reset_day, 1);
+    }
+
+    #[test]
+    fn changing_periods_uses_daily_evidence_and_marks_missing_history() {
+        let db = db();
+        let today = Local::now().date_naive();
+        let day = if today.day() > 1 { today.day() } else { 31 };
+        let period = period_start(today, day).to_string();
+        let id = db
+            .create_node(&Node { name: "meter".into(), traffic_reset_day: 1, ..Default::default() }, "daily")
+            .unwrap();
+        db.accumulate(id, "boot", Some((0, 0))).unwrap();
+        db.accumulate(id, "boot", Some((123, 456))).unwrap();
+        db.conn().execute("UPDATE traffic SET history_since='9999-01-01' WHERE node_id=?1", [id]).unwrap();
+        db.update_node(id, &NodePatch { traffic_reset_day: Some(day), ..Default::default() }).unwrap();
+        let t = &db.all_traffic()[&id];
+        assert_eq!((t.total_rx, t.total_tx, t.month_rx, t.month_tx), (123, 456, 123, 456));
+        assert_eq!(t.month_start, period);
+        assert!(t.traffic_incomplete);
+        db.set_traffic(id, &TrafficPatch { month_rx: Some(200), month_tx: Some(500), ..Default::default() })
+            .unwrap();
+        assert!(!db.all_traffic()[&id].traffic_incomplete);
+        db.accumulate(id, "boot", Some((124, 457))).unwrap();
+        assert_eq!(db.all_traffic()[&id].month_rx, 201);
+        assert_eq!(db.all_traffic()[&id].total_rx, 124);
+    }
+
+    #[test]
+    fn renewal_is_explicit_logged_and_rejects_repeated_submission() {
+        let db = db();
+        let id = db
+            .create_node(
+                &Node {
+                    name: "billing".into(),
+                    expires_at: Some("2026-01-31".into()),
+                    billing_cycle: "monthly".into(),
+                    ..Default::default()
+                },
+                "renew",
+            )
+            .unwrap();
+        db.renew_node(id, "2026-01-31").unwrap();
+        assert_eq!(db.node(id).unwrap().unwrap().expires_at.as_deref(), Some("2026-02-28"));
+        assert!(db.renew_node(id, "2026-01-31").is_err());
+        assert_eq!(db.renewals(id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn outbox_and_trigger_state_survive_restart_and_commit_together() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let id = db.create_node(&Node { name: "outbox".into(), ..Default::default() }, "outbox").unwrap();
+        let note = crate::notify::Note {
+            id: "durable-event".into(),
+            event: "offline".into(),
+            time: 1,
+            title: "test".into(),
+            ..Default::default()
+        };
+        db.queue_notifications(std::slice::from_ref(&note), &["webhook"], &[(id, 99)], &[], None).unwrap();
+        drop(db);
+        let db = Db::open(&scratch.0).unwrap();
+        assert_eq!(db.due_notifications(10).unwrap().len(), 1);
+        assert_eq!(db.node(id).unwrap().unwrap().down_since, 99);
+        db.conn().execute_batch("CREATE TRIGGER reject_delivery BEFORE INSERT ON notification_delivery BEGIN SELECT RAISE(ABORT,'test'); END").unwrap();
+        let second = crate::notify::Note { id: "rejected".into(), ..note };
+        assert!(db.queue_notifications(&[second], &["webhook"], &[(id, 123)], &[], None).is_err());
+        assert_eq!(db.node(id).unwrap().unwrap().down_since, 99);
+        assert_eq!(db.notification_history().unwrap().len(), 1);
+        db.finish_notification("durable-event", "webhook", "delivered", "", 0).unwrap();
+        assert!(db.due_notifications(10).unwrap().is_empty());
+        assert_eq!(db.retry_notification("durable-event").unwrap(), 0);
     }
 
     /// PRAGMA settings are per connection, so a value read through any other
@@ -1808,6 +2169,8 @@ mod tests {
         // leaving the panel reporting a failed restore over a database already
         // replaced.
         let _ = std::fs::remove_file(&bad);
+        drop(empty);
+        let _ = std::fs::remove_file(&bad);
         let shaped = Connection::open(&bad).unwrap();
         for table in TABLES {
             shaped.execute_batch(&format!("CREATE TABLE {table} (x TEXT)")).unwrap();
@@ -1819,6 +2182,8 @@ mod tests {
         assert!(refused.contains("table is missing"), "{refused}");
 
         // From a hub carrying a schema this build has never seen.
+        let _ = std::fs::remove_file(&bad);
+        drop(shaped);
         let _ = std::fs::remove_file(&bad);
         let newer = Connection::open(&bad).unwrap();
         newer.execute_batch(SCHEMA).unwrap();
@@ -2234,7 +2599,7 @@ mod tests {
         db.update_node(id, &patch(serde_json::json!({"traffic_reset_day":2}))).unwrap();
         db.set_traffic(id, &TrafficPatch { month_rx: Some(7_000), ..Default::default() }).unwrap();
         let t = db.all_traffic().remove(&id).unwrap();
-        assert_eq!((t.month_rx, t.month_tx), (7_000, 0));
+        assert_eq!((t.month_rx, t.month_tx), (7_000, 10_000));
         // Correcting only a lifetime total cannot revive the previous month's
         // bytes.
         db.conn()
@@ -2249,6 +2614,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE node (id INTEGER PRIMARY KEY); PRAGMA user_version = 5;").unwrap();
 
+        conn.execute_batch(SCHEMA).unwrap();
         migrate(&conn, 5).unwrap();
 
         assert!(columns_of(&conn, "node").unwrap().contains("tags"));
@@ -2267,6 +2633,7 @@ mod tests {
         )
         .unwrap();
 
+        conn.execute_batch(SCHEMA).unwrap();
         migrate(&conn, 6).unwrap();
         migrate(&conn, SCHEMA_VERSION).unwrap();
 

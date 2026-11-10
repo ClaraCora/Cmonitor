@@ -24,7 +24,8 @@ use axum::http::{header, Extensions, HeaderMap, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
-use chrono::{Local, Months, NaiveDate};
+use chrono::Local;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tower_http::compression::Predicate;
 use tracing::{info, warn};
@@ -292,6 +293,7 @@ struct Args {
     listen_defaulted: bool,
     database: String,
     reset_password: bool,
+    check_db: bool,
     site: String,
     themes: PathBuf,
 }
@@ -315,6 +317,7 @@ fn parse_args() -> Result<Args> {
     let mut listen = None;
     let mut database = "monitor.db".to_owned();
     let mut reset_password = false;
+    let mut check_db = false;
     let mut site = String::new();
     let mut themes = None;
     let mut it = std::env::args().skip(1);
@@ -324,12 +327,13 @@ fn parse_args() -> Result<Args> {
             "--listen" => listen = Some(value()),
             "--db" => database = value(),
             "--reset-password" => reset_password = true,
+            "--check-db" => check_db = true,
             "--site" => site = value(),
             "--themes" => themes = Some(PathBuf::from(value())),
             "-h" | "--help" => {
                 println!(
                     "monitor-hub {}\n\n\
-                     Usage: monitor-hub [--reset-password] [--listen [::]:28080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n\n\
+                     Usage: monitor-hub [--check-db] [--reset-password] [--listen [::]:28080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n\n\
                      --listen defaults to [::]:28080, one socket serving IPv6 and IPv4\n\
                      both; where the kernel has no dual-stack sockets it is 0.0.0.0:28080.\n\
                      --themes defaults to a themes/ directory beside the database.\n\
@@ -354,6 +358,7 @@ fn parse_args() -> Result<Args> {
         listen_defaulted,
         database,
         reset_password,
+        check_db,
         site: site.trim_end_matches('/').to_owned(),
         themes,
     })
@@ -369,6 +374,15 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
+    if args.check_db {
+        anyhow::ensure!(std::path::Path::new(&args.database).is_file(), "database does not exist");
+        let db = Db::open(&args.database)?;
+        let nodes = db.nodes()?;
+        db.ping_tasks()?;
+        db.stats()?;
+        println!("Database opens successfully: {} nodes", nodes.len());
+        return Ok(());
+    }
     if args.reset_password {
         anyhow::ensure!(
             std::path::Path::new(&args.database).is_file(),
@@ -463,6 +477,8 @@ async fn main() -> Result<()> {
         .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
         .route("/api/notify/test", post(notify::test))
+        .route("/api/notify/history", get(notify::history))
+        .route("/api/notify/{id}/retry", post(notify::retry))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))
@@ -482,6 +498,10 @@ async fn main() -> Result<()> {
         .merge(
             Router::new()
                 .route("/api/db/restore", post(api::db_restore))
+                .route("/api/db/restore/{id}", get(api::restore_status).delete(api::restore_cancel))
+                .route("/api/db/restore/{id}/apply", post(api::restore_apply))
+                .route("/api/nodes/{id}/renew", post(api::renew_node))
+                .route("/api/nodes/{id}/renewals", get(api::renewals))
                 .route("/api/themes", post(api::upload_theme))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
                 .with_state(app.clone()),
@@ -529,11 +549,16 @@ async fn shutdown() {
     // SIGTERM can always be registered; a failure here indicates a broken
     // runtime, and falling back to Ctrl-C alone would reinstate the problem
     // described above.
-    let mut term = signal(SignalKind::terminate()).expect("listen for SIGTERM");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+    #[cfg(unix)]
+    {
+        let mut term = signal(SignalKind::terminate()).expect("listen for SIGTERM");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
     }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
     info!("shutting down");
 }
 
@@ -616,60 +641,15 @@ fn first_run(app: &App, url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Billing cycles as whole months. `once` has none, so it never rolls over.
-fn cycle_months(cycle: &str) -> Option<u32> {
-    Some(match cycle {
-        "monthly" => 1,
-        "quarterly" => 3,
-        "semiannual" => 6,
-        "yearly" => 12,
-        "biennial" => 24,
-        "triennial" => 36,
-        _ => return None,
-    })
-}
-
-/// A node still reporting past its expiry date has been renewed, so the date is
-/// rolled forward by whole cycles until it lies in the future.
-fn renewed(expires: NaiveDate, cycle: &str, today: NaiveDate) -> Option<NaiveDate> {
-    let months = Months::new(cycle_months(cycle)?);
-    let mut next = expires;
-    while next < today {
-        next = next.checked_add_months(months)?;
-    }
-    (next != expires).then_some(next)
-}
-
-fn renew_online_nodes(app: &App) -> Result<()> {
-    // The hub's local timezone, as with the traffic boundaries: an expiry date
-    // is one a person entered, and on a UTC+8 hub `Utc` reports the previous day
-    // until 08:00 while the panel already shows it expired.
-    let today = Local::now().date_naive();
-    let online: Vec<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-    let nodes = app.db.nodes()?;
-    let mut rolled = Vec::new();
-    for node in &nodes {
-        if !online.contains(&node.id) {
-            continue;
-        }
-        let Some(expires) = node.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()) else {
-            continue;
-        };
-        let Some(next) = renewed(expires, &node.billing_cycle, today) else { continue };
-        app.db.set_expiry(node.id, &next.to_string())?;
-        info!("node {} is still up past {expires}, expiry rolled to {next}", node.name);
-        rolled.push((node.name.as_str(), format!("{expires} → {next}")));
-    }
-    notify::renewed(app, rolled);
-    Ok(())
-}
-
-/// Expires sessions, trims history, rolls over expiry dates and sends the daily
+/// Expires sessions, trims history and sends the daily
 /// expiry digest, once an hour.
 async fn housekeeping(app: Shared) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3_600));
     loop {
         ticker.tick().await;
+        if let Err(e) = api::cleanup_restore_uploads(&app) {
+            warn!("staged upload cleanup failed: {e:#}");
+        }
         let keep = app.db.retention_days();
         if let Err(e) = app.db.prune(keep) {
             warn!("pruning history failed: {e:#}");
@@ -677,12 +657,8 @@ async fn housekeeping(app: Shared) {
         if let Err(e) = app.db.expire_sessions() {
             warn!("expiring sessions failed: {e:#}");
         }
-        if let Err(e) = renew_online_nodes(&app) {
-            warn!("rolling expiry dates failed: {e:#}");
-        }
-        // After the roll-over, so the digest lists dates as they now stand.
         match notify::expiry_digest(&app, Local::now()) {
-            Ok(Some(note)) => notify::send(&app, note),
+            Ok(Some(_)) => {}
             Ok(None) => {}
             Err(e) => warn!("expiry digest failed: {e:#}"),
         }
@@ -729,18 +705,6 @@ mod tests {
         let addr: SocketAddr = default_listen().parse().expect("the default must parse");
         assert!(addr.ip().is_unspecified(), "{addr}");
         assert_eq!(addr.port(), 28_080);
-    }
-
-    #[test]
-    fn an_expired_node_that_is_still_up_rolls_forward_whole_cycles() {
-        let d = |s: &str| s.parse::<NaiveDate>().unwrap();
-        // One day past a monthly expiry: the next month, clamped to its end.
-        assert_eq!(renewed(d("2026-01-31"), "monthly", d("2026-02-01")), Some(d("2026-02-28")));
-        // Years overdue: cycles are added until the date is in the future.
-        assert_eq!(renewed(d("2024-03-10"), "yearly", d("2026-08-28")), Some(d("2027-03-10")));
-        // Not yet due, and one-off billing: both left unchanged.
-        assert_eq!(renewed(d("2026-09-01"), "monthly", d("2026-08-28")), None);
-        assert_eq!(renewed(d("2020-01-01"), "once", d("2026-08-28")), None);
     }
 
     #[tokio::test]

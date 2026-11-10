@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from "react"
 import { ExternalLink, LogOut, Moon, Sun } from "lucide-react"
-import { Toaster } from "sonner"
+import { toast, Toaster } from "sonner"
 
 import { Admin } from "@/components/Admin"
 import { Login } from "@/components/Login"
+import { RestoreStatus } from "@/components/RestoreStatus"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, provisioningSite, useNodes } from "@/lib/api"
@@ -23,13 +24,17 @@ function usePath() {
     return start
   })
   useEffect(() => {
-    const sync = () => setPath(normalise(location.pathname))
+    const sync = () => {
+      if (!dispatchEvent(new Event("cmonitor:navigate", {cancelable:true}))) { history.pushState({},"",path); return }
+      setPath(normalise(location.pathname))
+    }
     addEventListener("popstate", sync)
     return () => removeEventListener("popstate", sync)
-  }, [])
+  }, [path])
   return [
     path,
     useCallback((next: string) => {
+      if (!dispatchEvent(new Event("cmonitor:navigate", { cancelable: true }))) return
       const to = normalise(next)
       history.pushState({}, "", to)
       setPath(to)
@@ -49,12 +54,13 @@ function useTheme() {
   return [dark, () => setDark((d) => !d)] as const
 }
 
-export default function App() {
+function AdminApp() {
   const [path, go] = usePath()
+  const [signingOut, setSigningOut] = useState(false)
   const [dark, toggleTheme] = useTheme()
   const [me, setMe] = useState<Me | null>(null)
   const [meError, setMeError] = useState("")
-  const { nodes, admin, error, refresh } = useNodes()
+  const { nodes, admin, error, refresh, stale, lastUpdatedAt, connection } = useNodes()
 
   const loadMe = useCallback(() => {
     // `|| "..."` because an empty message reads as no error: api() falls back to
@@ -68,6 +74,11 @@ export default function App() {
   useEffect(() => {
     loadMe()
   }, [loadMe])
+  useEffect(() => {
+    const restored = () => { loadMe(); refresh() }
+    addEventListener("cmonitor:restore-complete", restored)
+    return () => removeEventListener("cmonitor:restore-complete", restored)
+  }, [loadMe, refresh])
 
   // Every frame declares its audience. The hub closes the stream when the session
   // behind it is revoked -- signed out from another device, a password change, a
@@ -101,8 +112,16 @@ export default function App() {
   const sorted = [...(nodes ?? [])].sort((a, b) => a.sort - b.sort || a.id - b.id)
 
   async function signOut() {
-    await api("/auth/logout", { method: "POST" }).catch(() => {})
-    location.href = "/"
+    if (signingOut || !dispatchEvent(new Event("cmonitor:navigate", { cancelable: true }))) return
+    setSigningOut(true)
+    try {
+      await api("/auth/logout", { method: "POST" })
+      location.assign("/")
+    } catch {
+      const current = await api<Me>("/me").catch(() => null)
+      if (current?.authed === false) location.assign("/")
+      else toast.error(current ? "退出失败，请重试" : "无法确认退出结果，请恢复网络后重试")
+    } finally { setSigningOut(false) }
   }
 
   return (
@@ -126,13 +145,15 @@ export default function App() {
           <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
             {dark ? <Sun /> : <Moon />}
           </Button>
-          <Button variant="ghost" size="icon" onClick={signOut} title="退出登录">
+          <Button variant="ghost" size="icon" onClick={signOut} disabled={signingOut} title="退出登录">
             <LogOut />
           </Button>
         </div>
       </header>
 
       <main className="mx-auto max-w-[1600px] space-y-5 px-4 py-6">
+        {stale && <p role="status" className="rounded-lg border p-3 text-sm">数据更新中断。以下为 {lastUpdatedAt ? new Date(lastUpdatedAt).toLocaleTimeString("zh-CN") : "—"} 收到的历史状态，请勿据此判断当前在线情况。<Button variant="ghost" size="sm" onClick={refresh}>重试</Button></p>}
+        {!stale && lastUpdatedAt && <p className="text-xs text-muted-foreground">{connection === "live" ? "实时更新" : "轮询更新"} · 最近更新 {new Date(lastUpdatedAt).toLocaleTimeString("zh-CN")}</p>}
         {error && <p className="text-sm text-destructive">{error}</p>}
         {!nodes ? (
           <Skeleton className="h-64" />
@@ -154,4 +175,8 @@ export default function App() {
       <Toaster position="top-center" theme={dark ? "dark" : "light"} />
     </div>
   )
+}
+
+export default function App() {
+  return <><RestoreStatus /><AdminApp /></>
 }

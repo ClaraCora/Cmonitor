@@ -43,6 +43,9 @@ export type Node = {
   currency: string
   billing_cycle: string
   expires_at: string | null
+  permanent?: boolean
+  traffic_incomplete?: boolean
+  muted_until?: number
   traffic_limit: number
   traffic_mode: string
   traffic_reset_day: number
@@ -192,6 +195,7 @@ export async function upload<T>(
   file: File,
   onProgress?: (sent: number) => void,
   signal?: AbortSignal,
+  headers?: Record<string, string>,
 ): Promise<T> {
   if (file.size === 0) throw new ApiError(400, "文件是空的")
   let last: Response | null = null
@@ -202,7 +206,7 @@ export async function upload<T>(
     if (signal?.aborted) throw new DOMException("aborted", "AbortError")
     const res = await fetch(`/api${path}?offset=${offset}&total=${file.size}`, {
       method: "POST",
-      headers: { "content-type": "application/octet-stream" },
+      headers: { "content-type": "application/octet-stream", ...headers },
       body: file.slice(offset, offset + CHUNK),
       signal,
     })
@@ -227,6 +231,14 @@ export async function upload<T>(
  * back to polling if it cannot be established.
  */
 export function useNodes() {
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null)
+  const [now, setNow] = useState(() => Date.now())
+  const [connection, setConnection] = useState("connecting")
+  const stale = lastUpdatedAt !== null && now - lastUpdatedAt >= 15_000
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [])
   const [nodes, setNodes] = useState<Node[] | null>(null)
   // null until a frame reports it. The panel treats an explicit false as the
   // session no longer being an admin one, so an unanswered first fetch must not
@@ -240,16 +252,22 @@ export function useNodes() {
     let poll: ReturnType<typeof setInterval> | null = null
     let retry: ReturnType<typeof setTimeout> | null = null
     let closed = false
+    let lastReceived = Date.now()
 
     const fetchOnce = () =>
       api<{ nodes: Node[]; admin: boolean }>("/nodes")
         .then((d) => {
+          if (closed) return
+          lastReceived = Date.now()
+          setLastUpdatedAt(lastReceived)
+          setConnection("polling")
           setNodes(d.nodes)
           setAdmin(d.admin)
           setError(null)
         })
         .catch((e: Error) => {
-          setError(e.message)
+          if (closed) return
+          setError(e.message || "无法获取最新状态")
           // With the public page switched off, a revoked session receives a 401
           // here and on the stream, so the frame that would report admin=false
           // never arrives and the panel would retain the list it already had.
@@ -270,7 +288,12 @@ export function useNodes() {
         return
       }
       socket.onmessage = (event) => {
-        const frame = JSON.parse(event.data)
+        if (closed) return
+        let frame
+        try { frame = JSON.parse(event.data); if (!Array.isArray(frame.nodes)) return } catch { return }
+        lastReceived = Date.now()
+        setLastUpdatedAt(lastReceived)
+        setConnection("live")
         setNodes(frame.nodes)
         setAdmin(frame.admin)
         setError(null)
@@ -283,19 +306,23 @@ export function useNodes() {
       socket.onerror = () => socket?.close()
       socket.onclose = () => {
         if (closed) return
+        setConnection("reconnecting")
+        fetchOnce()
         poll ??= setInterval(fetchOnce, 5000)
         retry = setTimeout(connect, 5000)
       }
     }
     connect()
+    const watchdog = setInterval(() => { if (!closed && Date.now()-lastReceived >= 10_000) fetchOnce() }, 5000)
 
     return () => {
       closed = true
+      clearInterval(watchdog)
       socket?.close()
       if (poll) clearInterval(poll)
       if (retry) clearTimeout(retry)
     }
   }, [reload])
 
-  return { nodes, admin, error, refresh: () => setReload((n) => n + 1) }
+  return { nodes, admin, error, lastUpdatedAt, stale, connection, refresh: () => setReload((n) => n + 1) }
 }
