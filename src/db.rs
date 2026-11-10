@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS node (
   expires_at    TEXT,
   remark        TEXT    NOT NULL DEFAULT '',
   tags          TEXT    NOT NULL DEFAULT '',
+  website       TEXT    NOT NULL DEFAULT '',
   traffic_limit INTEGER NOT NULL DEFAULT 0,
   traffic_mode  TEXT    NOT NULL DEFAULT 'sum',
   traffic_reset_day INTEGER NOT NULL DEFAULT 1,
@@ -144,7 +145,7 @@ CREATE TABLE IF NOT EXISTS visitor_log (
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -272,6 +273,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 6 {
         add_column(conn, "node", "tags TEXT NOT NULL DEFAULT ''")?;
     }
+    if from < 7 {
+        add_column(conn, "node", "website TEXT NOT NULL DEFAULT ''")?;
+    }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
 }
@@ -313,6 +317,9 @@ pub struct Node {
     /// `<color>` on each label using the Radix Themes color names.
     #[serde(default)]
     pub tags: String,
+    /// Provider website, included only in authenticated views.
+    #[serde(default)]
+    pub website: String,
     /// Monthly allowance in bytes; 0 means unmetered.
     #[serde(default)]
     pub traffic_limit: i64,
@@ -387,6 +394,7 @@ pub struct NodePatch {
     pub expires_at: Option<Option<String>>,
     pub remark: Option<String>,
     pub tags: Option<String>,
+    pub website: Option<String>,
     pub traffic_limit: Option<i64>,
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
@@ -615,8 +623,8 @@ impl Db {
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
             "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
-                               expires_at, remark, tags, traffic_limit, traffic_mode, traffic_reset_day, created_at)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                               expires_at, remark, tags, traffic_limit, traffic_mode, traffic_reset_day, website, created_at)
+             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 n.name,
                 token,
@@ -630,6 +638,7 @@ impl Db {
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day,
+                n.website,
                 Utc::now().timestamp()
             ],
         )?;
@@ -663,7 +672,7 @@ impl Db {
                              traffic_limit=COALESCE(?12,traffic_limit),
                              traffic_mode=COALESCE(?13,traffic_mode),
                              traffic_reset_day=COALESCE(?14,traffic_reset_day),
-                             notify=COALESCE(?15,notify)
+                             notify=COALESCE(?15,notify), website=COALESCE(?16,website)
              WHERE id=?1",
             params![
                 id,
@@ -680,7 +689,8 @@ impl Db {
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day,
-                n.notify
+                n.notify,
+                n.website
             ],
         )?;
         Ok(found > 0)
@@ -1631,6 +1641,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         expires_at: r.get::<_, Option<String>>("expires_at").unwrap_or(None),
         remark: s("remark"),
         tags: s("tags"),
+        website: s("website"),
         traffic_limit: n("traffic_limit"),
         traffic_mode: s("traffic_mode"),
         traffic_reset_day: n("traffic_reset_day") as u32,
@@ -2197,6 +2208,7 @@ mod tests {
                 "public": false,
                 "remark": "private",
                 "tags": "二网精品;1Gbps<green>",
+                "website": "https://provider.example/plans",
                 "expires_at": "2030-01-01"
             })),
         )
@@ -2206,6 +2218,7 @@ mod tests {
         assert!(!n.public);
         assert_eq!(n.remark, "private");
         assert_eq!(n.tags, "二网精品;1Gbps<green>");
+        assert_eq!(n.website, "https://provider.example/plans");
         assert_eq!(n.expires_at.as_deref(), Some("2030-01-01"));
         db.update_node(id, &patch(serde_json::json!({"price":0,"expires_at":null}))).unwrap();
         let n = db.node(id).unwrap().unwrap();
@@ -2243,6 +2256,41 @@ mod tests {
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(),
             SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn schema_six_gains_an_empty_website_without_changing_existing_nodes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE node (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO node VALUES (1, 'existing'); PRAGMA user_version = 6;",
+        )
+        .unwrap();
+
+        migrate(&conn, 6).unwrap();
+        migrate(&conn, SCHEMA_VERSION).unwrap();
+
+        let (name, website): (String, String) = conn
+            .query_row("SELECT name, website FROM node WHERE id=1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(name, "existing");
+        assert_eq!(website, "");
+    }
+
+    #[test]
+    fn a_website_is_stored_when_a_node_is_created() {
+        let db = db();
+        let id = db
+            .create_node(
+                &Node {
+                    name: "provider".into(),
+                    website: "https://provider.example/".into(),
+                    ..Default::default()
+                },
+                "website-token",
+            )
+            .unwrap();
+        assert_eq!(db.node(id).unwrap().unwrap().website, "https://provider.example/");
     }
 
     #[test]
