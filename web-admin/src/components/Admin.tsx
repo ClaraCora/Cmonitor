@@ -1553,12 +1553,13 @@ function SettingsTab() {
           <Field label="站点名称">
             <Input value={String(s.site_name ?? "")} onChange={(e) => set("site_name", e.target.value)} placeholder="Monitor" />
           </Field>
-          <Field label="预设筛选标签" hint="状态页国别按钮最左侧显示此标签；精确匹配节点标签文字，无需填写颜色。留空隐藏。">
-            <Input
+          <Field label="预设筛选标签" hint="每行一个，也可用中英文分号分隔。最多 12 个，每个 32 字，重复项自动合并。按填写顺序显示在国别按钮之前；精确匹配节点标签文字，无需颜色。留空隐藏。">
+            <textarea
+              rows={3}
+              className={TEXTAREA}
               value={String(s.preset_tag ?? "")}
               onChange={(e) => set("preset_tag", e.target.value)}
-              placeholder="例如：游走"
-              maxLength={32}
+              placeholder={"例如：游走\n主力\n备用"}
             />
           </Field>
           <Field label="历史数据保留天数" hint="超出的明细自动清理，累计流量不受影响">

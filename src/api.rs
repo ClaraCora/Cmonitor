@@ -1981,18 +1981,31 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         "password_login" if !matches!(value, "on" | "off") => Some("password_login must be on or off".into()),
         "password_login" => None,
         "visitor_card" if !matches!(value, "on" | "off") => Some("visitor_card must be on or off".into()),
-        "preset_tag"
-            if value.trim().chars().count() > 32
-                || value.chars().any(|c| c.is_control() || c == ';') =>
-        {
-            Some("预设筛选标签最多 32 个字符，不能包含分号或换行".into())
-        }
+        "preset_tag" => normalize_preset_tags(value).err().map(str::to_owned),
         "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
         "admin_password" => None,
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
         _ => Some(format!("unknown setting: {key}")),
     }
+}
+
+// Keep the existing setting key so a single saved label survives this upgrade.
+// Store one canonical delimiter; the panel also accepts pasted, multiline lists.
+fn normalize_preset_tags(value: &str) -> Result<String, &'static str> {
+    let mut tags = Vec::new();
+    for tag in value.split([';', '；', '\n', '\r']).map(str::trim).filter(|s| !s.is_empty()) {
+        if tag.chars().count() > 32 || tag.chars().any(char::is_control) {
+            return Err("每个预设筛选标签最多 32 个字符，不能包含控制字符");
+        }
+        if !tags.contains(&tag) {
+            tags.push(tag);
+            if tags.len() > 12 {
+                return Err("预设筛选标签最多设置 12 个，请减少后重试");
+            }
+        }
+    }
+    Ok(tags.join(";"))
 }
 
 pub async fn save_settings(
@@ -2008,7 +2021,7 @@ pub async fn save_settings(
         }
     }
     if let Some(Value::String(tag)) = map.get_mut("preset_tag") {
-        *tag = tag.trim().to_owned();
+        *tag = normalize_preset_tags(tag).expect("preset tags were validated above");
     }
     let password_hash = match map.get("admin_password").and_then(Value::as_str).map(hash_password).transpose()
     {
@@ -3085,15 +3098,31 @@ mod tests {
         let Json(admin) = settings(Admin, State(app.clone())).await;
         assert_eq!(admin["preset_tag"], "游走");
 
-        for invalid in [json!("游走;备用"), json!("游走\n备用"), json!("主".repeat(33)), json!(true)]
-        {
+        let saved = save(json!({"preset_tag": " 游走 ; 主力\r\n备用；游走;; 主力\n "})).await;
+        assert_eq!(saved.status(), StatusCode::OK);
+        let Json(public) = me(State(app.clone()), HeaderMap::new()).await;
+        assert_eq!(public["preset_tag"], "游走;主力;备用", "normalize, deduplicate and keep order");
+        let Json(admin) = settings(Admin, State(app.clone())).await;
+        assert_eq!(admin["preset_tag"], public["preset_tag"]);
+
+        let twelve = (1..=12).map(|n| format!("标签{n}")).collect::<Vec<_>>().join(";");
+        for invalid in [
+            json!(format!("{twelve};第十三个")),
+            json!("游\t走"),
+            json!("游\u{0}走"),
+            json!("主".repeat(33)),
+            json!(true),
+            json!(["游走", "备用"]),
+        ] {
             let refused = save(json!({"preset_tag": invalid, "site_name": "must-not-change"})).await;
             assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
-            assert_eq!(app.db.get("preset_tag").as_deref(), Some("游走"));
+            assert_eq!(app.db.get("preset_tag").as_deref(), Some("游走;主力;备用"));
             assert_eq!(app.db.get("site_name"), None, "invalid presets reject the entire write");
         }
+        assert_eq!(save(json!({"preset_tag": format!("{twelve};标签1")})).await.status(), StatusCode::OK);
+        assert_eq!(app.db.get("preset_tag").as_deref(), Some(twelve.as_str()));
         assert_eq!(save(json!({"preset_tag": "主".repeat(32)})).await.status(), StatusCode::OK);
-        assert_eq!(save(json!({"preset_tag": " "})).await.status(), StatusCode::OK);
+        assert_eq!(save(json!({"preset_tag": " ;；\n\r "})).await.status(), StatusCode::OK);
         let Json(cleared) = me(State(app), HeaderMap::new()).await;
         assert_eq!(cleared["preset_tag"], "", "clearing the setting hides the preset");
     }

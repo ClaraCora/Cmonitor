@@ -41,7 +41,11 @@ async function main() {
       if (backupFail && pathname === '/api/db') return fail('模拟备份状态加载失败')
       if (req.method() !== 'GET') {
         writes.push({ pathname, method:req.method(), body:req.postData() })
-        if (pathname === '/api/settings' && req.method() === 'PUT') Object.assign(settings,JSON.parse(req.postData()))
+        if (pathname === '/api/settings' && req.method() === 'PUT') {
+          const patch=JSON.parse(req.postData())
+          if (typeof patch.preset_tag==='string') patch.preset_tag=[...new Set(patch.preset_tag.split(/[;；\r\n]/).map(tag=>tag.trim()).filter(Boolean))].join(';')
+          Object.assign(settings,patch)
+        }
         if (pathname === '/api/auth/logout') return fail('模拟退出失败')
         if (/^\/api\/db\/restore\/[a-f0-9]{32}\/apply$/.test(pathname)) {
           restoreId = pathname.split('/')[4]
@@ -126,6 +130,14 @@ async function main() {
       assert.equal(settings.preset_tag,'游走','site settings save trims the preset label')
       await page.reload()
       assert.equal(await page.getByLabel('预设筛选标签',{exact:true}).inputValue(),'游走','saved preset survives reload')
+      await page.getByLabel('预设筛选标签',{exact:true}).fill(' 游走\n主力；备用;游走 ')
+      await page.getByRole('button',{name:'保存站点设置',exact:true}).click()
+      await page.getByText('已保存',{exact:true}).waitFor()
+      assert.equal(JSON.parse(writes.filter(w=>w.pathname==='/api/settings').at(-1).body).preset_tag,'游走\n主力；备用;游走','multiline presets reach the Hub intact')
+      await page.reload()
+      assert.equal(await page.getByLabel('预设筛选标签',{exact:true}).inputValue(),'游走;主力;备用','canonical multiple presets survive reload')
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,'multiline preset settings fit mobile')
+      await page.screenshot({animations:'disabled',path:path.join(output,'multiple-presets-settings-mobile.png')})
       await page.getByLabel('预设筛选标签',{exact:true}).fill('')
       await page.getByRole('button',{name:'保存站点设置',exact:true}).click()
       await page.getByText('已保存',{exact:true}).waitFor()
