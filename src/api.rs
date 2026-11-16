@@ -663,6 +663,7 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
         "public_page": app.public_page(),
         "visitor_card": app.db.get("visitor_card").as_deref() != Some("off"),
+        "preset_tag": app.db.get("preset_tag").unwrap_or_default(),
         "can_provision": provisioning_allowed(&app, &headers),
         // The hub's own public URL when one was given, which is what belongs in an
         // install command and in the OAuth callback -- not whichever address this
@@ -1209,6 +1210,7 @@ const READABLE_SETTINGS: &[&str] = &[
     "site_name",
     "public_page",
     "visitor_card",
+    "preset_tag",
     "github_client_id",
     "github_allowed_users",
     "retention_days",
@@ -1979,6 +1981,12 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         "password_login" if !matches!(value, "on" | "off") => Some("password_login must be on or off".into()),
         "password_login" => None,
         "visitor_card" if !matches!(value, "on" | "off") => Some("visitor_card must be on or off".into()),
+        "preset_tag"
+            if value.trim().chars().count() > 32
+                || value.chars().any(|c| c.is_control() || c == ';') =>
+        {
+            Some("预设筛选标签最多 32 个字符，不能包含分号或换行".into())
+        }
         "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
         "admin_password" => None,
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
@@ -1991,13 +1999,16 @@ pub async fn save_settings(
     _: Admin,
     State(app): State<Shared>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
-    let Some(map) = body.as_object() else { return bad("expected an object") };
-    for (key, value) in map {
+    let Some(map) = body.as_object_mut() else { return bad("expected an object") };
+    for (key, value) in map.iter() {
         if let Some(message) = setting_error(&app, key, value) {
             return bad(&message);
         }
+    }
+    if let Some(Value::String(tag)) = map.get_mut("preset_tag") {
+        *tag = tag.trim().to_owned();
     }
     let password_hash = match map.get("admin_password").and_then(Value::as_str).map(hash_password).transpose()
     {
@@ -3059,6 +3070,34 @@ mod tests {
         assert_eq!(app.db.get("retention_days").as_deref(), Some("7"));
     }
 
+    #[tokio::test]
+    async fn preset_tag_settings_are_validated_and_publicly_readable() {
+        let app = std::sync::Arc::new(app());
+        let save = |body: Value| save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(body));
+        let Json(initial) = me(State(app.clone()), HeaderMap::new()).await;
+        assert_eq!(initial["preset_tag"], "");
+
+        let saved = save(json!({"preset_tag": "  游走  "})).await;
+        assert_eq!(saved.status(), StatusCode::OK);
+        let Json(public) = me(State(app.clone()), HeaderMap::new()).await;
+        assert_eq!(public["preset_tag"], "游走");
+        assert_eq!(public["authed"], false);
+        let Json(admin) = settings(Admin, State(app.clone())).await;
+        assert_eq!(admin["preset_tag"], "游走");
+
+        for invalid in [json!("游走;备用"), json!("游走\n备用"), json!("主".repeat(33)), json!(true)]
+        {
+            let refused = save(json!({"preset_tag": invalid, "site_name": "must-not-change"})).await;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(app.db.get("preset_tag").as_deref(), Some("游走"));
+            assert_eq!(app.db.get("site_name"), None, "invalid presets reject the entire write");
+        }
+        assert_eq!(save(json!({"preset_tag": "主".repeat(32)})).await.status(), StatusCode::OK);
+        assert_eq!(save(json!({"preset_tag": " "})).await.status(), StatusCode::OK);
+        let Json(cleared) = me(State(app), HeaderMap::new()).await;
+        assert_eq!(cleared["preset_tag"], "", "clearing the setting hides the preset");
+    }
+
     /// The install script and the sign-in page keep separate counters: five
     /// machines started with a stale key is a misconfigured deploy, and a shared
     /// counter would lock the operator out of the panel for the lockout window.
@@ -3239,6 +3278,7 @@ mod tests {
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
             "site_name": read["site_name"],
+            "preset_tag": read["preset_tag"],
             "retention_days": read["retention_days"],
             "github_proxy": read["github_proxy"],
             "public_page": "on",

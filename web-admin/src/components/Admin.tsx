@@ -1543,7 +1543,7 @@ function useSettings() {
 }
 
 function SettingsTab() {
-  const { s, set, save, error, load } = useSettings()
+  const { s, set, save, saving, error, load } = useSettings()
   if (!s) return <LoadState error={error} retry={load} />
 
   return (
@@ -1552,6 +1552,14 @@ function SettingsTab() {
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="站点名称">
             <Input value={String(s.site_name ?? "")} onChange={(e) => set("site_name", e.target.value)} placeholder="Monitor" />
+          </Field>
+          <Field label="预设筛选标签" hint="状态页国别按钮最左侧显示此标签；精确匹配节点标签文字，无需填写颜色。留空隐藏。">
+            <Input
+              value={String(s.preset_tag ?? "")}
+              onChange={(e) => set("preset_tag", e.target.value)}
+              placeholder="例如：游走"
+              maxLength={32}
+            />
           </Field>
           <Field label="历史数据保留天数" hint="超出的明细自动清理，累计流量不受影响">
             <Input
@@ -1593,9 +1601,11 @@ function SettingsTab() {
         <div>
           <Button
             size="sm"
+            disabled={saving}
             onClick={() =>
               save({
                 site_name: String(s.site_name ?? ""),
+                preset_tag: String(s.preset_tag ?? "").trim(),
                 // `||` rather than `??`: the hub returns "" for an unset key
                 // rather than null, and "" is the one value this key's write path
                 // refuses.

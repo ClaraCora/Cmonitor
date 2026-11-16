@@ -41,6 +41,7 @@ async function main() {
       if (backupFail && pathname === '/api/db') return fail('模拟备份状态加载失败')
       if (req.method() !== 'GET') {
         writes.push({ pathname, method:req.method(), body:req.postData() })
+        if (pathname === '/api/settings' && req.method() === 'PUT') Object.assign(settings,JSON.parse(req.postData()))
         if (pathname === '/api/auth/logout') return fail('模拟退出失败')
         if (/^\/api\/db\/restore\/[a-f0-9]{32}\/apply$/.test(pathname)) {
           restoreId = pathname.split('/')[4]
@@ -119,6 +120,16 @@ async function main() {
       settingsFail=false
       await page.getByRole('button',{name:'重新加载',exact:true}).click()
       await page.getByLabel('站点名称',{exact:true}).waitFor()
+      await page.getByLabel('预设筛选标签',{exact:true}).fill(' 游走 ')
+      await page.getByRole('button',{name:'保存站点设置',exact:true}).click()
+      await page.getByText('已保存',{exact:true}).waitFor()
+      assert.equal(settings.preset_tag,'游走','site settings save trims the preset label')
+      await page.reload()
+      assert.equal(await page.getByLabel('预设筛选标签',{exact:true}).inputValue(),'游走','saved preset survives reload')
+      await page.getByLabel('预设筛选标签',{exact:true}).fill('')
+      await page.getByRole('button',{name:'保存站点设置',exact:true}).click()
+      await page.getByText('已保存',{exact:true}).waitFor()
+      assert.equal(settings.preset_tag,'','the preset can be cleared')
       await page.getByRole('button',{name:'退出登录',exact:true}).click()
       await page.getByText('退出失败，请重试',{exact:true}).waitFor()
       assert(page.url().endsWith('/clara/settings'),'failed logout must not navigate')
