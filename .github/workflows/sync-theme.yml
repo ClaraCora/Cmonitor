@@ -1,0 +1,47 @@
+name: sync-theme
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+concurrency:
+  group: sync-theme
+  cancel-in-progress: false
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 scripts/sync-theme-pin.py
+      - name: Validate and propose pinned theme
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if git diff --quiet -- web-theme.pin; then exit 0; fi
+          ./scripts/theme.sh
+          python3 - <<'PY'
+          import json, re
+          from pathlib import Path
+          theme = json.loads(Path('target/theme/theme.json').read_text())
+          minimum = theme.get('min_hub_version')
+          current = re.search(r'^version = "([^"]+)"', Path('Cargo.toml').read_text(), re.M)[1]
+          if minimum and tuple(map(int, minimum.split('.'))) > tuple(map(int, current.split('.'))):
+              raise SystemExit('theme requires a newer Hub; update Hub before proposing this pin')
+          PY
+          read -r tag digest < web-theme.pin
+          branch="automation/theme-$tag"
+          if gh pr list --head "$branch" --json number --jq 'length' | grep -qv '^0$'; then exit 0; fi
+          git switch -c "$branch"
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add web-theme.pin
+          git commit -m "Embed default theme $tag"
+          git push --set-upstream origin "$branch"
+          gh pr create --title "Embed default theme $tag" --body 'Update the built-in theme to the published archive and SHA256. Integration CI must pass before merging. Independent disk theme updates remain supported.'
+          # Token-generated pushes do not recursively trigger workflows.
+          gh workflow run ci.yml --ref "$branch"

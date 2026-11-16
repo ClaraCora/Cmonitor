@@ -8,9 +8,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
+use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
@@ -112,11 +114,16 @@ struct Lease {
     id: String,
     agent: mpsc::Sender<String>,
     cancel_agent: watch::Sender<bool>,
+    actor: String,
+    node_id: i64,
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
         self.app.terminals.remove(&self.id);
+        if let Err(e) = self.app.db.terminal_audit(&self.actor, self.node_id, "closed", &self.id[..16]) {
+            warn!("terminal close audit failed: {e}");
+        }
         if self.agent.try_send(rpc("terminal.close", json!({"terminal_id": self.id}))).is_err() {
             // A full queue cannot prevent root-shell cleanup. Reconnect the node.
             self.cancel_agent.send_replace(true);
@@ -150,6 +157,57 @@ fn default_rows() -> u32 {
     32
 }
 
+fn recent_session(app: &App, hash: &str) -> bool {
+    app.db.session_actor(hash).is_some_and(|(actor, time)| {
+        !actor.starts_with("legacy:") && (0..=600).contains(&(Utc::now().timestamp() - time))
+    })
+}
+pub async fn access(_: crate::api::Admin, State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
+    let allowed = current_session(&headers).is_some_and(|h| recent_session(&app, &h));
+    let config = app.db.auth_config(&app.site).ok();
+    Json(
+        json!({"allowed": allowed, "github": config.as_ref().is_some_and(|c| c.github_ready()), "password_login": config.as_ref().is_some_and(|c| c.password_enabled)}),
+    )
+}
+#[derive(Deserialize)]
+pub struct TerminalPolicy {
+    enabled: bool,
+}
+pub async fn policy(
+    _: crate::api::Admin,
+    State(app): State<Shared>,
+    Path(node): Path<i64>,
+    headers: HeaderMap,
+    Json(policy): Json<TerminalPolicy>,
+) -> Response {
+    if !app.db.node(node).ok().flatten().is_some() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let actor =
+        current_session(&headers).and_then(|h| app.db.session_actor(&h)).map(|v| v.0).unwrap_or_default();
+    if let Err(e) = app.db.set(&format!("terminal_node_{node}"), if policy.enabled { "on" } else { "off" }) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    if !policy.enabled {
+        app.terminals.disconnect_node(node);
+    }
+    if let Err(e) = app.db.terminal_audit(
+        &actor,
+        node,
+        if policy.enabled { "enabled" } else { "disabled" },
+        &random_token()[..16],
+    ) {
+        warn!("terminal policy audit failed: {e}");
+    }
+    Json(json!({"ok":true})).into_response()
+}
+pub async fn history(_: crate::api::Admin, State(app): State<Shared>) -> Response {
+    match app.db.terminal_history() {
+        Ok(items) => Json(json!({"items":items})).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 pub async fn handler(State(app): State<Shared>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
     if !crate::auth::same_origin(&app, &headers, true) {
         return StatusCode::FORBIDDEN.into_response();
@@ -160,6 +218,9 @@ pub async fn handler(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
     let Some(session) = current_session(&headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    if !recent_session(&app, &session) {
+        return (StatusCode::FORBIDDEN, "请在打开终端前重新登录，认证有效期为 10 分钟").into_response();
+    }
     info!("browser terminal websocket accepted");
     upgrade
         .read_buffer_size(crate::api::SOCKET_BUFFER)
@@ -184,6 +245,24 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
         send_error(&mut socket, "终端窗口大小无效").await;
         return;
     }
+    if !recent_session(&app, &session) {
+        send_error(&mut socket, "请重新登录后打开终端").await;
+        return;
+    }
+    if app.db.get(&format!("terminal_node_{node_id}")).as_deref() == Some("off") {
+        send_error(&mut socket, "管理员已禁用该节点终端").await;
+        return;
+    }
+    let agent_disabled = app
+        .agents
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&node_id)
+        .is_some_and(|a| !a.terminal_enabled);
+    if agent_disabled {
+        send_error(&mut socket, "Agent 已在本机禁用终端").await;
+        return;
+    }
     info!("opening terminal on node {node_id}");
 
     let connection = app
@@ -197,6 +276,11 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
         return;
     };
     let terminal_id = random_token();
+    let actor = app.db.session_actor(&session).map(|v| v.0).unwrap_or_default();
+    if app.db.terminal_audit(&actor, node_id, "open_requested", &terminal_id[..16]).is_err() {
+        send_error(&mut socket, "无法写入终端审计，请检查数据库").await;
+        return;
+    }
     let (browser_tx, mut browser_rx) = mpsc::channel(128);
     let Some(mut cancelled) =
         app.terminals.insert(terminal_id.clone(), node_id, agent_session, session.clone(), browser_tx)
@@ -204,7 +288,7 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
         send_error(&mut socket, "终端数量已达上限：每节点 4 个，Hub 共 32 个").await;
         return;
     };
-    let lease = Lease { app: app.clone(), id: terminal_id.clone(), agent, cancel_agent };
+    let lease = Lease { app: app.clone(), id: terminal_id.clone(), agent, cancel_agent, actor, node_id };
     if *agent_cancelled.borrow() || !authed_hash(&app, &session) {
         return;
     }
@@ -249,9 +333,11 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
                     let terminal_event = event_type(&message);
                     if terminal_event.as_deref() == Some("terminal.ready") {
                         ready = true;
+                        let _ = app.db.terminal_audit(&lease.actor,node_id,"ready",&terminal_id[..16]);
                         info!("terminal on node {node_id} is ready");
                     }
                     if !send(&mut socket, Message::Text(message.into())).await { break }
+                    if terminal_event.as_deref() == Some("terminal.error") { let _ = app.db.terminal_audit(&lease.actor,node_id,"agent_error",&terminal_id[..16]); }
                     if matches!(terminal_event.as_deref(), Some("terminal.exit" | "terminal.error")) {
                         break;
                     }
@@ -365,5 +451,19 @@ mod tests {
         assert!(to_agent("server-id", r#"{"type":"resize","cols":120,"rows":32}"#).is_some());
         assert!(to_agent("server-id", r#"{"type":"resize","cols":0,"rows":32}"#).is_none());
         assert!(to_agent("server-id", r#"{"type":"connect","node_id":1}"#).is_none());
+    }
+    #[test]
+    fn terminal_access_requires_a_recent_identified_login() {
+        let app = App::for_test(Db::open(":memory:").unwrap());
+        app.db.set("admin_password_hash", "hash").unwrap();
+        let now = Utc::now().timestamp();
+        app.db.create_session("legacy", crate::auth::session_expiry()).unwrap();
+        assert!(!recent_session(&app, "legacy"));
+        app.db.password_session("fresh", crate::auth::session_expiry(), "hash").unwrap();
+        assert!(recent_session(&app, "fresh"));
+        app.db.password_session("old", now + 14 * 86400 - 601, "hash").unwrap();
+        assert!(!recent_session(&app, "old"));
+        app.db.terminal_audit("password:local", 7, "ready", "public-correlation").unwrap();
+        assert_eq!(app.db.terminal_history().unwrap()[0]["node_id"], 7);
     }
 }

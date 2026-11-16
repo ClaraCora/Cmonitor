@@ -1,10 +1,7 @@
-import { Children, cloneElement, isValidElement, useEffect, useId, useRef, useState } from "react"
+import { lazy, Suspense, Children, cloneElement, isValidElement, useEffect, useId, useRef, useState } from "react"
 import { DropdownMenu } from "radix-ui"
 import { flushSync } from "react-dom"
 import { Bell, CalendarClock, MoreHorizontal, ChevronRight, Copy, Database, Download, Eye, EyeOff, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Terminal as TerminalIcon, Trash2, Upload, Users } from "lucide-react"
-import { FitAddon } from "@xterm/addon-fit"
-import { Terminal as XTerm } from "@xterm/xterm"
-import "@xterm/xterm/css/xterm.css"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -659,177 +656,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   )
 }
 
-type TerminalState = "connecting" | "online" | "closed" | "error"
-
-function TerminalDialog({ node, onClose }: { node: Node; onClose: () => void }) {
-  const [container, setContainer] = useState<HTMLDivElement | null>(null)
-  const socket = useRef<WebSocket | null>(null)
-  const [state, setState] = useState<TerminalState>("connecting")
-  const [message, setMessage] = useState("正在连接 Hub…")
-
-  useEffect(() => {
-    let disposed = false
-    let currentState: TerminalState = "connecting"
-    const updateState = (next: TerminalState, text: string) => {
-      currentState = next
-      setState(next)
-      setMessage(text)
-    }
-    const detail = (error: unknown) => error instanceof Error && error.message ? `：${error.message}` : ""
-    const host = container
-    if (!host) return
-    updateState("connecting", "正在连接 Hub…")
-
-    const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/terminal/ws`
-    let ws: WebSocket
-    try {
-      // Start the handshake before xterm touches the DOM. If xterm fails, the
-      // Hub log still tells us whether the browser reached this point.
-      ws = new WebSocket(url)
-    } catch (error) {
-      updateState("error", `浏览器无法创建终端连接${detail(error)}`)
-      return
-    }
-    socket.current = ws
-    const connectTimer = window.setTimeout(() => {
-      if (!disposed && ws.readyState !== WebSocket.OPEN) {
-        updateState("error", "无法连接 Hub 的终端通道，请检查反向代理的 WebSocket 配置")
-        ws.close()
-      }
-    }, 10_000)
-
-    const initialize = () => {
-      const terminal = new XTerm({
-      cursorBlink: true,
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-      fontSize: 15,
-        scrollback: 5000,
-        theme: { background: "#0d1117", foreground: "#e6edf3", cursor: "#58a6ff" },
-      })
-      try {
-        const fit = new FitAddon()
-        terminal.loadAddon(fit)
-        terminal.open(host)
-        return { terminal, fit }
-      } catch (error) {
-        terminal.dispose()
-        throw error
-      }
-    }
-    let initialized: ReturnType<typeof initialize>
-    try {
-      initialized = initialize()
-    } catch (error) {
-      window.clearTimeout(connectTimer)
-      updateState("error", `终端界面初始化失败${detail(error)}`)
-      ws.close()
-      socket.current = null
-      return
-    }
-    const { terminal, fit } = initialized
-
-    const resize = () => {
-      if (disposed || !host.clientWidth || !host.clientHeight) return
-      fit.fit()
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "resize", cols: terminal.cols, rows: terminal.rows }))
-      }
-    }
-    const observer = new ResizeObserver(() => requestAnimationFrame(resize))
-    observer.observe(host)
-
-    const data = terminal.onData((input) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "input", data: input }))
-    })
-    const resized = terminal.onResize(({ cols, rows }) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "resize", cols, rows }))
-    })
-
-    ws.onopen = () => {
-      window.clearTimeout(connectTimer)
-      fit.fit()
-      ws.send(JSON.stringify({ type: "connect", node_id: node.id, cols: terminal.cols, rows: terminal.rows }))
-      if (!disposed) {
-        setMessage("正在启动终端…")
-      }
-    }
-    ws.onmessage = (event) => {
-      try {
-        const frame = JSON.parse(event.data) as { type?: string; message?: string; method?: string; params?: { data?: string; reason?: string; message?: string } }
-        if (frame.type === "error") {
-          updateState("error", frame.message || "终端连接失败")
-        } else if (frame.method === "terminal.ready") {
-          updateState("online", "已连接")
-          terminal.focus()
-        } else if (frame.method === "terminal.output" && frame.params?.data) {
-          terminal.write(frame.params.data)
-        } else if (frame.method === "terminal.error") {
-          updateState("error", frame.params?.message || "终端发生错误")
-          terminal.write(`\r\n\x1b[31m${frame.params?.message || "终端发生错误"}\x1b[0m\r\n`)
-        } else if (frame.method === "terminal.exit") {
-          updateState("closed", "终端进程已结束")
-          terminal.write(`\r\n\x1b[90m终端进程已结束${frame.params?.reason ? `：${frame.params.reason}` : ""}\x1b[0m\r\n`)
-        }
-      } catch {
-        updateState("error", "收到无法识别的终端数据")
-      }
-    }
-    ws.onerror = () => {
-      window.clearTimeout(connectTimer)
-      if (!disposed && currentState !== "error") {
-        updateState("error", "终端连接失败，请确认节点在线")
-      }
-    }
-    ws.onclose = () => {
-      window.clearTimeout(connectTimer)
-      if (!disposed) {
-        if (currentState !== "error" && currentState !== "closed") updateState("closed", "连接已关闭")
-      }
-    }
-
-    return () => {
-      disposed = true
-      window.clearTimeout(connectTimer)
-      observer.disconnect()
-      data.dispose()
-      resized.dispose()
-      ws.close()
-      socket.current = null
-      terminal.dispose()
-    }
-  }, [node.id, container])
-
-  const status = {
-    connecting: "连接中",
-    online: "在线",
-    closed: "已关闭",
-    error: "错误",
-  }[state]
-
-  return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent
-        onOpenAutoFocus={(e) => e.preventDefault()}
-        className="grid h-[calc(100dvh_-_1rem)] w-[calc(100vw_-_1rem)] max-h-[calc(100dvh_-_1rem)] max-w-none grid-rows-[auto_auto_minmax(0,1fr)_auto] gap-3 overflow-hidden p-3 sm:h-[calc(100dvh_-_2rem)] sm:max-h-[calc(100dvh_-_2rem)] sm:max-w-7xl sm:p-4 2xl:max-w-[96rem]"
-      >
-        <DialogHeader className="px-1">
-          <DialogTitle className="flex items-center gap-2"><TerminalIcon className="size-4" />{node.name} · Web Terminal</DialogTitle>
-          <DialogDescription>终端命令在目标节点上以 root 权限执行。</DialogDescription>
-        </DialogHeader>
-        <div className="flex items-center justify-between gap-3 px-1 text-xs text-muted-foreground">
-          <span className="flex items-center gap-2"><span className={`size-2 rounded-full ${state === "online" ? "bg-ok" : state === "error" ? "bg-destructive" : "bg-muted-foreground"}`} />{status}</span>
-          <span className="truncate" title={message}>{message}</span>
-        </div>
-        <div className="terminal-surface min-h-0 overflow-hidden rounded-md border bg-[#0d1117] p-2 shadow-xs">
-          <div ref={setContainer} className="h-full min-h-0 w-full" />
-        </div>
-        <DialogFooter className="pt-1">
-          <Button variant="ghost" onClick={onClose}>关闭</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
+const TerminalDialog = lazy(() => import("./TerminalDialog").then(m => ({ default: m.TerminalDialog })))
 
 function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh: () => void; site: string; canProvision: boolean }) {
   const [creating, setCreating] = useState(false)
@@ -857,6 +684,13 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   const visible = needle
     ? order.filter((n) => [n.name, n.ip, n.ipv4, n.ipv6].some((v) => v?.toLowerCase().includes(needle)))
     : order
+
+  async function toggleTerminal(n: Node) {
+    try {
+      await api(`/nodes/${n.id}/terminal`, { method: "PUT", body: JSON.stringify({ enabled: n.terminal_enabled === false }) })
+      refresh(); toast.success(n.terminal_enabled === false ? "已允许节点终端" : "已禁用节点终端，现有连接已关闭")
+    } catch (e) { toast.error((e as Error).message) }
+  }
 
   async function togglePublic(n: Node) {
     try {
@@ -945,7 +779,8 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 <DropdownMenu.Portal><DropdownMenu.Content align="end" sideOffset={6} className="z-50 min-w-40 rounded-lg border bg-popover p-1 text-popover-foreground shadow-md">
                   <DropdownMenu.Item className={action} onSelect={() => setBilling(n)}>续费设置</DropdownMenu.Item>
                   <DropdownMenu.Item className={action} onSelect={() => togglePublic(n)}>{n.public ? "隐藏节点" : "公开节点"}</DropdownMenu.Item>
-                  <DropdownMenu.Item className={action} disabled={!n.online || !supportsTerminal(n.agent_version)} onSelect={() => setTerminal(n)}>打开终端</DropdownMenu.Item>
+                  <DropdownMenu.Item className={action} onSelect={() => toggleTerminal(n)}>{n.terminal_enabled === false ? "允许节点终端" : "禁用节点终端"}</DropdownMenu.Item>
+                  <DropdownMenu.Item className={action} disabled={!n.online || n.terminal_capable === false || n.terminal_enabled === false || !supportsTerminal(n.agent_version)} onSelect={() => setTerminal(n)}>打开终端</DropdownMenu.Item>
                   <DropdownMenu.Item className={action} disabled={!canProvision} onSelect={() => setInstalling(n)}>安装 Agent</DropdownMenu.Item>
                   <DropdownMenu.Separator className="my-1 h-px bg-border" />
                   <DropdownMenu.Item className={action} disabled={!!needle || index===0} onSelect={() => moveBy(-1)}>上移</DropdownMenu.Item>
@@ -956,6 +791,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
               </DropdownMenu.Root>
             </div>
             <Addresses node={n} />
+            {n.network_interfaces?.length ? <p className="text-xs text-muted-foreground">统计网卡：{n.network_interfaces.join(", ")}</p> : null}
             <p className="text-xs text-muted-foreground">本期流量 {n.traffic_incomplete ? "≥ " : ""}{bytes(monthUsage(n))}{n.traffic_incomplete && "（历史不完整）"} · {n.price>0 ? money(n.price,n.currency) : "免费"}</p>
           </div>
         })}
@@ -1029,6 +865,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 {/* Addresses live only here, never on the public page. */}
                 <TableCell>
                   <Addresses node={n} />
+            {n.network_interfaces?.length ? <p className="text-xs text-muted-foreground">统计网卡：{n.network_interfaces.join(", ")}</p> : null}
                 </TableCell>
                 <TableCell>
                   <Badge variant={n.online ? "default" : "secondary"} className="font-normal">
@@ -1074,13 +911,14 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                   <Button
                     variant="ghost"
                     size="icon"
-                    disabled={!n.online || !supportsTerminal(n.agent_version)}
+                    disabled={!n.online || n.terminal_capable === false || n.terminal_enabled === false || !supportsTerminal(n.agent_version)}
                     onClick={() => setTerminal(n)}
-                    title={!n.online ? "节点离线" : supportsTerminal(n.agent_version) ? "打开 Web Terminal" : "请升级 Cagent 至 1.1.0 或更高版本"}
+                    title={n.terminal_enabled === false ? "管理员已禁用终端" : n.terminal_capable === false ? "Agent 已禁用终端" : !n.online ? "节点离线" : "打开 Web Terminal"}
                     aria-label={!n.online ? "节点离线" : supportsTerminal(n.agent_version) ? "打开 Web Terminal" : "请升级 Cagent 至 1.1.0 或更高版本"}
                   >
                     <TerminalIcon />
                   </Button>
+                  <Button size="icon" variant="ghost" onClick={() => toggleTerminal(n)} title={n.terminal_enabled === false ? "允许节点终端" : "禁用节点终端"} aria-label={n.terminal_enabled === false ? "允许节点终端" : "禁用节点终端"}><Shield className={n.terminal_enabled === false ? "text-destructive" : ""} /></Button>
                   <Button variant="ghost" size="icon" disabled={!canProvision} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />
                   </Button>
@@ -1141,7 +979,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
           onRotated={refresh}
         />
       )}
-      {terminal && <TerminalDialog node={terminal} onClose={() => setTerminal(null)} />}
+      {terminal && <Suspense fallback={<p role="status">正在加载终端…</p>}><TerminalDialog node={terminal} onClose={() => setTerminal(null)} /></Suspense>}
       {deleting && (
         <ConfirmDialog
           title={`删除节点「${deleting.name}」？`}
@@ -1897,7 +1735,7 @@ function NotificationHistory() {
     {(error || !items) && <LoadState error={error} retry={load} />}
     {items?.length===0 && <p className="text-sm text-muted-foreground">还没有投递记录。配置渠道并开启节点通知后，事件会保存在这里。</p>}
     <div className="max-h-96 divide-y overflow-y-auto">{items?.map(item => <div key={`${item.id}:${item.channel}`} className="flex items-start gap-3 py-3">
-      <div className="min-w-0 flex-1"><p className="break-words text-sm">{item.title}</p><p className="mt-1 text-xs text-muted-foreground">{new Date(item.created_at*1000).toLocaleString("zh-CN")} · {item.channel} · {{pending:"等待重试",delivered:"已送达",failed:"投递失败"}[item.status] || item.status} · 尝试 {item.attempts} 次</p>{item.last_error && <p className="mt-1 break-words text-xs text-destructive">{item.last_error}</p>}</div>
+      <div className="min-w-0 flex-1"><p className="break-words text-sm">{item.title}</p><p className="mt-1 text-xs text-muted-foreground">{new Date(item.created_at*1000).toLocaleString("zh-CN")} · {item.channel} · {{pending:"等待重试",delivered:"接收端已接受",failed:"投递失败"}[item.status] || item.status} · 尝试 {item.attempts} 次</p>{item.last_error && <p className="mt-1 break-words text-xs text-destructive">{item.last_error}</p>}</div>
       {item.status==="failed" && <Button size="sm" variant="outline" disabled={!!busy} onClick={async () => { setBusy(item.id); try { await api(`/notify/${item.id}/retry`,{method:"POST"}); load() } catch(e) { toast.error((e as Error).message) } finally { setBusy("") } }}>重试</Button>}
     </div>)}</div>
   </Card>
@@ -1983,6 +1821,17 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
       </ChannelCard>
 
       <ChannelCard title="Webhook" configured={!!s.notify_webhook_url_set}>
+        <Field label="接收渠道" hint="自动识别官方域名；自建中转请明确选择渠道。通用 HTTP 仅确认接收端返回成功。">
+          <select className="w-full rounded-md border bg-background px-3 py-2 text-sm" value={text("notify_webhook_kind") || "auto"} onChange={e => set("notify_webhook_kind", e.target.value)}>
+            <option value="auto">自动识别</option><option value="http">通用 HTTP</option><option value="wecom">企业微信</option><option value="dingtalk">钉钉</option><option value="feishu">飞书 / Lark</option>
+          </select>
+        </Field>
+        <Field label="自定义成功字段" hint="可选，JSON Pointer，例如 /code；设置后必须匹配预期值。">
+          <Input value={text("notify_webhook_success_path")} onChange={e => set("notify_webhook_success_path", e.target.value)} placeholder="/code" />
+        </Field>
+        <Field label="预期 JSON 值" hint='例如 0、true 或 "ok"'>
+          <Input value={text("notify_webhook_success_value") || "0"} onChange={e => set("notify_webhook_success_value", e.target.value)} />
+        </Field>
         <Field label="URL" hint={secretHint("notify_webhook_url")}>
           <Input
             type="password"
@@ -2008,7 +1857,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
         <div className="flex gap-2">
           <Button
             size="sm"
-            onClick={() => save({ notify_webhook_body: text("notify_webhook_body"), ...typed("notify_webhook_url", "notify_webhook_headers") })}
+            onClick={() => save({ notify_webhook_kind: text("notify_webhook_kind") || "auto", notify_webhook_success_path: text("notify_webhook_success_path"), notify_webhook_success_value: text("notify_webhook_success_value") || "0", notify_webhook_body: text("notify_webhook_body"), ...typed("notify_webhook_url", "notify_webhook_headers") })}
           >
             保存 Webhook
           </Button>
@@ -2072,6 +1921,19 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
 // The two ways into this panel, on their own page: the GitHub identity it trusts
 // and the password that works when GitHub does not.
 type Session = { id: string; current: boolean; created_at: number }
+
+function TerminalHistory() {
+  const [items, setItems] = useState<{ ts: number; actor: string; node_id: number; action: string; correlation: string }[] | null>(null)
+  const [error, setError] = useState("")
+  const load = () => { setError(""); api<{ items: NonNullable<typeof items> }>("/terminal/history").then(d => setItems(d.items ?? [])).catch((e: Error) => setError(e.message)) }
+  useEffect(() => { queueMicrotask(load) }, [])
+  return <Card className="gap-3 p-5"><div className="flex items-center justify-between"><h3 className="text-sm font-medium">终端访问审计</h3><Button size="sm" variant="ghost" onClick={load}>刷新</Button></div>
+    <p className="text-xs text-muted-foreground">最近 100 条访问记录；不记录命令和终端内容。</p>
+    {(error || !items) && <LoadState error={error} retry={load} />}
+    {items?.length === 0 && <p className="text-sm text-muted-foreground">暂无终端访问记录</p>}
+    <div className="max-h-80 space-y-2 overflow-y-auto">{items?.map((item,i) => <p key={i} className="break-words text-xs">{new Date(item.ts*1000).toLocaleString()} · {item.actor} · 节点 {item.node_id} · {({open_requested:"请求开启",ready:"已连接",agent_error:"节点拒绝",closed:"已关闭",enabled:"允许终端",disabled:"禁用终端"} as Record<string,string>)[item.action] ?? item.action}<span className="ml-2 text-muted-foreground">{item.correlation}</span></p>)}</div>
+  </Card>
+}
 
 function Sessions() {
   const [rows, setRows] = useState<Session[] | null>(null)
@@ -2138,6 +2000,7 @@ function Security({ site }: { site: string }) {
   return (
     <div className="space-y-4">
       <Sessions />
+      <TerminalHistory />
 
       <Card className="gap-4 p-5">
         <div>

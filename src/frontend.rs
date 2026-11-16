@@ -39,6 +39,8 @@ pub struct Theme {
     pub short: String,
     pub description: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_hub_version: Option<String>,
     pub author: String,
     pub url: String,
     #[serde(default)]
@@ -207,6 +209,16 @@ fn external_theme(themes: &Path, short: &str) -> Option<PathBuf> {
     Some(dist)
 }
 
+fn compatible(theme: &Theme) -> bool {
+    let version = |s: &str| -> Option<Vec<u64>> {
+        let parts = s.split('.').map(str::parse::<u64>).collect::<std::result::Result<Vec<_>, _>>().ok()?;
+        (parts.len() == 3).then_some(parts)
+    };
+    theme.min_hub_version.as_deref().is_none_or(|minimum| {
+        version(minimum).zip(version(env!("CARGO_PKG_VERSION"))).is_some_and(|(a, b)| a <= b)
+    })
+}
+
 fn manifest(root: &Path, short: &str) -> Option<Theme> {
     let data = read_inside(root, "theme.json")?;
     if data.len() > 64 * 1024 {
@@ -215,7 +227,7 @@ fn manifest(root: &Path, short: &str) -> Option<Theme> {
     let theme: Theme = serde_json::from_slice(&data)
         .inspect_err(|e| tracing::warn!("{short}/theme.json 不是有效的 manifest，主题不会出现在列表里：{e}"))
         .ok()?;
-    (theme.short == short).then_some(theme)
+    (theme.short == short && compatible(&theme)).then_some(theme)
 }
 
 pub fn themes(app: &App) -> std::io::Result<Vec<Theme>> {
@@ -338,6 +350,12 @@ fn publish(themes: &Path, staging: &Path, expect: Option<&str>) -> Result<Theme>
         bail!("theme.json 过大");
     }
     let theme: Theme = serde_json::from_slice(&manifest).context("theme.json 格式不对")?;
+    if !compatible(&theme) {
+        bail!(
+            "该主题要求 Hub {} 或更高版本，请先升级 Hub",
+            theme.min_hub_version.as_deref().unwrap_or("未知")
+        );
+    }
     if !valid_short(&theme.short) {
         bail!("theme.json 里的 short 不能作为目录名：{:?}", theme.short);
     }
@@ -635,5 +653,14 @@ mod tests {
         let app = App::for_test(crate::db::Db::open(":memory:").unwrap());
         assert!(selectable(&app, "") && selectable(&app, "default"));
         assert!(!selectable(&app, "aurora"), "a theme that is not installed is not selectable");
+    }
+    #[test]
+    fn a_theme_cannot_claim_compatibility_with_an_older_hub() {
+        let mut t: Theme=serde_json::from_value(serde_json::json!({"name":"x","short":"x","description":"","version":"1","author":"a","url":"","min_hub_version":"999.0.0"})).unwrap();
+        assert!(!compatible(&t));
+        t.min_hub_version = Some("bad".into());
+        assert!(!compatible(&t));
+        t.min_hub_version = Some(env!("CARGO_PKG_VERSION").into());
+        assert!(compatible(&t));
     }
 }

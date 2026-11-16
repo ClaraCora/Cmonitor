@@ -165,10 +165,10 @@ def main():
                 sockets.append(result)
             return result
 
-        def agent_online(cookie):
+        def agent_online(cookie, terminal_capable=True):
             for _ in range(100):
                 status, nodes, _ = api("/api/nodes", cookie=cookie)
-                if status == 200 and any(n["online"] for n in nodes["nodes"]):
+                if status == 200 and any(n["online"] and n.get("terminal_capable") is terminal_capable for n in nodes["nodes"]):
                     return
                 time.sleep(0.1)
             raise AssertionError("Agent did not connect")
@@ -248,6 +248,24 @@ def main():
                 db.execute("INSERT INTO traffic(node_id) VALUES(?)", (node,))
             agent, _ = start(agent_binary, [], dict(os.environ, MONITOR_SERVER=origin, MONITOR_TOKEN=token))
             agent_online(cookie)
+            assert api("/api/terminal/access", cookie=cookie)[1]["allowed"] is True
+            with sqlite3.connect(database) as db:
+                db.execute("UPDATE session SET expires_at=expires_at-601")
+            assert api("/api/terminal/access", cookie=cookie)[1]["allowed"] is False
+            ws(cookie, expected=403)
+            cookie = login(password)
+            channel, pid = terminal(cookie, node)
+            assert api(f"/api/nodes/{node}/terminal", {"enabled": False}, cookie, method="PUT")[0] == 200
+            channel.closed()
+            shell_gone(pid)
+            blocked = ws(cookie)
+            blocked.send({"type": "connect", "node_id": node, "cols": 80, "rows": 24})
+            assert blocked.receive().get("type") == "error"
+            assert api(f"/api/nodes/{node}/terminal", {"enabled": True}, cookie, method="PUT")[0] == 200
+            audit = api("/api/terminal/history", cookie=cookie)[1]["items"]
+            assert {"open_requested", "ready", "closed", "disabled", "enabled"}.issubset({item["action"] for item in audit})
+            assert api("/api/terminal/history")[0] == 401
+            print("PASS: recent authentication, node terminal policy, shell cleanup and private audit", flush=True)
             channel, pid = terminal(cookie, node)
             assert api(f"/api/nodes/{node}/token", {}, cookie)[0] == 200
             channel.closed()
@@ -266,6 +284,16 @@ def main():
             shell_gone(pid)
             ws(cookie, expected=401)
             cookie = login(password)
+            stop(agent)
+            agent, _ = start(agent_binary, ["--disable-terminal"], dict(os.environ, MONITOR_SERVER=origin, MONITOR_TOKEN=token))
+            agent_online(cookie, terminal_capable=False)
+            blocked = ws(cookie)
+            blocked.send({"type": "connect", "node_id": node, "cols": 80, "rows": 24})
+            assert blocked.receive().get("type") == "error"
+            stop(agent)
+            agent, _ = start(agent_binary, [], dict(os.environ, MONITOR_SERVER=origin, MONITOR_TOKEN=token))
+            agent_online(cookie)
+            print("PASS: Agent local terminal disable cannot be overridden by Hub policy", flush=True)
             channel, pid = terminal(cookie, node)
             assert api(f"/api/nodes/{node}", cookie=cookie, method="DELETE")[0] == 200
             channel.closed()

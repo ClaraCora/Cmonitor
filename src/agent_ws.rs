@@ -79,6 +79,9 @@ pub struct Agent {
     /// It is live state, repopulated by probes after a hub restart.
     pub pings: HashMap<i64, PingReading>,
     pub last_seen: i64,
+    pub probe_started_at: i64,
+    pub terminal_enabled: bool,
+    pub network_interfaces: Vec<String>,
     /// Wall-clock minute this session has already accounted for. A history row
     /// is written when a report arrives past it.
     pub last_minute: i64,
@@ -107,6 +110,9 @@ impl Agent {
             metrics: serde_json::Value::Null,
             pings: HashMap::new(),
             last_seen: 0,
+            probe_started_at: Utc::now().timestamp(),
+            terminal_enabled: true,
+            network_interfaces: Vec::new(),
             // The minute in progress rather than zero. Its row is already on
             // disk, written by the session this one replaces from the mean of a
             // whole minute; a reconnect's first report would otherwise overwrite
@@ -330,7 +336,24 @@ fn release(app: &App, node_id: i64, session: u64) -> bool {
 fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
     let rpc: Rpc = serde_json::from_str(text)?;
     match rpc.method.as_str() {
-        "hello" => return app.db.save_facts(node_id, &rpc.params, ip),
+        "hello" => {
+            if let Some(agent) = app.agents.write().unwrap_or_else(|e| e.into_inner()).get_mut(&node_id) {
+                agent.terminal_enabled =
+                    rpc.params.get("terminal_enabled").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                agent.network_interfaces = rpc
+                    .params
+                    .get("network_interfaces")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .take(128)
+                            .filter_map(|v| v.as_str().filter(|s| s.len() <= 64).map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
+            return app.db.save_facts(node_id, &rpc.params, ip);
+        }
         "report" => report(app, node_id, rpc.params)?,
         "ping.result" => {
             let task_id = rpc.params.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -339,7 +362,9 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
             // render a malformed frame as an outage. The accumulator follows the
             // same rule for a counter it cannot read.
             let latency = rpc.params.get("latency_ms").and_then(|v| v.as_i64());
-            if let (true, Some(latency)) = (task_id > 0, latency) {
+            if let (true, Some(latency)) =
+                (task_id > 0, latency.filter(|v| *v >= -3 && *v <= i32::MAX as i64))
+            {
                 let now = Utc::now().timestamp();
                 // Only current assignments are recorded. The same result decides
                 // whether this task may enter the public live snapshot, so a node
@@ -563,6 +588,7 @@ pub fn push_ping_tasks(app: &App) {
                 // an edited or newly created task cannot inherit the old task's
                 // latency under a different name.
                 agent.pings.clear();
+                agent.probe_started_at = Utc::now().timestamp();
                 (*id, agent.tx.clone())
             })
             .collect()

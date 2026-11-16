@@ -460,6 +460,9 @@ async fn main() -> Result<()> {
         .route("/api/nodes/{id}/metrics", get(api::metrics))
         .route("/api/ws", get(api::live_ws))
         .route("/api/terminal/ws", get(terminal::handler))
+        .route("/api/terminal/access", get(terminal::access))
+        .route("/api/terminal/history", get(terminal::history))
+        .route("/api/nodes/{id}/terminal", axum::routing::put(terminal::policy))
         // Sign-in.
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))

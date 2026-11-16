@@ -114,6 +114,18 @@ pub fn settings(app: &App, out: &mut serde_json::Map<String, Value>) {
     }
     let login = if app.db.get("notify_login").as_deref() == Some("off") { "off" } else { "on" };
     out.insert("notify_login".into(), json!(login));
+    out.insert(
+        "notify_webhook_kind".into(),
+        json!(setting(app, "notify_webhook_kind").unwrap_or_else(|| "auto".into())),
+    );
+    out.insert(
+        "notify_webhook_success_path".into(),
+        json!(setting(app, "notify_webhook_success_path").unwrap_or_default()),
+    );
+    out.insert(
+        "notify_webhook_success_value".into(),
+        json!(setting(app, "notify_webhook_success_value").unwrap_or_else(|| "0".into())),
+    );
     out.insert("notify_telegram_chat".into(), json!(app.db.get("notify_telegram_chat").unwrap_or_default()));
     out.insert("notify_telegram_text".into(), json!(template(app, "notify_telegram_text", DEFAULT_TEXT)));
     out.insert("notify_webhook_body".into(), json!(template(app, "notify_webhook_body", DEFAULT_BODY)));
@@ -134,6 +146,13 @@ pub fn setting_error(key: &str, value: &str) -> Option<String> {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let problem = match key {
         "notify_login" => (!matches!(value, "on" | "off")).then_some("notify_login must be on or off"),
+        "notify_webhook_kind" => (!matches!(value, "auto" | "http" | "wecom" | "dingtalk" | "feishu"))
+            .then_some("unknown webhook channel type"),
+        "notify_webhook_success_path" => (!value.is_empty() && !value.starts_with('/'))
+            .then_some("success path must be a JSON pointer, e.g. /code"),
+        "notify_webhook_success_value" => {
+            serde_json::from_str::<Value>(value).is_err().then_some("success value must be valid JSON")
+        }
         "notify_webhook_headers" => return parse_headers(value).err(),
         // Empty clears a channel's field, or restores a template's default.
         "notify_telegram_token"
@@ -241,8 +260,19 @@ fn render(template: &str, note: &Note, site: &str, json: bool) -> String {
 }
 
 enum Channel {
-    Telegram { token: String, chat: String, text: String },
-    Webhook { url: String, headers: String, body: String },
+    Telegram {
+        token: String,
+        chat: String,
+        text: String,
+    },
+    Webhook {
+        url: String,
+        headers: String,
+        body: String,
+        kind: String,
+        success_path: String,
+        success_value: Value,
+    },
 }
 
 impl Channel {
@@ -267,7 +297,18 @@ fn channels(app: &App) -> Vec<Channel> {
     }
     if let Some(url) = setting(app, "notify_webhook_url") {
         let headers = app.db.get("notify_webhook_headers").unwrap_or_default();
-        out.push(Channel::Webhook { url, headers, body: template(app, "notify_webhook_body", DEFAULT_BODY) });
+        let selected = setting(app, "notify_webhook_kind").unwrap_or_else(|| "auto".into());
+        let kind = if selected == "auto" { webhook_kind(&url).into() } else { selected };
+        out.push(Channel::Webhook {
+            url,
+            headers,
+            body: template(app, "notify_webhook_body", DEFAULT_BODY),
+            kind,
+            success_path: setting(app, "notify_webhook_success_path").unwrap_or_default(),
+            success_value: setting(app, "notify_webhook_success_value")
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(json!(0)),
+        });
     }
     out
 }
@@ -275,6 +316,7 @@ fn channels(app: &App) -> Vec<Channel> {
 /// Why a delivery failed, and whether another attempt could change that. A
 /// refused credential or a malformed request fails identically every time, and
 /// retrying it would hold the queue for 20 s per alert.
+#[derive(Debug)]
 struct Failure {
     retry: bool,
     reason: String,
@@ -306,7 +348,7 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
         Channel::Telegram { token, chat, text } => client()
             .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
             .json(&json!({"chat_id": chat, "text": render(text, note, &site, false)})),
-        Channel::Webhook { url, headers, body } => {
+        Channel::Webhook { url, headers, body, .. } => {
             // `insert` into one map: `RequestBuilder::header` and `HeaderMap::extend`
             // both append, which would send a configured Content-Type alongside the
             // default instead of in its place.
@@ -326,23 +368,91 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
         reason: format!("{:#}", anyhow::Error::from(e.without_url())),
     })?;
     let status = response.status();
-    if status.is_success() {
+    if !status.is_success() {
+        return Err(Failure {
+            retry: status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS,
+            reason: if status.is_redirection() {
+                format!("{status}: URL redirects; configure the final URL")
+            } else {
+                format!("receiver returned HTTP {status}")
+            },
+        });
+    }
+    let (kind, path, expected) = match channel {
+        Channel::Telegram { .. } => ("telegram", "", &Value::Null),
+        Channel::Webhook { kind, success_path, success_value, .. } => {
+            (kind.as_str(), success_path.as_str(), success_value)
+        }
+    };
+    if kind == "http" && path.is_empty() {
         return Ok(());
     }
-    if status.is_redirection() {
-        let reason = format!("{status}: the URL redirects; enter the address it redirects to");
-        return Err(Failure { retry: false, reason });
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| Failure { retry: true, reason: "cannot read channel acknowledgement".into() })?
+    {
+        if bytes.len() + chunk.len() > 65_536 {
+            return Err(Failure { retry: false, reason: "channel acknowledgement exceeds 64 KiB".into() });
+        }
+        bytes.extend_from_slice(&chunk);
     }
-    // The first chunk carries the reason (Telegram's `description`, Discord's
-    // `message`) without reading an error page of arbitrary length.
-    let head = response.chunk().await.ok().flatten().unwrap_or_default();
-    Err(Failure {
-        retry: status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS,
-        reason: format!(
-            "{status}: {}",
-            String::from_utf8_lossy(&head).chars().take(300).collect::<String>().trim()
-        ),
-    })
+    validate_ack(kind, path, expected, &bytes)
+}
+
+/// Known webhook hosts keep existing configurations safe without re-entry.
+fn webhook_kind(url: &str) -> &'static str {
+    match reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_owned)).as_deref() {
+        Some("qyapi.weixin.qq.com") => "wecom",
+        Some("oapi.dingtalk.com") => "dingtalk",
+        Some("open.feishu.cn" | "open.larksuite.com") => "feishu",
+        _ => "http",
+    }
+}
+
+/// Persist only a numeric code or fixed explanation, never a response body that
+/// could echo the URL, custom credentials, message or request headers.
+fn validate_ack(kind: &str, path: &str, expected: &Value, bytes: &[u8]) -> Result<(), Failure> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| Failure {
+        retry: false,
+        reason: "channel requires a valid JSON acknowledgement".into(),
+    })?;
+    if !path.is_empty() {
+        return if value.pointer(path) == Some(expected) {
+            Ok(())
+        } else {
+            Err(Failure { retry: false, reason: "configured JSON acknowledgement did not match".into() })
+        };
+    }
+    if kind == "telegram" {
+        return if value.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err(Failure {
+                retry: value.get("error_code").and_then(Value::as_i64).is_some_and(|v| v == 429 || v >= 500),
+                reason: "Telegram rejected the request or omitted ok=true".into(),
+            })
+        };
+    }
+    let code = match kind {
+        "wecom" | "dingtalk" => value.get("errcode"),
+        "feishu" => value.get("code").or_else(|| value.get("StatusCode")),
+        _ => return Ok(()),
+    }
+    .and_then(Value::as_i64)
+    .ok_or_else(|| Failure {
+        retry: false,
+        reason: "channel acknowledgement is missing its numeric success code".into(),
+    })?;
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(Failure {
+            retry: matches!(code, -1 | 45009 | 45011 | 130101 | 9499 | 99991400 | 99991663),
+            reason: format!("channel rejected request: business code {code}"),
+        })
+    }
 }
 
 /// Queues an alert without waiting, so that sign-in and housekeeping never
@@ -387,9 +497,8 @@ async fn deliver_due(app: &App) -> Result<()> {
         match post(app, channel, &note).await {
             Ok(()) => app.db.finish_notification(&id, &name, "delivered", "", 0)?,
             Err(f) => {
-                // Remote bodies can echo credentials; history stores only the HTTP status.
-                let reason =
-                    f.reason.split(':').next().unwrap_or("投递失败").chars().take(120).collect::<String>();
+                // post() constructs redacted summaries and never returns remote bodies.
+                let reason = f.reason.chars().take(300).collect::<String>();
                 let status = if !f.retry || attempts + 1 >= ATTEMPTS { "failed" } else { "pending" };
                 let next = Utc::now().timestamp() + (10_i64 * 2_i64.pow(attempts.min(8) as u32)).min(3600);
                 app.db.finish_notification(&id, &name, status, &reason, next)?;
@@ -734,10 +843,38 @@ fn sweep_inner(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
                 continue;
             }
             for task in tasks.iter().filter(|task| task.nodes.contains(&node.id)) {
-                let Some(reading) = agent.pings.get(&task.id) else { continue };
-                if now - reading.updated_at > task.interval * 2 + 30 {
+                let reading = agent.pings.get(&task.id);
+                let stale =
+                    now - reading.map_or(agent.probe_started_at, |r| r.updated_at) > task.interval * 2 + 30;
+                let missing_key = format!("probe-missing:{}:{}", node.id, task.id);
+                let missing_active = app.db.alert_value(&missing_key).unwrap_or(0) != 0;
+                if stale && !missing_active {
+                    notes.push(Note {
+                        event: "probe_missing".into(),
+                        node: node.name.clone(),
+                        title: format!("探测采样中断 · {}", node.name),
+                        message: format!(
+                            "{} 超过 {} 秒没有新观测，不能据此判断线路健康",
+                            task.name,
+                            task.interval * 2 + 30
+                        ),
+                        ..Default::default()
+                    });
+                    state_changes.push((missing_key.clone(), 1));
+                } else if !stale && missing_active && reading.is_some() {
+                    notes.push(Note {
+                        event: "probe_sampling_recovery".into(),
+                        node: node.name.clone(),
+                        title: format!("探测采样恢复 · {}", node.name),
+                        message: format!("{} 已收到新观测", task.name),
+                        ..Default::default()
+                    });
+                    state_changes.push((missing_key, 0));
+                }
+                if stale {
                     continue;
                 }
+                let Some(reading) = reading else { continue };
                 let key = format!("probe:{}:{}", node.id, task.id);
                 let last_key = format!("probe-last:{}:{}", node.id, task.id);
                 let active = app.db.alert_value(&key).unwrap_or(0) != 0;
@@ -750,7 +887,15 @@ fn sweep_inner(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
                         event: "probe".into(),
                         node: node.name.clone(),
                         title: format!("TCP 探测异常 · {}", node.name),
-                        message: format!("{} 连续 {failures} 次失败", task.name),
+                        message: format!(
+                            "{} 连续 {failures} 次失败；最近原因：{}",
+                            task.name,
+                            match reading.latency {
+                                -2 => "DNS 解析超时",
+                                -3 => "DNS 解析失败",
+                                _ => "TCP 连接失败或超时",
+                            }
+                        ),
                         ..Default::default()
                     });
                     state_changes.push((key, 1));
@@ -1224,5 +1369,69 @@ mod tests {
         assert_eq!(note.title, "⏳ 2 台节点即将到期");
         assert_eq!(note.message, "today · 2026-09-15 今天到期\nsoon · 2026-09-20 还剩 5 天");
         assert!(expiry_digest(&app, at(10)).unwrap().is_none(), "once per day");
+    }
+    #[test]
+    fn business_acknowledgements_are_checked_without_echoing_credentials() {
+        for kind in ["wecom", "dingtalk"] {
+            assert!(validate_ack(kind, "", &Value::Null, br#"{"errcode":0}"#).is_ok());
+            let failure =
+                validate_ack(kind, "", &Value::Null, br#"{"errcode":40001,"errmsg":"secret-token"}"#)
+                    .unwrap_err();
+            assert!(!failure.retry);
+            assert!(!failure.reason.contains("secret-token"));
+            assert!(validate_ack(kind, "", &Value::Null, b"{}").is_err());
+            assert!(validate_ack(kind, "", &Value::Null, br#"{"errcode":45009}"#).unwrap_err().retry);
+        }
+        assert!(validate_ack("feishu", "", &Value::Null, br#"{"code":0}"#).is_ok());
+        assert!(validate_ack("feishu", "", &Value::Null, br#"{"StatusCode":0}"#).is_ok());
+        assert!(validate_ack("telegram", "", &Value::Null, br#"{"ok":false}"#).is_err());
+        assert!(validate_ack("http", "/result/code", &json!("ok"), br#"{"result":{"code":"ok"}}"#).is_ok());
+    }
+    #[tokio::test]
+    async fn http_200_business_rejection_is_a_failed_delivery() {
+        let app = app();
+        let router =
+            axum::Router::new().route("/", axum::routing::post(|| async { Json(json!({"errcode":40001})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        app.db.set("notify_webhook_url", &format!("http://{addr}/")).unwrap();
+        app.db.set("notify_webhook_kind", "wecom").unwrap();
+        send(&app, Note { event: "test".into(), ..Default::default() });
+        deliver_due(&app).await.unwrap();
+        let history = app.db.notification_history().unwrap();
+        assert_eq!(history[0]["status"], "failed");
+        assert!(history[0]["last_error"].as_str().unwrap().contains("40001"));
+        server.abort();
+    }
+    #[test]
+    fn missing_samples_alert_once_and_recover_only_with_new_observations() {
+        let app = app();
+        with_channel(&app);
+        let now = Utc::now().timestamp();
+        let id = node(&app, "missing", true, now);
+        connect(&app, id);
+        let probe = app
+            .db
+            .save_ping_task(&crate::db::PingTask {
+                id: 0,
+                name: "dns".into(),
+                target: "a:443".into(),
+                interval: 60,
+                nodes: vec![id],
+            })
+            .unwrap();
+        let mut watch = Watch::default();
+        assert!(sweep(&app, &mut watch, now).unwrap().is_empty());
+        assert_eq!(sweep(&app, &mut watch, now + 151).unwrap()[0].event, "probe_missing");
+        assert!(sweep(&app, &mut watch, now + 180).unwrap().is_empty());
+        app.agents
+            .write()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .pings
+            .insert(probe, crate::agent_ws::PingReading::new(5, now + 181));
+        assert_eq!(sweep(&app, &mut watch, now + 181).unwrap()[0].event, "probe_sampling_recovery");
     }
 }

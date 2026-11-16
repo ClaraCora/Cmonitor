@@ -101,7 +101,11 @@ def backup(source, directory, keep=7, offsite=None, hub=None):
                 subprocess.run([str(hub), "--db", str(candidate), "--check-db"], check=True, timeout=120, capture_output=True)
         temporary.replace(target)
         with target.open("rb") as stream:
-            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            # Python 3.9/3.10 on supported deployment hosts lack file_digest.
+            hasher = hashlib.sha256()
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                hasher.update(chunk)
+            digest = hasher.hexdigest()
         manifest = target.with_suffix(".json")
         manifest.write_text(json.dumps({"file": target.name, "sha256": digest, "nodes": nodes, "verified_at": int(time.time())}) + "\n", encoding="utf-8")
         os.chmod(manifest, 0o600)

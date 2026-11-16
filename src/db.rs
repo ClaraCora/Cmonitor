@@ -167,17 +167,27 @@ CREATE TABLE IF NOT EXISTS notification_delivery (
  PRIMARY KEY(event_id,channel)
 );
 CREATE INDEX IF NOT EXISTS notification_due ON notification_delivery(status,next_attempt_at);
+CREATE TABLE IF NOT EXISTS terminal_audit (
+ id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, actor TEXT NOT NULL,
+ node_id INTEGER NOT NULL, action TEXT NOT NULL, correlation TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS alert_state (
  key TEXT PRIMARY KEY, value INTEGER NOT NULL
 );
 "#;
-const EXTRA_TABLES: [&str; 5] =
-    ["traffic_daily", "renewal_history", "notification_event", "notification_delivery", "alert_state"];
+const EXTRA_TABLES: [&str; 6] = [
+    "traffic_daily",
+    "renewal_history",
+    "notification_event",
+    "notification_delivery",
+    "alert_state",
+    "terminal_audit",
+];
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -927,7 +937,7 @@ impl Db {
         for prefix in ["disk", "disk-active", "disk-last"] {
             conn.execute("DELETE FROM alert_state WHERE key=?1", [format!("{prefix}:{id}")])?;
         }
-        for prefix in ["traffic", "probe", "probe-last"] {
+        for prefix in ["traffic", "probe", "probe-last", "probe-missing"] {
             conn.execute("DELETE FROM alert_state WHERE key LIKE ?1", [format!("{prefix}:{id}:%")])?;
         }
         Ok(conn.execute("DELETE FROM node WHERE id = ?1", [id])? > 0)
@@ -1408,6 +1418,9 @@ impl Db {
         let conn = self.conn();
         conn.execute("DELETE FROM ping_record WHERE task_id = ?1", [id])?;
         conn.execute("DELETE FROM ping_task WHERE id=?1", [id])?;
+        for prefix in ["probe", "probe-last", "probe-missing"] {
+            conn.execute("DELETE FROM alert_state WHERE key LIKE ?1", [format!("{prefix}:%:{id}")])?;
+        }
         Ok(())
     }
 
@@ -1527,6 +1540,9 @@ impl Db {
                 close_bucket(&mut out, &mut open, bucket * step);
                 bucket = b;
             }
+            if latency < -1 {
+                continue;
+            }
             let seen = totals.entry(task).or_insert((0, 0));
             seen.1 += 1;
             let probe = match open.iter().position(|(id, ..)| *id == task) {
@@ -1556,6 +1572,61 @@ impl Db {
             })
             .collect();
         Ok((out, serde_json::Value::Object(loss)))
+    }
+
+    /// Statistics of original samples, independent of chart bucket resolution.
+    pub fn ping_window_stats(&self, node_id: i64, since: i64) -> Result<serde_json::Value> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(PING_ROWS)?;
+        let mut rows = stmt.query(params![node_id, since, 1])?;
+        #[derive(Default)]
+        struct Samples {
+            ok: Vec<i64>,
+            lost: usize,
+            errors: usize,
+            previous: Option<i64>,
+            delta: f64,
+            pairs: usize,
+        }
+        let mut probes: HashMap<i64, Samples> = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let (task, value) = (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?);
+            let s = probes.entry(task).or_default();
+            if value < 0 {
+                if value == -1 {
+                    s.lost += 1;
+                } else {
+                    s.errors += 1;
+                }
+                s.previous = None;
+            } else {
+                if let Some(previous) = s.previous {
+                    s.delta += (value - previous).abs() as f64;
+                    s.pairs += 1;
+                }
+                s.previous = Some(value);
+                s.ok.push(value);
+            }
+        }
+        let out: serde_json::Map<String, serde_json::Value> = probes
+            .into_iter()
+            .map(|(id, mut s)| {
+                let n = s.ok.len();
+                let avg = (n > 0).then(|| s.ok.iter().map(|v| *v as f64).sum::<f64>() / n as f64);
+                s.ok.sort_unstable();
+                let percentile =
+                    |p: f64| (n > 0).then(|| s.ok[((n as f64 * p).ceil() as usize).saturating_sub(1)]);
+                let total = n + s.lost;
+                (
+                    id.to_string(),
+                    serde_json::json!({ "avg_ms": avg, "p50_ms": percentile(0.5), "p95_ms": percentile(0.95),
+                "success_count": n, "loss_count": s.lost, "error_count": s.errors,
+                "loss_pct": (total > 0).then(|| 100.0 * s.lost as f64 / total as f64),
+                "jitter_ms": (s.pairs > 0).then(|| s.delta / s.pairs as f64) }),
+                )
+            })
+            .collect();
+        Ok(serde_json::Value::Object(out))
     }
 
     // ---- the database file itself ----
@@ -1768,6 +1839,44 @@ impl Db {
         let mut conn = self.conn();
         conn.restore(rusqlite::MAIN_DB, src, None::<fn(rusqlite::backup::Progress)>)?;
         Ok(())
+    }
+
+    pub fn session_actor(&self, hash: &str) -> Option<(String, i64)> {
+        self.conn()
+            .query_row(
+                "SELECT kind,identity,expires_at FROM session WHERE token_hash=?1 AND expires_at>?2",
+                params![hash, Utc::now().timestamp()],
+                |r| {
+                    let kind: String = r.get(0)?;
+                    let identity: String = r.get(1)?;
+                    let expiry: i64 = r.get(2)?;
+                    Ok((
+                        format!("{kind}:{}", if identity.is_empty() { "local" } else { &identity }),
+                        crate::auth::issued_at(expiry),
+                    ))
+                },
+            )
+            .ok()
+    }
+    pub fn terminal_audit(&self, actor: &str, node: i64, action: &str, correlation: &str) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO terminal_audit(ts,actor,node_id,action,correlation) VALUES(?1,?2,?3,?4,?5)",
+            params![Utc::now().timestamp(), actor, node, action, correlation],
+        )?;
+        conn.execute(
+            "DELETE FROM terminal_audit WHERE id <= (SELECT COALESCE(MAX(id),0)-2000 FROM terminal_audit)",
+            [],
+        )?;
+        Ok(())
+    }
+    pub fn terminal_history(&self) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT ts,actor,node_id,action,correlation FROM terminal_audit ORDER BY id DESC LIMIT 100",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(serde_json::json!({"ts":r.get::<_,i64>(0)?, "actor":r.get::<_,String>(1)?, "node_id":r.get::<_,i64>(2)?, "action":r.get::<_,String>(3)?, "correlation":r.get::<_,String>(4)?})))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     // ---- sessions ----

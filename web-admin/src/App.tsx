@@ -1,15 +1,16 @@
-import { useCallback, useEffect, useState } from "react"
+import { readPreference, savePreference } from "@/lib/storage"
+import { lazy, Suspense, useCallback, useEffect, useState } from "react"
 import { ExternalLink, LogOut, Moon, Sun } from "lucide-react"
 import { toast, Toaster } from "sonner"
 
-import { Admin } from "@/components/Admin"
+const Admin = lazy(() => import("@/components/Admin").then(m => ({ default: m.Admin })))
 import { Login } from "@/components/Login"
 import { RestoreStatus } from "@/components/RestoreStatus"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, provisioningSite, useNodes } from "@/lib/api"
 
-type Me = { authed: boolean; github: boolean; password_login: boolean; hub_version: string | null; site_name: string; public_page: boolean; site: string; can_provision: boolean }
+type Me = { authed: boolean; github: boolean; password_login: boolean; hub_version: string | null; embedded_theme_version?: string; active_theme_version?: string; site_name: string; public_page: boolean; site: string; can_provision: boolean }
 
 // `/clara` alone is not a page; it is normalised to the first section so that a
 // bookmark and the OAuth redirect both resolve to a real route.
@@ -44,12 +45,12 @@ function usePath() {
 
 function useTheme() {
   const [dark, setDark] = useState(() => {
-    const saved = localStorage.getItem("theme")
+    const saved = readPreference("theme")
     return saved ? saved === "dark" : matchMedia("(prefers-color-scheme: dark)").matches
   })
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark)
-    localStorage.setItem("theme", dark ? "dark" : "light")
+    savePreference("theme", dark ? "dark" : "light")
   }, [dark])
   return [dark, () => setDark((d) => !d)] as const
 }
@@ -134,7 +135,7 @@ function AdminApp() {
             <img src={`${import.meta.env.BASE_URL}favicon.svg`} alt="" className="size-5 rounded-md" />
             {me.site_name || "Monitor"}
           </a>
-          <span className="text-xs text-muted-foreground">后台{me.hub_version && <span className="ml-2 whitespace-nowrap font-mono">Hub v{me.hub_version}</span>}</span>
+          <span title={`内置主题 ${me.embedded_theme_version ?? "未知"} · 当前主题 ${me.active_theme_version ?? "未知"}`} className="text-xs text-muted-foreground">后台{me.hub_version && <span className="ml-2 whitespace-nowrap font-mono">Hub v{me.hub_version}</span>}</span>
           <div className="flex-1" />
           {/* The status page is a separate app, so this is a navigation. */}
           <Button variant="ghost" size="sm" asChild>
@@ -158,7 +159,7 @@ function AdminApp() {
         {!nodes ? (
           <Skeleton className="h-64" />
         ) : (
-          <Admin
+          <Suspense fallback={<Skeleton className="h-96" />}><Admin
             path={path}
             go={go}
             nodes={sorted}
@@ -168,7 +169,7 @@ function AdminApp() {
             // while the install command and OAuth callback need the real one.
             site={me.site || location.origin}
             canProvision={me.can_provision && !!provisioningSite(location.origin) && !!provisioningSite(me.site || location.origin)}
-          />
+          /></Suspense>
         )}
       </main>
 

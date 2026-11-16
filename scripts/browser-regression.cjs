@@ -208,6 +208,35 @@ async function main() {
     outage=false
     await page.clock.fastForward(6000)
     await page.getByText(/数据更新中断/).waitFor({state:'hidden'})
+    // Regression for independently stale probes and ratios beyond their quota.
+    if (mode === 'theme') {
+      for (const node of nodes) {
+        node.traffic_limit=1000; node.month_rx=1250; node.month_tx=250
+        Object.assign(node.pings[0],{status:'stale',latency:null,last_latency:1,updated_at:Math.floor(Date.now()/1000)-3600})
+      }
+      await page.goto(origin+'/')
+      await page.getByText('探测未更新',{exact:true}).first().waitFor()
+      assert.equal(await page.getByText('150%',{exact:true}).count(),nodes.length)
+      await page.getByLabel('搜索节点名称或标签').fill('无匹配的节点')
+      await page.getByRole('button',{name:'清除筛选',exact:true}).click()
+      await page.getByRole('heading',{name:nodes[0].name,exact:true}).waitFor()
+    }
+    // A denied Storage API must not blank either app (including restore status).
+    await context.addInitScript(()=>{
+      Storage.prototype.getItem=()=>{throw new DOMException('blocked','SecurityError')}
+      Storage.prototype.setItem=()=>{throw new DOMException('blocked','SecurityError')}
+    })
+    await page.reload()
+    await page.getByText(nodes[0].name,{exact:true}).filter({visible:true}).first().waitFor()
+    await page.getByRole('button',{name:'切换主题',exact:true}).click()
+    const pending=await context.newPage()
+    await pending.route('**/api/me',()=>{})
+    await pending.clock.install()
+    await pending.goto(origin+(mode==='admin'?'/clara/nodes':'/'))
+    await pending.getByText('加载中…',{exact:true}).waitFor()
+    await pending.clock.fastForward(16000)
+    await pending.getByRole('button',{name:'重试',exact:true}).waitFor()
+    await pending.close()
     assert.deepEqual(errors,[],'no browser runtime errors')
     fs.writeFileSync(path.join(output,`${mode}-results.json`),JSON.stringify({mode,passed:true,writes,historyRequests:historyCalls.length},null,2))
     console.log(`${mode}: labels, error recovery, data freshness, responsive controls and refresh checks passed`)

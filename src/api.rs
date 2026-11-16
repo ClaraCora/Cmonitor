@@ -7,7 +7,7 @@ use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::{Local, Utc};
+use chrono::{Local, Months, NaiveDate, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::debug;
@@ -106,6 +106,28 @@ fn node_view(
     let live = |key: &str, stored: i64| {
         current.and_then(|a| a.metrics.get(key).and_then(serde_json::Value::as_i64)).unwrap_or(stored)
     };
+    let pings = tasks.iter().filter(|task| task.nodes.contains(&node.id)).map(|task| {
+            let reading = current.and_then(|agent| agent.pings.get(&task.id));
+            json!({
+                "id": task.id,
+                "name": task.name,
+                "latency": reading.filter(|v| Utc::now().timestamp() - v.updated_at <= task.interval * 2 + 30).map(|value| value.latency),
+                "last_latency": reading.map(|v| v.latency),
+                "interval_sec": task.interval,
+                "status": match reading {
+                    Some(v) if current.is_none() || Utc::now().timestamp() - v.updated_at > task.interval * 2 + 30 => "stale",
+                    Some(v) if v.latency >= 0 => "ok",
+                    Some(_) => "failed",
+                    None if current.is_some_and(|a| Utc::now().timestamp() - a.probe_started_at > task.interval * 2 + 30) => "stale",
+                    None => "pending",
+                },
+                "reason": reading.and_then(|v| match v.latency { -2 => Some("dns_timeout"), -3 => Some("dns_error"), -1 => Some("tcp_timeout"), _ => None }),
+                "updated_at": reading.map(|value| value.updated_at),
+                "samples": reading
+                    .map(|value| value.samples.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            })
+        }).collect::<Vec<_>>();
     let mut view = json!({
         "id": node.id,
         "name": node.name,
@@ -135,6 +157,10 @@ fn node_view(
         "currency": node.currency,
         "billing_cycle": node.billing_cycle,
         "expires_at": node.expires_at,
+        "valuation_at": Utc::now().timestamp(),
+        "billing_timezone": Local::now().offset().to_string(),
+        "expires_at_epoch": billing_boundary(node.expires_at.as_deref(), 0),
+        "billing_period_start_epoch": billing_boundary(node.expires_at.as_deref(), billing_months(&node.billing_cycle)),
         "tags": node.tags,
         "traffic_limit": node.traffic_limit,
         "traffic_mode": node.traffic_mode,
@@ -151,18 +177,7 @@ fn node_view(
         // Every assigned task is present before its first answer, so the card
         // does not jump when a probe starts. Results are session-live: after a
         // hub restart they refill on the task's next interval.
-        "pings": tasks.iter().filter(|task| task.nodes.contains(&node.id)).map(|task| {
-            let reading = current.and_then(|agent| agent.pings.get(&task.id));
-            json!({
-                "id": task.id,
-                "name": task.name,
-                "latency": reading.map(|value| value.latency),
-                "updated_at": reading.map(|value| value.updated_at),
-                "samples": reading
-                    .map(|value| value.samples.iter().copied().collect::<Vec<_>>())
-                    .unwrap_or_default(),
-            })
-        }).collect::<Vec<_>>(),
+        "pings": pings,
     });
     // An allowlist rather than a denylist: the agent ships from its own
     // repository, so a field added there would otherwise reach anonymous visitors
@@ -186,8 +201,29 @@ fn node_view(
         view["notify"] = json!(node.notify);
         view["muted_until"] = json!(node.muted_until);
         view["website"] = json!(node.website);
+        view["terminal_capable"] = json!(current.is_some_and(|a| a.terminal_enabled));
+        view["network_interfaces"] = json!(current.map(|a| &a.network_interfaces));
     }
     view
+}
+
+fn billing_months(cycle: &str) -> u32 {
+    match cycle {
+        "monthly" => 1,
+        "quarterly" => 3,
+        "semiannual" => 6,
+        "yearly" => 12,
+        "biennial" => 24,
+        "triennial" => 36,
+        _ => 0,
+    }
+}
+
+/// Preserve existing Hub-local start-of-day expiry semantics, expose the exact
+/// boundary so every visitor's timezone and clock produce the same estimate.
+fn billing_boundary(date: Option<&str>, months: u32) -> Option<i64> {
+    let date = NaiveDate::parse_from_str(date?, "%Y-%m-%d").ok()?.checked_sub_months(Months::new(months))?;
+    Local.from_local_datetime(&date.and_hms_opt(0, 0, 0)?).earliest().map(|v| v.timestamp())
 }
 
 fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
@@ -201,7 +237,14 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
     Ok(nodes
         .iter()
         .filter(|n| full || n.public)
-        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), &tasks, full))
+        .map(|n| {
+            let mut view = node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), &tasks, full);
+            if full {
+                view["terminal_enabled"] =
+                    json!(app.db.get(&format!("terminal_node_{}", n.id)).as_deref() != Some("off"));
+            }
+            view
+        })
         .collect())
 }
 
@@ -310,7 +353,8 @@ pub async fn metrics(
         // continues to work.
         let (ping, loss) =
             if want_ping { app.db.ping_records(id, since, step)? } else { (vec![], json!({})) };
-        anyhow::Ok(json!({"metrics": metrics, "ping": ping, "probes": probes, "loss": loss}))
+        let stats = if want_ping { app.db.ping_window_stats(id, since)? } else { json!({}) };
+        anyhow::Ok(json!({"metrics": metrics, "ping": ping, "probes": probes, "loss": loss, "stats": stats}))
     })
     .await;
     match built.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
@@ -608,6 +652,8 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     Json(json!({
         "authed": authenticated,
         "hub_version": authenticated.then_some(env!("CARGO_PKG_VERSION")),
+        "embedded_theme_version": authenticated.then(|| serde_json::from_str::<Value>(include_str!("../target/theme/theme.json")).ok().and_then(|v| v.get("version").cloned())),
+        "active_theme_version": authenticated.then(|| crate::frontend::themes(&app).ok().and_then(|themes| themes.into_iter().find(|t| t.selected).map(|t| t.version))),
         // Where the panel lives, told only to callers already inside it: the
         // status page's public bundle may not carry the path, so it cannot be
         // a constant there.
@@ -2551,7 +2597,7 @@ mod tests {
             .get_mut(&open)
             .unwrap()
             .pings
-            .insert(probe, crate::agent_ws::PingReading::new(7, 1_700_000_000));
+            .insert(probe, crate::agent_ws::PingReading::new(7, Utc::now().timestamp()));
 
         let public = visible_nodes(&app, false).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
@@ -3277,6 +3323,46 @@ mod tests {
             let body = String::from_utf8(body.to_vec()).unwrap();
             assert!(body.contains(ip), "{body}");
             assert!(!body.contains("city"), "{body}");
+        }
+    }
+    #[test]
+    fn a_stale_probe_does_not_claim_a_current_latency() {
+        let app = app();
+        let id = node(&app, "freshness", true);
+        let probe = task(&app, vec![id]);
+        let _held = connect(&app, id, json!({}));
+        app.agents
+            .write()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .pings
+            .insert(probe, crate::agent_ws::PingReading::new(7, Utc::now().timestamp() - 3600));
+        let view = visible_nodes(&app, false).unwrap();
+        let p = &view[0]["pings"][0];
+        assert_eq!(p["status"], "stale");
+        assert!(p["latency"].is_null());
+        assert_eq!(p["last_latency"], 7);
+    }
+    #[test]
+    fn probe_window_stats_use_original_samples_and_dns_is_not_packet_loss() {
+        let app = app();
+        let id = node(&app, "stats", true);
+        let probe = task(&app, vec![id]);
+        let now = Utc::now().timestamp() - 200;
+        for (i, v) in [10, 10, 10, 100, -2, -3, -1].into_iter().enumerate() {
+            app.db.insert_ping(id, probe, now + i as i64 * 20, v).unwrap();
+        }
+        let stats = app.db.ping_window_stats(id, now).unwrap();
+        let s = &stats[probe.to_string()];
+        assert_eq!(s["avg_ms"], 32.5);
+        assert_eq!(s["p95_ms"], 100);
+        assert_eq!(s["success_count"], 4);
+        assert_eq!(s["error_count"], 2);
+        assert_eq!(s["loss_pct"], 20.0);
+        for step in [1, 60, 120] {
+            let (_, loss) = app.db.ping_records(id, now, step).unwrap();
+            assert_eq!(loss[probe.to_string()], 20.0);
         }
     }
 }

@@ -1,7 +1,7 @@
 {
-  "tag": "v1.1.4",
+  "tag": "v1.2.0",
   "sha256": {
-    "x86_64": "6c5b6e1f3d205e20fab4c2cc8f8d7c8e11d9e82acbbb06f357aaa9206d5c2ef5",
-    "aarch64": "fdfe628c139f4ab95f6721dc16d4b29c0b2a03ed5761199df6f27452962ce9bd"
+    "aarch64": "66b50d71852fe9f2194948befee46c395597e53e926ecdd4a64949bd5ee851c2",
+    "x86_64": "ef73014e15eb9f3744f4c292579a7e6385bebd81630878e9e7a13ee46ace0d2e"
   }
 }
