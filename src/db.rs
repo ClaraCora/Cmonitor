@@ -147,6 +147,16 @@ CREATE TABLE IF NOT EXISTS visitor_log (
 "#;
 
 const EXTRA_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS upgrade_batch (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, epoch TEXT NOT NULL, target TEXT NOT NULL, created INTEGER NOT NULL,
+ status TEXT NOT NULL DEFAULT 'running', reason TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_running_upgrade ON upgrade_batch(status) WHERE status='running';
+CREATE TABLE IF NOT EXISTS upgrade_item (
+ batch INTEGER NOT NULL REFERENCES upgrade_batch(id) ON DELETE CASCADE, pos INTEGER NOT NULL, node INTEGER NOT NULL,
+ status TEXT NOT NULL DEFAULT 'queued', previous_session TEXT NOT NULL DEFAULT '', deadline INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(batch,pos), UNIQUE(batch,node)
+);
 CREATE TABLE IF NOT EXISTS traffic_daily (
  node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
  day TEXT NOT NULL, rx INTEGER NOT NULL DEFAULT 0, tx INTEGER NOT NULL DEFAULT 0,
@@ -187,7 +197,7 @@ const EXTRA_TABLES: [&str; 6] = [
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.

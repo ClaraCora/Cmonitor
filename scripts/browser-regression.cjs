@@ -35,6 +35,7 @@ async function main() {
     await context.route('**/api/**', async route => {
       const req = route.request(), pathname = new URL(req.url()).pathname
       const fail = body => route.fulfill({status:503,body})
+      if (pathname === '/api/agent-upgrades' && req.method()==='GET') return route.fulfill({json:{target:'1.2.1',nodes:{1:'ready',2:'plaintext'},batch:null}})
       if (outage && pathname === '/api/nodes') return fail('模拟网络中断')
       if (settingsFail && pathname === '/api/settings') return fail('模拟设置加载失败')
       if (pingFail && pathname === '/api/ping-tasks') return fail('模拟探测加载失败')
@@ -89,6 +90,17 @@ async function main() {
     page.on('pageerror',e => errors.push(e.message))
     if (mode === 'admin') {
       await page.goto(origin+'/clara/nodes')
+      await page.getByRole('button',{name:'升级 Agent',exact:true}).click()
+      const picker=page.getByRole('dialog'); await picker.getByRole('checkbox').first().waitFor()
+      assert(await picker.getByRole('checkbox').nth(1).isDisabled(),'HTTP node cannot be selected')
+      await picker.getByRole('checkbox').first().check()
+      await picker.getByText('首台验证：测试节点 1').waitFor()
+      await page.screenshot({animations:'disabled',path:path.join(output,'rollout-desktop.png')})
+      await page.setViewportSize({width:390,height:844})
+      await page.screenshot({animations:'disabled',path:path.join(output,'rollout-mobile.png')})
+      await picker.getByRole('button',{name:'开始升级（1 台）'}).click()
+      assert.deepEqual(JSON.parse(writes.find(w=>w.pathname==='/api/agent-upgrades').body),{nodes:[1]})
+      await page.keyboard.press('Escape');await page.setViewportSize({width:1440,height:1000})
       await page.getByRole('button',{name:'编辑节点',exact:true}).first().click()
       const dialog=page.getByRole('dialog')
       await dialog.getByLabel('流量计算方式',{exact:true}).waitFor()

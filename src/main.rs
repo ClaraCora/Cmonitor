@@ -11,6 +11,7 @@ mod backup;
 mod db;
 mod frontend;
 mod notify;
+mod rollout;
 mod security;
 mod terminal;
 
@@ -442,6 +443,7 @@ async fn main() -> Result<()> {
     }
 
     tokio::spawn(housekeeping(app.clone()));
+    tokio::spawn(rollout::watch(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
 
@@ -450,6 +452,17 @@ async fn main() -> Result<()> {
         .route("/api/agent/ws", get(agent_ws::handler))
         .route("/api/agent/register", post(api::agent_register))
         .route("/install.sh", get(install_script))
+        .route(
+            "/agent-updater.py",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    include_str!("../deploy/agent-updater.py"),
+                )
+            }),
+        )
+        .route("/api/agent/upgrade", post(rollout::poll))
+        .route("/api/agent-upgrades", get(rollout::status).post(rollout::start))
         .route("/agent/{arch}", get(agent_binary))
         .route("/agent/{arch}/sha256", get(agent_checksum))
         // Read paths; the public page reaches these unauthenticated.

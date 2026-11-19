@@ -15,6 +15,7 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { addresses, api, changes, GIB, provisioningSite, terminalControl, trafficCorrection, upload, type Node, type PingTask, type VisitorRow } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
+import { AgentRollout } from "./AgentRollout"
 import { trackRestore, useRestoreOperation } from "@/lib/restore"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -756,6 +757,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
+        <AgentRollout nodes={nodes} />
         {/* An open window is visible from the list itself, so nobody has to
             remember they left one open. */}
         <Button variant="outline" disabled={!canProvision} onClick={() => setRegistering(true)}>

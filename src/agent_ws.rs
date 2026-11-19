@@ -70,6 +70,7 @@ static SESSION: AtomicU64 = AtomicU64::new(0);
 pub struct Agent {
     /// Distinguishes one session on a node from the next; see [`release`].
     pub session: u64,
+    pub rollout: crate::rollout::Live,
     pub cancel: watch::Sender<bool>,
     /// Outbound channel, used to push probe assignments.
     pub tx: mpsc::Sender<String>,
@@ -107,6 +108,7 @@ impl Agent {
     pub fn new(session: u64, tx: mpsc::Sender<String>) -> Self {
         Self {
             session,
+            rollout: Default::default(),
             cancel: watch::channel(false).0,
             tx,
             metrics: serde_json::Value::Null,
@@ -200,13 +202,14 @@ pub async fn handler(
     };
     let ip = client_ip(&headers, peer.ip()).to_string();
     let token = token.to_owned();
+    let tls = crate::forwarded_proto(&headers) == Some("https");
 
     upgrade
         .read_buffer_size(crate::api::SOCKET_BUFFER)
         .max_message_size(crate::api::MAX_FRAME)
         .max_frame_size(crate::api::MAX_FRAME)
         .on_upgrade(move |socket| async move {
-            if let Err(e) = serve(app, node_id, ip, token, socket).await {
+            if let Err(e) = serve(app, node_id, ip, token, tls, socket).await {
                 debug!("node {node_id} disconnected: {e:#}");
             }
         })
@@ -217,13 +220,21 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ").filter(|t| !t.is_empty())
 }
 
-async fn serve(app: Shared, node_id: i64, ip: String, token: String, mut socket: WebSocket) -> Result<()> {
+async fn serve(
+    app: Shared,
+    node_id: i64,
+    ip: String,
+    token: String,
+    tls: bool,
+    mut socket: WebSocket,
+) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<String>(16);
     let session = SESSION.fetch_add(1, Ordering::Relaxed);
     // Online from the handshake rather than the first report: a panel reporting
     // otherwise for a whole interval would describe the hub's bookkeeping rather
     // than the machine.
-    let agent = Agent::new(session, tx);
+    let mut agent = Agent::new(session, tx);
+    agent.rollout.tls = tls;
     let mut cancelled = agent.cancel.subscribe();
     {
         let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
@@ -276,7 +287,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, token: String, mut socket:
                             crate::terminal::from_agent(&app, node_id, session, &text);
                             Ok(false)
                         } else {
-                            dispatch(&app, node_id, &ip, &text)
+                            dispatch_session(&app, node_id, &ip, &text, Some(session))
                         }
                     }) {
                     Ok(true) => locate(app.clone(), node_id, ip.clone()),
@@ -336,11 +347,27 @@ fn release(app: &App, node_id: i64, session: u64) -> bool {
 /// Handles one inbound frame and reports whether the node is now owed a country
 /// lookup. The lookup itself is an outbound request and happens off this path;
 /// see `locate`.
+#[cfg(test)]
 fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
+    dispatch_session(app, node_id, ip, text, None)
+}
+fn dispatch_session(app: &App, node_id: i64, ip: &str, text: &str, session: Option<u64>) -> Result<bool> {
     let rpc: Rpc = serde_json::from_str(text)?;
     match rpc.method.as_str() {
         "hello" => {
-            if let Some(agent) = app.agents.write().unwrap_or_else(|e| e.into_inner()).get_mut(&node_id) {
+            if let Some(agent) = app
+                .agents
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&node_id)
+                .filter(|a| session.is_none_or(|s| s == a.session))
+            {
+                agent.rollout.version =
+                    rpc.params["agent_version"].as_str().filter(|s| s.len() < 40).unwrap_or("").to_owned();
+                agent.rollout.reported = false;
+                if rpc.params["terminal_reason"] == "plaintext" {
+                    agent.rollout.tls = false;
+                }
                 agent.terminal_enabled =
                     rpc.params.get("terminal_enabled").and_then(serde_json::Value::as_bool).unwrap_or(true);
                 agent.terminal_reason =
@@ -364,7 +391,7 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
             }
             return app.db.save_facts(node_id, &rpc.params, ip);
         }
-        "report" => report(app, node_id, rpc.params)?,
+        "report" => report_session(app, node_id, rpc.params, session)?,
         "ping.result" => {
             let task_id = rpc.params.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
             // A missing reading is not a reading of -1: `close_bucket` counts
@@ -486,7 +513,16 @@ fn check_contract(node_id: i64, metrics: &serde_json::Value) {
     }
 }
 
-fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()> {
+#[cfg(test)]
+fn report(app: &App, node_id: i64, metrics: serde_json::Value) -> Result<()> {
+    report_session(app, node_id, metrics, None)
+}
+fn report_session(
+    app: &App,
+    node_id: i64,
+    mut metrics: serde_json::Value,
+    session: Option<u64>,
+) -> Result<()> {
     // Missing fields remain compatible with older agents, while malformed values
     // must not become a live frame that can crash a browser. Counter validation
     // is separate: a missing or null kernel reading must not alter its
@@ -535,7 +571,11 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
     // Absence means the session was retired mid-flight: the panel rotated the
     // token, or the socket is unwinding. The bytes above remain booked; there is
     // simply no longer a session to attribute them to.
-    let Some(entry) = agents.get_mut(&node_id) else { return Ok(()) };
+    let Some(entry) = agents.get_mut(&node_id).filter(|a| session.is_none_or(|s| s == a.session)) else {
+        return Ok(());
+    };
+    entry.rollout.reported = !entry.rollout.version.is_empty()
+        && report_fields().all(|key| metrics.get(key).is_some_and(|v| !v.is_null()));
     let first = entry.last_seen == 0;
     if first {
         check_contract(node_id, &metrics);

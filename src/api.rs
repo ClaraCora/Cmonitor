@@ -564,7 +564,7 @@ pub(crate) fn https_domain(site: &str) -> Option<reqwest::Url> {
 /// a genuine IP entry point: provisioning stops working across an upgrade, the
 /// message implicates the address bar, and nothing records the header actually
 /// responsible.
-fn provisioning_allowed(app: &App, headers: &HeaderMap) -> bool {
+pub(crate) fn provisioning_allowed(app: &App, headers: &HeaderMap) -> bool {
     let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
         debug!("provisioning refused: the request carries no readable Host header");
         return false;
