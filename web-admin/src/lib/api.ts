@@ -110,6 +110,15 @@ export function supportsTerminal(version: string): boolean {
   return true
 }
 
+export function terminalControl(n: Pick<Node, "online" | "agent_version" | "terminal_capable" | "terminal_enabled" | "terminal_reason">) {
+  if (!n.online) return { disabled: true, text: "节点离线" }
+  if (n.terminal_enabled === false) return { disabled: true, text: "管理员已禁用终端" }
+  if (!supportsTerminal(n.agent_version)) return { disabled: true, text: "请升级 Cagent 至 1.1.0 或更高版本" }
+  if (n.terminal_reason === "plaintext") return { disabled: true, text: "当前 HTTP 连接仅支持监控上报" }
+  if (n.terminal_capable === false || n.terminal_reason === "policy") return { disabled: true, text: "Agent 已禁用终端" }
+  return { disabled: false, text: n.terminal_reason === "available" ? "打开 Web Terminal" : "打开终端（旧版 Agent 未报告连接能力）" }
+}
+
 /**
  * The traffic fields as a `TrafficPatch`: GB entered by hand, bytes on the wire,
  * and only the counters actually given a value.

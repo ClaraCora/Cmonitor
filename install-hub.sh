@@ -167,6 +167,7 @@ install_hub() {
 		sed -n 's#.*/download/\([^/]*\)/.*#\1#p')" || true
 	[ -n "$tag" ] || die "查不到最新发布版；GitHub 不可达，或还没有任何发布"
 	ok "版本" "$tag"
+	base="https://github.com/$REPO/releases/download/$tag"
 
 	tmp="$(mktemp -d)"
 	trap 'rm -rf "$tmp"' EXIT
@@ -183,34 +184,24 @@ install_hub() {
 	[ "$got" = "$want" ] || die "校验不通过，已丢弃下载的文件。期望 $want，实得 $got"
 	ok "校验" "sha256 一致"
 
-	# Keep a complete rollback point until the new process and API both pass
-	# health checks. Database and theme files belong to the same Hub release.
-	rollback_dir="$(mktemp -d "$ROOT/.hub-upgrade.XXXXXX")"
-	backup=""
-	if [ -f "$BIN" ]; then cp -p "$BIN" "$rollback_dir/monitor-hub"; backup="$rollback_dir/monitor-hub"; fi
-	[ -f "$UNIT" ] && cp -p "$UNIT" "$rollback_dir/monitor-hub.service" || true
-	if [ -d "$DATA/themes" ]; then cp -a "$DATA/themes" "$rollback_dir/themes"; fi
+	# Test migrations on an independent SQLite snapshot before pausing writers.
+	chmod 0755 "$tmp/$asset"
 	if [ -f "$DATA/monitor.db" ]; then
-		[ -x "$ROOT/backup.py" ] || [ -f "$ROOT/backup.py" ] || die "升级前找不到数据库备份脚本"
-		python3 "$ROOT/backup.py" --db "$DATA/monitor.db" --directory "$rollback_dir/db" --keep 1 --hub "$BIN" >/dev/null ||
-			die "升级前数据库备份失败，已保留现场：$rollback_dir"
+		python3 - "$DATA/monitor.db" "$tmp/preflight.db" <<'PYDB'
+import sqlite3, sys
+from pathlib import Path
+with sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + '?mode=ro', uri=True) as live, sqlite3.connect(sys.argv[2]) as copy:
+    live.backup(copy)
+PYDB
+		"$tmp/$asset" --db "$tmp/preflight.db" --check-db >/dev/null || die "候选版本无法读取数据库副本"
 	fi
-	# Stopped first so the copy does not land beneath a live process.
-	systemctl stop "$SERVICE" 2>/dev/null || true
-	install -m 0755 "$tmp/$asset" "$BIN"
-	# The download is complete. Cleared here as well as on EXIT because the menu
-	# calls this more than once per run and each call replaces the trap, leaving
-	# the previous directory and its binary uncollected.
-	rm -rf "$tmp"
-	trap - EXIT
-
 	# Loopback only: the panel and the agent tokens never traverse a network in
 	# the clear, and there is no port to firewall. Reaching it is the reverse
 	# proxy's responsibility, and 127.0.0.1 rather than [::1] because that is
 	# every proxy's default upstream; the hub binds one address, not both.
 	args="--listen 127.0.0.1:$PORT --db $DATA/monitor.db"
 	[ -z "$SITE" ] || args="$args --site $SITE"
-	cat >"$UNIT" <<UNIT
+	cat >"$tmp/unit" <<UNIT
 [Unit]
 Description=monitor hub
 After=network-online.target
@@ -239,36 +230,64 @@ MemoryMax=256M
 WantedBy=multi-user.target
 UNIT
 
-	systemctl daemon-reload
-	systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-	# Not left to set -e: a binary that cannot exec fails the job itself, which is
-	# precisely the case the rollback below exists for. Unguarded, the script
-	# would exit here with a raw systemd error and leave the hub down on the
-	# binary that just failed.
-	systemctl restart "$SERVICE" || true
-	# is-active answers before a unit that exits immediately has done so, and the
-	# first run also computes an argon2 hash. Wait, then query the local API too.
-	sleep 3
-	if ! systemctl is-active --quiet "$SERVICE" || ! curl -fsS --max-time 5 "http://127.0.0.1:$PORT/api/me" >/dev/null; then
-		if [ -n "$backup" ]; then
-			install -m 0755 "$rollback_dir/monitor-hub" "$BIN"
-			[ -f "$rollback_dir/monitor-hub.service" ] && install -m 0644 "$rollback_dir/monitor-hub.service" "$UNIT"
-			if [ -d "$rollback_dir/db" ]; then
-				restore_db="$(find "$rollback_dir/db" -name '*.db' -type f -print -quit)"
-				if [ -n "$restore_db" ]; then cp -p "$restore_db" "$DATA/monitor.db"; rm -f "$DATA/monitor.db-wal" "$DATA/monitor.db-shm"; fi
-			fi
-			if [ -d "$rollback_dir/themes" ]; then rm -rf "$DATA/themes"; cp -a "$rollback_dir/themes" "$DATA/themes"; fi
-			systemctl daemon-reload
-			systemctl restart "$SERVICE" 2>/dev/null || true
-			sleep 3
-			if systemctl is-active --quiet "$SERVICE" && curl -fsS --max-time 5 "http://127.0.0.1:$PORT/api/me" >/dev/null; then
-				die "新版本健康检查失败，已恢复旧版本。回滚现场保留在 $rollback_dir"
-			fi
-			die "新版本和旧版本都未通过健康检查，现场保留在 $rollback_dir"
+	old_listen_port=$(old_port)
+	# Prevent simultaneous installers from taking inconsistent rollback points.
+	exec 9>"$ROOT/.hub-upgrade.lock"
+	flock -n 9 || die "另一个升级正在进行"
+	rollback_dir=$(mktemp -d "$ROOT/.hub-upgrade.XXXXXX")
+	if [ -f "$BIN" ]; then cp -p "$BIN" "$rollback_dir/bin"; fi
+	if [ -f "$UNIT" ]; then cp -p "$UNIT" "$rollback_dir/unit"; fi
+	timers=""; interrupted=0; changed=0
+	for timer in monitor-backup.timer monitor-backup-status.timer; do
+		if systemctl is-active --quiet "$timer"; then timers="$timers $timer"; fi
+	done
+	# The old service may use a different port when --port is explicitly changed.
+	health() {
+		for attempt in 1 2 3 4 5 6 7 8 9 10; do
+			if systemctl is-active --quiet "$SERVICE" && curl -fsSL --max-time 3 "http://127.0.0.1:$1/" -o /dev/null &&
+				curl -fsS --max-time 3 "http://127.0.0.1:$1/api/me" | python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin)["authed"], bool)' 2>/dev/null; then return 0; fi
+			sleep 1
+		done
+		return 1
+	}
+	restore_hub() {
+		if [ "$changed" = 1 ]; then
+			systemctl stop "$SERVICE" || return 1
+			mv "$DATA" "$rollback_dir/failed-data" && mv "$rollback_dir/data" "$DATA" || return 1
+			[ -f "$rollback_dir/bin" ] && [ -f "$rollback_dir/unit" ] || return 1
+			install -m 0755 "$rollback_dir/bin" "$BIN" && install -m 0644 "$rollback_dir/unit" "$UNIT" && systemctl daemon-reload || return 1
 		fi
-		die "服务启动或 API 健康检查失败，现场保留在 $rollback_dir"
-	fi
-	rm -rf "$rollback_dir"
+		[ "$interrupted" = 0 ] || { systemctl start "$SERVICE" && health "${old_listen_port:-$PORT}"; }
+	}
+	finish_upgrade() {
+		code=$?; trap - EXIT HUP INT TERM; set +e
+		if [ "$code" -ne 0 ]; then
+			if restore_hub; then echo "安装失败，已验证原运行状态；现场：$rollback_dir" >&2
+			else echo "安装失败，原服务未通过恢复检查；现场：$rollback_dir" >&2; fi
+		fi
+		if [ -n "$timers" ]; then systemctl start $timers || code=1; fi
+		rm -rf "$tmp"
+		if [ "$code" = 0 ]; then rm -rf "$rollback_dir"; fi
+		exit "$code"
+	}
+	trap finish_upgrade EXIT; trap 'exit 1' HUP INT TERM
+	if [ -n "$timers" ]; then systemctl stop $timers; fi
+	for writer in monitor-backup.service monitor-backup-status.service; do
+		if systemctl is-active --quiet "$writer"; then systemctl stop "$writer"; fi
+	done
+	if [ -f "$UNIT" ]; then interrupted=1; systemctl stop "$SERVICE"; fi
+	# With all writers stopped, preserve ownership, WAL and themes as one set.
+	cp -a "$DATA" "$rollback_dir/data"
+	changed=1
+	install -m 0755 "$tmp/$asset" "$BIN"
+	install -m 0644 "$tmp/unit" "$UNIT"
+	systemctl daemon-reload
+	systemctl enable "$SERVICE" >/dev/null
+	systemctl start "$SERVICE" && health "$PORT" || die "新服务或 API 未通过检查"
+	if [ -n "$timers" ]; then systemctl start $timers; fi
+	trap - EXIT HUP INT TERM
+	rm -rf "$tmp" "$rollback_dir"
+	flock -u 9; exec 9>&-
 	ok "服务" "已启动并开机自启"
 
 	if [ -n "$first" ]; then done_title="安装完成"; else done_title="升级完成"; fi
@@ -442,7 +461,7 @@ monitor hub 安装器
 hub 只监听 127.0.0.1，公网访问不到，需要自己配 nginx / caddy / CF 隧道把
 域名指过来。装完会打印具体怎么配。
 
-重跑一次就是升级：校验通过后才替换二进制，起不来会自动回滚到上一版；
+重跑一次就是升级：校验通过后才替换二进制，未通过健康检查时恢复旧数据和服务，并报告复验结果；
 没写的参数沿用上次的，所以升级不会把端口和 --site 冲掉。
 二进制和数据都在 $ROOT 下（数据库和主题在 $DATA），卸载默认保留数据。
 TXT
@@ -491,6 +510,8 @@ if [ -n "$SITE" ]; then
 fi
 [ "$(id -u)" = 0 ] || die "需要 root：sudo sh $0"
 command -v curl >/dev/null 2>&1 || die "需要 curl"
+command -v python3 >/dev/null 2>&1 || die "需要 python3 以校验数据库副本"
+command -v flock >/dev/null 2>&1 || die "需要 flock（util-linux）"
 command -v sha256sum >/dev/null 2>&1 || die "需要 sha256sum（装 coreutils）"
 command -v systemctl >/dev/null 2>&1 ||
 	die "这个安装器只装 systemd 服务。手动运行：$BIN --listen 127.0.0.1:$PORT --db $DATA/monitor.db"

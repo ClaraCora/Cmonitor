@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { addresses, changes, GIB, provisioningSite, supportsTerminal, trafficCorrection } from "./api.ts"
+import { addresses, changes, GIB, provisioningSite, supportsTerminal, terminalControl, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -58,3 +58,11 @@ try {
   assert.equal(calls, 1)
 } finally { globalThis.fetch = originalFetch }
 console.log("request deadline, cancellation and Headers compatibility passed")
+
+const onlineAgent = { online: true, agent_version: "1.2.1", terminal_enabled: true, terminal_capable: true }
+assert.equal(terminalControl({ ...onlineAgent, terminal_reason: "plaintext" }).disabled, true)
+assert.equal(terminalControl({ ...onlineAgent, terminal_reason: "available" }).disabled, false)
+assert.equal(terminalControl({ ...onlineAgent, online: false }).text, "节点离线")
+assert.equal(terminalControl({ ...onlineAgent, terminal_enabled: false }).text, "管理员已禁用终端")
+assert.equal(terminalControl({ ...onlineAgent, terminal_reason: "policy" }).text, "Agent 已禁用终端")
+assert.match(terminalControl(onlineAgent).text, /未报告/)

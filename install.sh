@@ -15,14 +15,15 @@ ENV_FILE="$ROOT/agent.env"
 SERVER=""
 TOKEN=""
 REGISTER=""
-INTERVAL=1
+INTERVAL=""
 INSECURE=""
+OFFLINE=""
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
 	# message rather than the usage below, and `shift 2` cannot proceed.
 	case "$1" in
-	--server | --token | --register | --interval)
+	--server | --token | --register | --interval | --offline-dir)
 		[ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
 	esac
 	case "$1" in
@@ -30,11 +31,29 @@ while [ $# -gt 0 ]; do
 	--token) TOKEN="$2"; shift 2 ;;
 	--register) REGISTER="$2"; shift 2 ;;
 	--interval) INTERVAL="$2"; shift 2 ;;
+	--offline-dir) OFFLINE="$2"; shift 2 ;;
 	--insecure) INSECURE=1; shift ;;
 	*) echo "unknown option: $1" >&2; exit 2 ;;
 	esac
 done
 
+# An offline update with no connection arguments only replaces the executable.
+# In particular a hand-written HTTP/OpenRC service is kept byte for byte.
+SYSTEM_UNIT=/etc/systemd/system/monitor-agent.service
+OPENRC_UNIT=/etc/init.d/monitor-agent
+if [ -f "$SYSTEM_UNIT" ]; then EXISTING=$SYSTEM_UNIT; else EXISTING=$OPENRC_UNIT; fi
+saved_server=$(sed -n 's/^MONITOR_SERVER=//p' "$ENV_FILE" 2>/dev/null || true)
+keep_unit=""
+if [ -z "$SERVER$TOKEN$REGISTER$INTERVAL$INSECURE" ] && [ -f "$EXISTING" ] && [ -f "$BIN" ]; then
+	keep_unit=1; SERVER=$saved_server
+	TOKEN=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE")
+fi
+if [ "$SERVER" = "$saved_server" ] && [ -z "$INTERVAL$INSECURE" ] && [ -f "$EXISTING" ] && [ -f "$BIN" ]; then preserve_definition=1; else preserve_definition=""; fi
+if [ -z "$INTERVAL" ] && [ -f "$EXISTING" ]; then
+	INTERVAL=$(sed -nE 's/^(ExecStart|command_args)=.*--interval ([0-9]+).*/\2/p' "$EXISTING" | head -1)
+fi
+INTERVAL=${INTERVAL:-1}
+if [ "$SERVER" = "$saved_server" ] && [ -f "$EXISTING" ] && grep -Eq '^(ExecStart|command_args)=.* --insecure([^[:alnum:]_-]|$)' "$EXISTING"; then INSECURE=1; fi
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
 	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--insecure]" >&2
 	exit 2
@@ -101,7 +120,7 @@ http://*)
 		}
 		echo "warning: --insecure over plain HTTP to $SERVER" >&2
 		echo "         the token and every report travel in the clear, and the binary" >&2
-		echo "         installed below is fetched over the same unverified channel" >&2
+		[ -n "$OFFLINE" ] || echo "         the download also uses HTTP" >&2
 	fi
 	;;
 esac
@@ -114,13 +133,6 @@ else
 	echo "this installer needs systemd or OpenRC" >&2
 	exit 1
 fi
-
-UPGRADE_BACKUP=""
-cleanup() {
-	rm -f "$TMP"
-	[ -z "$UPGRADE_BACKUP" ] || rm -rf "$UPGRADE_BACKUP"
-}
-trap cleanup EXIT
 
 case "$(uname -m)" in
 x86_64 | amd64) ARCH=x86_64 ;;
@@ -136,10 +148,17 @@ URL="${SERVER%/}/agent/$ARCH"
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
-echo "downloading monitor-agent ($ARCH)"
+echo "preparing monitor-agent ($ARCH)"
 command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum is required (install coreutils)" >&2; exit 1; }
-curl -fsSL --max-time 180 "$URL" -o "$TMP"
-WANT=$(curl -fsSL --max-time 30 "$URL/sha256")
+if [ -n "$OFFLINE" ]; then
+	name="monitor-agent-$ARCH-unknown-linux-musl"
+	WANT=$(awk -v name="$name" '$2 == name {print $1}' "$OFFLINE/sha256sums.txt")
+	[ -n "$WANT" ] || { echo "offline checksum missing" >&2; exit 1; }
+	cp "$OFFLINE/$name" "$TMP"
+else
+	curl -fsSL --max-time 180 "$URL" -o "$TMP"
+	WANT=$(curl -fsSL --max-time 30 "$URL/sha256")
+fi
 GOT=$(sha256sum "$TMP" | cut -d ' ' -f1)
 [ "$GOT" = "$WANT" ] || { echo "Agent SHA-256 mismatch; installation refused" >&2; exit 1; }
 
@@ -169,6 +188,7 @@ if [ -z "$TOKEN" ]; then
 	fi
 fi
 if [ -z "$TOKEN" ]; then
+	[ -z "$OFFLINE" ] || { echo "offline installs need an existing identity or --token" >&2; exit 2; }
 	# The hub trims and bounds this as well; here it is restricted to characters
 	# a hostname may contain, so nothing unexpected travels in the body.
 	NAME=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-64)
@@ -187,44 +207,48 @@ fi
 # policy such as network include/exclude rules and terminal restrictions.
 install -d -m 0755 "$ROOT"
 UPGRADE_BACKUP=$(mktemp -d "$ROOT/.agent-upgrade.XXXXXX")
-[ -f "$BIN" ] && cp -p "$BIN" "$UPGRADE_BACKUP/monitor-agent" || true
-[ -f "$ENV_FILE" ] && cp -p "$ENV_FILE" "$UPGRADE_BACKUP/agent.env" || true
-if [ "$INIT" = openrc ]; then
-	[ -f /etc/init.d/monitor-agent ] && cp -p /etc/init.d/monitor-agent "$UPGRADE_BACKUP/service" || true
-else
-	[ -f /etc/systemd/system/monitor-agent.service ] && cp -p /etc/systemd/system/monitor-agent.service "$UPGRADE_BACKUP/service" || true
-fi
-
+if [ "$INIT" = openrc ]; then UNIT=$OPENRC_UNIT; else UNIT=$SYSTEM_UNIT; fi
+for file in "$BIN" "$ENV_FILE"; do
+	if [ -f "$file" ]; then cp -p "$file" "$UPGRADE_BACKUP/"; fi
+done
+if [ -f "$UNIT" ]; then cp -p "$UNIT" "$UPGRADE_BACKUP/saved-unit"; fi
+service_stop() { if [ "$INIT" = openrc ]; then rc-service monitor-agent stop; else systemctl stop monitor-agent; fi; }
+service_start() { if [ "$INIT" = openrc ]; then rc-service monitor-agent restart; else systemctl daemon-reload && systemctl restart monitor-agent; fi; }
+service_active() { if [ "$INIT" = openrc ]; then rc-service monitor-agent status; else systemctl is-active --quiet monitor-agent; fi; }
 restore_previous() {
-	[ -f "$UPGRADE_BACKUP/monitor-agent" ] && install -m 0755 "$UPGRADE_BACKUP/monitor-agent" "$BIN" || true
-	[ -f "$UPGRADE_BACKUP/agent.env" ] && install -m 0600 "$UPGRADE_BACKUP/agent.env" "$ENV_FILE" || true
-	if [ "$INIT" = openrc ]; then
-		if [ -f "$UPGRADE_BACKUP/service" ]; then install -m 0755 "$UPGRADE_BACKUP/service" /etc/init.d/monitor-agent
-		else rm -f /etc/init.d/monitor-agent; fi
-		rc-update add monitor-agent default >/dev/null 2>&1 || true
-		rc-service monitor-agent restart >/dev/null 2>&1 || true
-	else
-		if [ -f "$UPGRADE_BACKUP/service" ]; then install -m 0644 "$UPGRADE_BACKUP/service" /etc/systemd/system/monitor-agent.service
-		else rm -f /etc/systemd/system/monitor-agent.service; fi
-		systemctl daemon-reload
-		systemctl enable monitor-agent >/dev/null 2>&1 || true
-		systemctl restart monitor-agent >/dev/null 2>&1 || true
-	fi
+	if [ -f "$UNIT" ]; then service_stop >/dev/null 2>&1 || return 1; fi
+	for file in "$BIN" "$ENV_FILE" "$UNIT"; do
+		copy="$UPGRADE_BACKUP/${file##*/}"
+		# OpenRC's service and the executable have identical basenames; the
+		# service copy is stored under its own name below.
+		if [ "$file" = "$UNIT" ]; then copy="$UPGRADE_BACKUP/saved-unit"; fi
+		if [ -f "$copy" ]; then cp -p "$copy" "$file.restore" && mv -f "$file.restore" "$file" || return 1
+		else rm -f "$file" || return 1; fi
+	done
+	[ ! -f "$UNIT" ] || { service_start && service_active; }
 }
-
-# Stop an agent already running here before replacing its binary. A failed
-# upgrade restores the complete previous installation and starts it again.
-if [ "$INIT" = openrc ]; then
-	rc-service monitor-agent stop 2>/dev/null || true
-else
-	systemctl stop monitor-agent 2>/dev/null || true
+finish_agent() {
+	code=$?; trap - EXIT HUP INT TERM; set +e; rm -f "$TMP"
+	if [ "$code" -ne 0 ]; then
+		if restore_previous; then echo "installation failed; previous files restored" >&2
+		else echo "recovery incomplete; inspect $UPGRADE_BACKUP" >&2; fi
+	else rm -rf "$UPGRADE_BACKUP"; fi
+	exit "$code"
+}
+trap finish_agent EXIT; trap 'exit 1' HUP INT TERM
+if [ -f "$UNIT" ] && service_active >/dev/null 2>&1; then service_stop; fi
+install -m 0755 "$TMP" "$UPGRADE_BACKUP/new-bin"
+mv -f "$UPGRADE_BACKUP/new-bin" "$BIN"
+if [ -n "$keep_unit" ]; then
+	service_start && sleep 2 && service_active || exit 1
+	echo "updated binary; kept the existing service, credentials and reporting settings"; exit 0
 fi
-install -m 0755 "$TMP" "$BIN"
 
 # Preserve every existing setting while replacing only the connection values.
 # Write beside the final file, set its mode before publication, then atomically
 # replace it so a service never observes a partial environment file.
-ENV_TMP=$(mktemp "$ROOT/.agent-env.XXXXXX")
+ENV_TMP="$UPGRADE_BACKUP/new-env"
+(umask 077; : > "$ENV_TMP")
 if [ -f "$ENV_FILE" ]; then
 	sed '/^MONITOR_SERVER=/d; /^MONITOR_TOKEN=/d' "$ENV_FILE" >"$ENV_TMP"
 fi
@@ -234,6 +258,11 @@ fi
 } >>"$ENV_TMP"
 chmod 0600 "$ENV_TMP"
 mv -f "$ENV_TMP" "$ENV_FILE"
+
+if [ -n "$preserve_definition" ]; then
+	service_start && sleep 2 && service_active || exit 1
+	echo "updated agent and connection settings; existing service options retained"; exit 0
+fi
 
 if [ "$INIT" = openrc ]; then
 	cat >/etc/init.d/monitor-agent <<RC
@@ -261,11 +290,9 @@ RC
 	chmod 0755 /etc/init.d/monitor-agent
 	rc-update add monitor-agent default >/dev/null
 	if ! rc-service monitor-agent restart || ! rc-service monitor-agent status >/dev/null 2>&1; then
-		restore_previous
-		echo "agent upgrade failed; previous installation was restored" >&2
+		echo "agent upgrade failed; starting recovery" >&2
 		exit 1
 	fi
-	rm -rf "$UPGRADE_BACKUP"; UPGRADE_BACKUP=""
 	echo "monitor-agent installed; follow it with: tail -f /var/log/monitor-agent.log"
 	exit 0
 fi
@@ -296,15 +323,12 @@ systemctl enable monitor-agent >/dev/null
 # untouched, so reinstalling over a live agent would keep the old binary
 # running.
 if ! systemctl restart monitor-agent; then
-	restore_previous
-	echo "agent upgrade failed; previous installation was restored" >&2
+	echo "agent upgrade failed; starting recovery" >&2
 	exit 1
 fi
 sleep 2
 if ! systemctl is-active --quiet monitor-agent; then
-	restore_previous
-	echo "agent did not remain active; previous installation was restored" >&2
+	echo "agent did not remain active; starting recovery" >&2
 	exit 1
 fi
-rm -rf "$UPGRADE_BACKUP"; UPGRADE_BACKUP=""
 echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"

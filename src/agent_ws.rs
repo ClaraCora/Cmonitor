@@ -82,7 +82,7 @@ pub struct Agent {
     pub probe_started_at: i64,
     pub terminal_enabled: bool,
     /// Why the agent reported terminal access as unavailable.
-    pub terminal_reason: String,
+    pub terminal_reason: &'static str,
     pub network_interfaces: Vec<String>,
     /// Wall-clock minute this session has already accounted for. A history row
     /// is written when a report arrives past it.
@@ -114,7 +114,7 @@ impl Agent {
             last_seen: 0,
             probe_started_at: Utc::now().timestamp(),
             terminal_enabled: true,
-            terminal_reason: "unknown".into(),
+            terminal_reason: "unknown",
             network_interfaces: Vec::new(),
             // The minute in progress rather than zero. Its row is already on
             // disk, written by the session this one replaces from the mean of a
@@ -343,12 +343,13 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
             if let Some(agent) = app.agents.write().unwrap_or_else(|e| e.into_inner()).get_mut(&node_id) {
                 agent.terminal_enabled =
                     rpc.params.get("terminal_enabled").and_then(serde_json::Value::as_bool).unwrap_or(true);
-                agent.terminal_reason = rpc
-                    .params
-                    .get("terminal_reason")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_owned();
+                agent.terminal_reason =
+                    match rpc.params.get("terminal_reason").and_then(serde_json::Value::as_str) {
+                        Some("plaintext") => "plaintext",
+                        Some("policy") => "policy",
+                        Some("available") => "available",
+                        _ => "unknown",
+                    };
                 agent.network_interfaces = rpc
                     .params
                     .get("network_interfaces")

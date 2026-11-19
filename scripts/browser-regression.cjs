@@ -152,7 +152,7 @@ async function main() {
 
       await page.goto(origin+'/clara/data')
       await page.getByRole('heading',{name:'自动备份',exact:true}).waitFor()
-      await page.getByText('最近 7 份成功备份',{exact:true}).waitFor()
+      await page.getByText('最近 7 份及最近 7 个备份日期的每日副本',{exact:true}).waitFor()
       await page.getByText('每天 03:20，最多延后 10 分钟',{exact:true}).waitFor()
       await page.getByText('2026-11-11 03:21:27 CST',{exact:true}).waitFor()
       await page.getByText('未配置，目前仅保存在本机',{exact:true}).waitFor()
@@ -167,7 +167,7 @@ async function main() {
       backupFail=true
       await page.getByRole('button',{name:'刷新备份状态',exact:true}).click()
       await page.getByText('加载失败：模拟备份状态加载失败').waitFor()
-      await page.getByText('最近 7 份成功备份',{exact:true}).waitFor()
+      await page.getByText('最近 7 份及最近 7 个备份日期的每日副本',{exact:true}).waitFor()
       backupFail=false; backupState='unavailable'; backupError='模拟备份失败'; backupStale=true
       await page.getByRole('button',{name:'刷新备份状态',exact:true}).click()
       await page.getByText('无法确认定时任务状态',{exact:true}).waitFor()

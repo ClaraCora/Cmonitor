@@ -64,6 +64,21 @@ def report_status(source):
     return status
 
 
+def expired_generations(directory, keep):
+    """Keep recent generations plus the newest verified copy on each of the last keep backup dates."""
+    copies = sorted(directory.glob('monitor-*.db'), reverse=True)
+    retained = set(copies[:keep])
+    dates = set()
+    for copy in copies:
+        date = copy.name[8:16]
+        if date.isdigit() and date not in dates and copy.with_suffix('.json').is_file():
+            retained.add(copy)
+            dates.add(date)
+            if len(dates) == keep:
+                break
+    return [copy for copy in copies if copy not in retained]
+
+
 def backup(source, directory, keep=7, offsite=None, hub=None):
     source, directory = Path(source).resolve(), Path(directory).resolve()
     if not source.is_file():
@@ -113,7 +128,7 @@ def backup(source, directory, keep=7, offsite=None, hub=None):
             # Configured by the server operator, never a shell command. A failure
             # retains every existing local generation and is visible in the panel.
             subprocess.run(["rsync", "-a", "--protect-args", "--", str(target), str(manifest), offsite], check=True, timeout=300, capture_output=True)
-        for expired in sorted(directory.glob("monitor-*.db"), reverse=True)[keep:]:
+        for expired in expired_generations(directory, keep):
             expired.unlink()
             expired.with_suffix(".json").unlink(missing_ok=True)
         record(source, "backup_last_success", int(time.time()))

@@ -86,6 +86,14 @@ class BackupTests(unittest.TestCase):
                 policy = json.loads(conn.execute("SELECT value FROM setting WHERE key='backup_policy'").fetchone()[0])
                 self.assertEqual(policy, {"directory": str(copies.resolve()), "keep": 2, "offsite": False})
 
+    def test_repeated_manual_backups_do_not_displace_daily_restore_points(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            folder = Path(scratch)
+            for stamp in ['20261116-0001', '20261117-0001', '20261117-0002', '20261118-0001', '20261118-0002']:
+                f = folder / f'monitor-{stamp}.db'
+                f.touch(); f.with_suffix('.json').touch()
+            self.assertEqual([p.name for p in module.expired_generations(folder, 2)], ['monitor-20261117-0001.db', 'monitor-20261116-0001.db'])
+
     def test_failed_offsite_copy_preserves_every_previous_generation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

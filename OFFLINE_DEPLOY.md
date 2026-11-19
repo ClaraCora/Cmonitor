@@ -8,7 +8,7 @@ HTTP 上报中 Token 和监控数据以明文传输；当前 Cagent v1.2.1 会�
 
 操作流程是：在联网电脑下载 Agent → 复制到目标机器 → 写入现有 HTTP IP 入口和节点 Token → 创建带 `--insecure` 的服务 → 向原面板上报。
 
-示例按当前仓库 Hub v1.6.1 固定的 Cagent v1.2.1 编写。目标机器为 Linux，提供 systemd 和 Alpine/OpenRC 两种服务配置。命令使用 Linux Bash 语法；在 Windows 上准备下载文件时，可以使用 WSL，或通过浏览器下载同名文件。
+Agent 版本以部署的 Hub 随附的 `agent.pin` 为准。目标机器为 Linux，提供 systemd 和 Alpine/OpenRC 两种服务配置。命令使用 Linux Bash 语法；在 Windows 上准备下载文件时，可以使用 WSL，或通过浏览器下载同名文件。
 
 ## 1. 提前准备原地址、Token 和系统条件
 
@@ -66,39 +66,27 @@ uname -m
 
 ### 2.2 下载、校验和打包
 
-在**能够访问 GitHub 的联网电脑**执行：
+从与生产 Hub **相同版本**的 GitHub Release 获取 `cmonitor-agent-offline.tar.gz` 和 `sha256sums.txt`，按清单核对归档的 SHA-256，再用受信任的介质或 SSH 搬入目标机。包内含两种架构、对应的摘要、安装器及版本说明。也可在可信联网电脑上，从对应 Hub 源码目录自行制包：
 
 ```bash
-set -euo pipefail
-
-mkdir -p cmonitor-agent-offline
-cd cmonitor-agent-offline
-
-AGENT_TAG=v1.2.1
-
-for ARCH in x86_64 aarch64; do
-    curl -fL --retry 3 \
-        "https://github.com/ClaraCora/Cagent/releases/download/${AGENT_TAG}/monitor-agent-${ARCH}-unknown-linux-musl" \
-        -o "monitor-agent-${ARCH}-unknown-linux-musl"
-done
-
-# 摘要来自本仓库 Hub v1.6.1 的 agent.pin，对应 Cagent v1.2.1。
-cat > sha256sums.txt <<'EOF'
-1879b3cd7da55d32a41cfa751c5112345d0647ef28e310d4e4746b9bc719f423  monitor-agent-x86_64-unknown-linux-musl
-9f37a0e9e7597d87b404613629389b25ccd6bb6b9e9ad60fa03f2893eda2526e  monitor-agent-aarch64-unknown-linux-musl
-EOF
-
-sha256sum -c sha256sums.txt
-printf 'Agent=%s\n' "$AGENT_TAG" > versions.txt
-
-cd ..
-tar -czf cmonitor-agent-offline.tar.gz cmonitor-agent-offline
+python3 scripts/agent-offline.py cmonitor-agent-offline.tar.gz
 sha256sum cmonitor-agent-offline.tar.gz > cmonitor-agent-offline.tar.gz.sha256
 ```
 
-两个文件应均显示 `OK`。如果原面板运行的是其他版本，先核对对应 Hub 发布版本的 `agent.pin`，采用它固定的 Agent 版本和摘要；改版本时不能继续沿用这里的旧摘要。
+脚本从当前源码的 `agent.pin` 读取版本并逐项验证摘要。下载 Release 时可以从正式清单提取 `cmonitor-agent-offline.tar.gz` 行，存为同名的 `.sha256` 文件供下节使用。
 
-下载页面：[Cagent v1.2.1 Release](https://github.com/ClaraCora/Cagent/releases/tag/v1.2.1)。用浏览器准备时，下载上述二进制文件，按本节内容创建校验文件并校验；不要下载 `Source code` 源码包来代替可执行文件。
+### 已安装节点离线升级
+
+在目标机上验包、解压，然后以 root 执行：
+
+```bash
+sha256sum -c cmonitor-agent-offline.tar.gz.sha256
+tar xzf cmonitor-agent-offline.tar.gz
+cd cmonitor-agent-offline
+sh ./install.sh --offline-dir .
+```
+
+此命令保留原服务定义和环境文件，只替换二进制。现有 HTTP 地址、`--insecure`、采样间隔、节点身份、网卡与终端策略均沿用。升级不发起下载或重新注册。检查原节点 ID 持续上报及版本即可。首次安装见下文。
 
 ## 3. 把文件复制到目标机器
 

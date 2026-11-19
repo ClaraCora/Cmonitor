@@ -13,7 +13,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { addresses, api, changes, GIB, provisioningSite, supportsTerminal, trafficCorrection, upload, type Node, type PingTask, type VisitorRow } from "@/lib/api"
+import { addresses, api, changes, GIB, provisioningSite, terminalControl, trafficCorrection, upload, type Node, type PingTask, type VisitorRow } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 import { trackRestore, useRestoreOperation } from "@/lib/restore"
 
@@ -780,7 +780,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                   <DropdownMenu.Item className={action} onSelect={() => setBilling(n)}>续费设置</DropdownMenu.Item>
                   <DropdownMenu.Item className={action} onSelect={() => togglePublic(n)}>{n.public ? "隐藏节点" : "公开节点"}</DropdownMenu.Item>
                   <DropdownMenu.Item className={action} onSelect={() => toggleTerminal(n)}>{n.terminal_enabled === false ? "允许节点终端" : "禁用节点终端"}</DropdownMenu.Item>
-                  <DropdownMenu.Item title={n.terminal_reason === "plaintext" ? "当前 HTTP 连接仅支持监控上报" : undefined} className={action} disabled={!n.online || n.terminal_capable === false || n.terminal_enabled === false || !supportsTerminal(n.agent_version)} onSelect={() => setTerminal(n)}>打开终端{n.terminal_reason === "plaintext" ? "（HTTP 不可用）" : ""}</DropdownMenu.Item>
+                  <DropdownMenu.Item className={action} disabled={terminalControl(n).disabled} onSelect={() => setTerminal(n)}>{terminalControl(n).text}</DropdownMenu.Item>
                   <DropdownMenu.Item className={action} disabled={!canProvision} onSelect={() => setInstalling(n)}>安装 Agent</DropdownMenu.Item>
                   <DropdownMenu.Separator className="my-1 h-px bg-border" />
                   <DropdownMenu.Item className={action} disabled={!!needle || index===0} onSelect={() => moveBy(-1)}>上移</DropdownMenu.Item>
@@ -911,10 +911,10 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                   <Button
                     variant="ghost"
                     size="icon"
-                    disabled={!n.online || n.terminal_capable === false || n.terminal_enabled === false || !supportsTerminal(n.agent_version)}
+                    disabled={terminalControl(n).disabled}
                     onClick={() => setTerminal(n)}
-                    title={n.terminal_enabled === false ? "管理员已禁用终端" : !n.online ? "节点离线" : n.terminal_capable === false ? (({ available: "可用", plaintext: "当前 HTTP 连接仅支持监控上报", policy: "Agent 已禁用终端", offline: "节点离线", unknown: "Agent 尚未报告终端能力" } as Record<string, string>)[n.terminal_reason ?? "unknown"] ?? "Agent 暂不可用") : !supportsTerminal(n.agent_version) ? "请升级 Cagent 至 1.1.0 或更高版本" : "打开 Web Terminal"}
-                    aria-label={n.terminal_enabled === false ? "管理员已禁用终端" : !n.online ? "节点离线" : n.terminal_capable === false ? "Web Terminal 不可用" : supportsTerminal(n.agent_version) ? "打开 Web Terminal" : "请升级 Cagent 至 1.1.0 或更高版本"}
+                    title={terminalControl(n).text}
+                    aria-label={terminalControl(n).text}
                   >
                     <TerminalIcon />
                   </Button>
@@ -1784,7 +1784,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
               Telegram 和 Webhook 配了哪个就发哪个，也可以同时用。离线通知在下方按节点打开；流量和到期提醒对填了额度、到期日的节点生效。
             </p>
-            {!s.notify_telegram_token_set && !s.notify_webhook_url_set && (
+            {!(s.notify_telegram_token_set && text("notify_telegram_chat").trim()) && !s.notify_webhook_url_set && (
               <p role="alert" className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
                 尚未配置通知接收渠道。事件会记录在 Hub 中，但不会送达 Telegram 或 Webhook。
               </p>
@@ -2218,7 +2218,7 @@ function Data() {
         </div>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           {stat("执行时间（服务器时间）", calendar ? `${daily ? `每天 ${daily}` : calendar}${delay && delay !== "0" ? `，最多延后 ${delay}` : ""}` : "暂无计划信息")}
-          {stat("保留策略", backup?.policy ? `最近 ${backup.policy.keep} 份成功备份` : "等待备份任务上报")}
+          {stat("保留策略", backup?.policy ? `最近 ${backup.policy.keep} 份及最近 ${backup.policy.keep} 个备份日期的每日副本` : "等待备份任务上报")}
           {stat("已有备份", backup?.copies != null ? `${backup.copies} 份` : "无法读取备份目录")}
           {stat("最近成功", info.backup_success ? new Date(Number(info.backup_success) * 1000).toLocaleString("zh-CN") : "尚无成功记录")}
           {stat("下次执行（服务器时间）", backup?.scheduler.next_run?.replace(/^\w+ (\d{4}-\d{2}-\d{2}) /, "$1 ") ?? "暂无下次执行时间")}
