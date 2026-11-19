@@ -72,6 +72,7 @@ export type Node = {
   notify?: boolean
   terminal_capable?: boolean
   terminal_enabled?: boolean
+  terminal_reason?: "available" | "policy" | "plaintext" | "unknown" | "offline"
   network_interfaces?: string[] | null
 }
 

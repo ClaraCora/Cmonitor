@@ -115,6 +115,13 @@ else
 	exit 1
 fi
 
+UPGRADE_BACKUP=""
+cleanup() {
+	rm -f "$TMP"
+	[ -z "$UPGRADE_BACKUP" ] || rm -rf "$UPGRADE_BACKUP"
+}
+trap cleanup EXIT
+
 case "$(uname -m)" in
 x86_64 | amd64) ARCH=x86_64 ;;
 aarch64 | arm64) ARCH=aarch64 ;;
@@ -175,32 +182,58 @@ if [ -z "$TOKEN" ]; then
 	}
 fi
 
-# Stop an agent already running here before replacing its binary. The service
-# name is fixed, so a reinstall could never start a second copy, but without this
-# the new binary lands beneath a live process and only the restart at the end
-# picks it up. Stopping first also means the copy does not depend on `install`
-# unlinking rather than failing with ETXTBSY. Placed after the download, so a
-# node that cannot fetch the binary keeps running.
+# Keep the complete previous installation until the new service has proved it
+# starts. This includes the environment file because it carries supported local
+# policy such as network include/exclude rules and terminal restrictions.
+install -d -m 0755 "$ROOT"
+UPGRADE_BACKUP=$(mktemp -d "$ROOT/.agent-upgrade.XXXXXX")
+[ -f "$BIN" ] && cp -p "$BIN" "$UPGRADE_BACKUP/monitor-agent" || true
+[ -f "$ENV_FILE" ] && cp -p "$ENV_FILE" "$UPGRADE_BACKUP/agent.env" || true
+if [ "$INIT" = openrc ]; then
+	[ -f /etc/init.d/monitor-agent ] && cp -p /etc/init.d/monitor-agent "$UPGRADE_BACKUP/service" || true
+else
+	[ -f /etc/systemd/system/monitor-agent.service ] && cp -p /etc/systemd/system/monitor-agent.service "$UPGRADE_BACKUP/service" || true
+fi
+
+restore_previous() {
+	[ -f "$UPGRADE_BACKUP/monitor-agent" ] && install -m 0755 "$UPGRADE_BACKUP/monitor-agent" "$BIN" || true
+	[ -f "$UPGRADE_BACKUP/agent.env" ] && install -m 0600 "$UPGRADE_BACKUP/agent.env" "$ENV_FILE" || true
+	if [ "$INIT" = openrc ]; then
+		if [ -f "$UPGRADE_BACKUP/service" ]; then install -m 0755 "$UPGRADE_BACKUP/service" /etc/init.d/monitor-agent
+		else rm -f /etc/init.d/monitor-agent; fi
+		rc-update add monitor-agent default >/dev/null 2>&1 || true
+		rc-service monitor-agent restart >/dev/null 2>&1 || true
+	else
+		if [ -f "$UPGRADE_BACKUP/service" ]; then install -m 0644 "$UPGRADE_BACKUP/service" /etc/systemd/system/monitor-agent.service
+		else rm -f /etc/systemd/system/monitor-agent.service; fi
+		systemctl daemon-reload
+		systemctl enable monitor-agent >/dev/null 2>&1 || true
+		systemctl restart monitor-agent >/dev/null 2>&1 || true
+	fi
+}
+
+# Stop an agent already running here before replacing its binary. A failed
+# upgrade restores the complete previous installation and starts it again.
 if [ "$INIT" = openrc ]; then
 	rc-service monitor-agent stop 2>/dev/null || true
 else
 	systemctl stop monitor-agent 2>/dev/null || true
 fi
-install -d -m 0755 "$ROOT"
 install -m 0755 "$TMP" "$BIN"
 
-# The token lives in a root-only environment file rather than the unit, keeping
-# it out of `systemctl cat` and the world-readable journal. 0600 root is what
-# keeps it private, since $ROOT itself is readable and holds the binaries. Set in
-# a subshell, because the unit file written below is read by anyone debugging
-# with `systemctl cat` and need not be 0600.
-(
-	umask 077
-	cat >"$ENV_FILE" <<ENV
-MONITOR_SERVER=$SERVER
-MONITOR_TOKEN=$TOKEN
-ENV
-)
+# Preserve every existing setting while replacing only the connection values.
+# Write beside the final file, set its mode before publication, then atomically
+# replace it so a service never observes a partial environment file.
+ENV_TMP=$(mktemp "$ROOT/.agent-env.XXXXXX")
+if [ -f "$ENV_FILE" ]; then
+	sed '/^MONITOR_SERVER=/d; /^MONITOR_TOKEN=/d' "$ENV_FILE" >"$ENV_TMP"
+fi
+{
+	printf 'MONITOR_SERVER=%s\n' "$SERVER"
+	printf 'MONITOR_TOKEN=%s\n' "$TOKEN"
+} >>"$ENV_TMP"
+chmod 0600 "$ENV_TMP"
+mv -f "$ENV_TMP" "$ENV_FILE"
 
 if [ "$INIT" = openrc ]; then
 	cat >/etc/init.d/monitor-agent <<RC
@@ -227,7 +260,12 @@ start_pre() {
 RC
 	chmod 0755 /etc/init.d/monitor-agent
 	rc-update add monitor-agent default >/dev/null
-	rc-service monitor-agent restart
+	if ! rc-service monitor-agent restart || ! rc-service monitor-agent status >/dev/null 2>&1; then
+		restore_previous
+		echo "agent upgrade failed; previous installation was restored" >&2
+		exit 1
+	fi
+	rm -rf "$UPGRADE_BACKUP"; UPGRADE_BACKUP=""
 	echo "monitor-agent installed; follow it with: tail -f /var/log/monitor-agent.log"
 	exit 0
 fi
@@ -257,5 +295,16 @@ systemctl enable monitor-agent >/dev/null
 # restart rather than `enable --now`: --now leaves an already-running service
 # untouched, so reinstalling over a live agent would keep the old binary
 # running.
-systemctl restart monitor-agent
+if ! systemctl restart monitor-agent; then
+	restore_previous
+	echo "agent upgrade failed; previous installation was restored" >&2
+	exit 1
+fi
+sleep 2
+if ! systemctl is-active --quiet monitor-agent; then
+	restore_previous
+	echo "agent did not remain active; previous installation was restored" >&2
+	exit 1
+fi
+rm -rf "$UPGRADE_BACKUP"; UPGRADE_BACKUP=""
 echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"

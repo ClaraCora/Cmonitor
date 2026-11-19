@@ -1,5 +1,7 @@
 name: security
 on:
+  schedule:
+    - cron: "37 4 * * 2"
   push:
     branches: [main]
     paths: [Cargo.lock, Cargo.toml, .node-version, web-admin/package.json, web-admin/package-lock.json, web-admin/.npmrc, scripts/check-node-security.mjs, .github/workflows/security.yml]

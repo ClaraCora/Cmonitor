@@ -4,11 +4,11 @@
 
 节点使用原面板为它生成的 Token。主要配置是 `MONITOR_SERVER=http://IP:端口`，启动命令增加 `--insecure`。本流程只在节点安装 Agent，使用服务端已有的接入入口。
 
-HTTP 上报中 Token 和监控数据以明文传输；当前 Cagent v1.1.3 会禁用这种远程明文连接上的 Web Terminal，CPU、内存、流量等监控上报仍可使用。
+HTTP 上报中 Token 和监控数据以明文传输；当前 Cagent v1.2.1 会禁用这种远程明文连接上的 Web Terminal，CPU、内存、流量等监控上报仍可使用。
 
 操作流程是：在联网电脑下载 Agent → 复制到目标机器 → 写入现有 HTTP IP 入口和节点 Token → 创建带 `--insecure` 的服务 → 向原面板上报。
 
-示例按当前仓库 Hub v1.2.27 固定的 Cagent v1.1.3 编写。目标机器为 Linux，提供 systemd 和 Alpine/OpenRC 两种服务配置。命令使用 Linux Bash 语法；在 Windows 上准备下载文件时，可以使用 WSL，或通过浏览器下载同名文件。
+示例按当前仓库 Hub v1.6.1 固定的 Cagent v1.2.1 编写。目标机器为 Linux，提供 systemd 和 Alpine/OpenRC 两种服务配置。命令使用 Linux Bash 语法；在 Windows 上准备下载文件时，可以使用 WSL，或通过浏览器下载同名文件。
 
 ## 1. 提前准备原地址、Token 和系统条件
 
@@ -74,7 +74,7 @@ set -euo pipefail
 mkdir -p cmonitor-agent-offline
 cd cmonitor-agent-offline
 
-AGENT_TAG=v1.1.3
+AGENT_TAG=v1.2.1
 
 for ARCH in x86_64 aarch64; do
     curl -fL --retry 3 \
@@ -82,7 +82,7 @@ for ARCH in x86_64 aarch64; do
         -o "monitor-agent-${ARCH}-unknown-linux-musl"
 done
 
-# 摘要来自本仓库 Hub v1.2.27 的 agent.pin，对应 Cagent v1.1.3。
+# 摘要来自本仓库 Hub v1.6.1 的 agent.pin，对应 Cagent v1.2.1。
 cat > sha256sums.txt <<'EOF'
 1879b3cd7da55d32a41cfa751c5112345d0647ef28e310d4e4746b9bc719f423  monitor-agent-x86_64-unknown-linux-musl
 9f37a0e9e7597d87b404613629389b25ccd6bb6b9e9ad60fa03f2893eda2526e  monitor-agent-aarch64-unknown-linux-musl
@@ -98,7 +98,7 @@ sha256sum cmonitor-agent-offline.tar.gz > cmonitor-agent-offline.tar.gz.sha256
 
 两个文件应均显示 `OK`。如果原面板运行的是其他版本，先核对对应 Hub 发布版本的 `agent.pin`，采用它固定的 Agent 版本和摘要；改版本时不能继续沿用这里的旧摘要。
 
-下载页面：[Cagent v1.1.3 Release](https://github.com/ClaraCora/Cagent/releases/tag/v1.1.3)。用浏览器准备时，下载上述二进制文件，按本节内容创建校验文件并校验；不要下载 `Source code` 源码包来代替可执行文件。
+下载页面：[Cagent v1.2.1 Release](https://github.com/ClaraCora/Cagent/releases/tag/v1.2.1)。用浏览器准备时，下载上述二进制文件，按本节内容创建校验文件并校验；不要下载 `Source code` 源码包来代替可执行文件。
 
 ## 3. 把文件复制到目标机器
 
@@ -334,7 +334,7 @@ curl --noproxy '*' --http1.1 -i --max-time 10 \
 | 502 | 服务端反代无法访问 Hub，上游地址、端口或服务状态有问题 |
 | Agent 日志报 401 / Unauthorized | Token 是否完整、是否属于这个 Hub 的这个节点、是否已经换发或删除；与上述无 Token 检查返回 401 不同 |
 | 节点反复上下线 | 是否有另一台机器或旧 Agent 进程使用同一个 Token |
-| 可以上报但 Web Terminal 不可用 | 本方案为远程明文 WebSocket，Cagent v1.1.3 会禁用终端，这是预期限制 |
+| 可以上报但 Web Terminal 不可用 | 本方案为远程明文 WebSocket，Cagent v1.2.1 会禁用终端，这是预期限制 |
 | 文件改好仍没生效 | 修改 env 后重启；修改 systemd unit 后先 daemon-reload 再重启；检查是否有旧服务覆盖文件 |
 
 查看 systemd 实际加载的服务文件和覆盖文件：
@@ -350,12 +350,12 @@ systemctl cat monitor-agent
 - 只把节点的上报地址配置成原 Hub 的现有 HTTP IP 入口。原 Hub 的 `--site` 继续使用其管理后台原地址，不需要改成 IP；后台添加节点等操作仍在能够访问原后台的电脑上完成。
 - `--insecure` 允许远程 HTTP/WS，不是跳过 HTTPS/WSS 的证书校验。不要把只有域名证书的原站点直接改写成 `https://IP`。
 - HTTP 入口必须支持 WebSocket 的 `Upgrade`/`Connection` 头，并将 `/api/agent/ws` 转发到发放 Token 的原 Hub。普通网页能通过 IP 打开，不等于 Agent 接口已配置正确。
-- 如以后要使用 Web Terminal 或加密上报，可以采用证书包含该 IP 且受 Agent 信任的 HTTPS IP 入口，或通过可达 IP 建立 SSH/VPN 加密通道。Cagent v1.1.3 使用内置 WebPKI 根证书，没有自定义 CA 文件参数。
+- 如以后要使用 Web Terminal 或加密上报，可以采用证书包含该 IP 且受 Agent 信任的 HTTPS IP 入口，或通过可达 IP 建立 SSH/VPN 加密通道。Cagent v1.2.1 使用内置 WebPKI 根证书，没有自定义 CA 文件参数。
 - 不需要为本方案修改 hosts。hosts 只改变解析，不能保证解决域名/SNI 受限的问题。
 
 本流程中 GitHub 只用于联网电脑准备安装文件；目标机器运行时通过配置的 IP 和端口连接原 Hub。
 
-配置依据：本仓库 `install.sh`、`agent.pin`、`src/agent_ws.rs`，以及对应 Cagent v1.1.3 的参数、环境变量和连接实现。示例尚未在你的目标机器上执行，实际连接按第 8 节验收。
+配置依据：本仓库 `install.sh`、`agent.pin`、`src/agent_ws.rs`，以及对应 Cagent v1.2.1 的参数、环境变量和连接实现。示例尚未在你的目标机器上执行，实际连接按第 8 节验收。
 
 ## 10. 宝塔 Nginx：IP 入口只允许 Agent 连接
 

@@ -202,6 +202,7 @@ fn node_view(
         view["muted_until"] = json!(node.muted_until);
         view["website"] = json!(node.website);
         view["terminal_capable"] = json!(current.is_some_and(|a| a.terminal_enabled));
+        view["terminal_reason"] = json!(current.map(|a| a.terminal_reason.as_str()).unwrap_or("offline"));
         view["network_interfaces"] = json!(current.map(|a| &a.network_interfaces));
     }
     view
@@ -644,6 +645,14 @@ fn normalize_website(website: &mut String) -> Option<&'static str> {
     }
     *website = url.to_string();
     None
+}
+
+/// Lightweight unauthenticated probe for an external monitor. It does not expose
+/// node names, credentials, or settings, and succeeds only while the Hub can
+/// answer requests and read its database.
+pub async fn healthz(State(app): State<Shared>) -> impl IntoResponse {
+    let online = app.agents.read().unwrap_or_else(|e| e.into_inner()).len();
+    (StatusCode::OK, Json(json!({ "status": "ok", "online_nodes": online })))
 }
 
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {

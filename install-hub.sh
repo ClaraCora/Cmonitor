@@ -183,16 +183,17 @@ install_hub() {
 	[ "$got" = "$want" ] || die "校验不通过，已丢弃下载的文件。期望 $want，实得 $got"
 	ok "校验" "sha256 一致"
 
-	# Keep the old binary until the new one has proved it starts: a failed upgrade
-	# must leave a running hub rather than a dead service.
+	# Keep a complete rollback point until the new process and API both pass
+	# health checks. Database and theme files belong to the same Hub release.
+	rollback_dir="$(mktemp -d "$ROOT/.hub-upgrade.XXXXXX")"
 	backup=""
-	if [ -f "$BIN" ]; then
-		backup="$BIN.old"
-		# Never over an existing backup. A run that died between the install below
-		# and the health check left $BIN holding a binary that never proved it
-		# starts; copying that over the good backup would make the rollback restore
-		# the same broken binary while reporting success.
-		[ -f "$backup" ] || cp -f "$BIN" "$backup"
+	if [ -f "$BIN" ]; then cp -p "$BIN" "$rollback_dir/monitor-hub"; backup="$rollback_dir/monitor-hub"; fi
+	[ -f "$UNIT" ] && cp -p "$UNIT" "$rollback_dir/monitor-hub.service" || true
+	if [ -d "$DATA/themes" ]; then cp -a "$DATA/themes" "$rollback_dir/themes"; fi
+	if [ -f "$DATA/monitor.db" ]; then
+		[ -x "$ROOT/backup.py" ] || [ -f "$ROOT/backup.py" ] || die "升级前找不到数据库备份脚本"
+		python3 "$ROOT/backup.py" --db "$DATA/monitor.db" --directory "$rollback_dir/db" --keep 1 --hub "$BIN" >/dev/null ||
+			die "升级前数据库备份失败，已保留现场：$rollback_dir"
 	fi
 	# Stopped first so the copy does not land beneath a live process.
 	systemctl stop "$SERVICE" 2>/dev/null || true
@@ -246,18 +247,28 @@ UNIT
 	# binary that just failed.
 	systemctl restart "$SERVICE" || true
 	# is-active answers before a unit that exits immediately has done so, and the
-	# first run also computes an argon2 hash. Wait, then query.
+	# first run also computes an argon2 hash. Wait, then query the local API too.
 	sleep 3
-	if ! systemctl is-active --quiet "$SERVICE"; then
+	if ! systemctl is-active --quiet "$SERVICE" || ! curl -fsS --max-time 5 "http://127.0.0.1:$PORT/api/me" >/dev/null; then
 		if [ -n "$backup" ]; then
-			install -m 0755 "$backup" "$BIN"
-			rm -f "$backup"
+			install -m 0755 "$rollback_dir/monitor-hub" "$BIN"
+			[ -f "$rollback_dir/monitor-hub.service" ] && install -m 0644 "$rollback_dir/monitor-hub.service" "$UNIT"
+			if [ -d "$rollback_dir/db" ]; then
+				restore_db="$(find "$rollback_dir/db" -name '*.db' -type f -print -quit)"
+				if [ -n "$restore_db" ]; then cp -p "$restore_db" "$DATA/monitor.db"; rm -f "$DATA/monitor.db-wal" "$DATA/monitor.db-shm"; fi
+			fi
+			if [ -d "$rollback_dir/themes" ]; then rm -rf "$DATA/themes"; cp -a "$rollback_dir/themes" "$DATA/themes"; fi
+			systemctl daemon-reload
 			systemctl restart "$SERVICE" 2>/dev/null || true
-			die "新版本没能启动，已回滚到上一版。日志：journalctl -u $SERVICE -n 50"
+			sleep 3
+			if systemctl is-active --quiet "$SERVICE" && curl -fsS --max-time 5 "http://127.0.0.1:$PORT/api/me" >/dev/null; then
+				die "新版本健康检查失败，已恢复旧版本。回滚现场保留在 $rollback_dir"
+			fi
+			die "新版本和旧版本都未通过健康检查，现场保留在 $rollback_dir"
 		fi
-		die "服务启动失败。日志：journalctl -u $SERVICE -n 50"
+		die "服务启动或 API 健康检查失败，现场保留在 $rollback_dir"
 	fi
-	rm -f "$BIN.old"
+	rm -rf "$rollback_dir"
 	ok "服务" "已启动并开机自启"
 
 	if [ -n "$first" ]; then done_title="安装完成"; else done_title="升级完成"; fi
