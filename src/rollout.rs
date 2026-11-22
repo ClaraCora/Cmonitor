@@ -1,4 +1,4 @@
-//! Each batch has one outstanding node. A worker may only obtain the Hub's pin.
+//! Verify the first node before releasing the rest of the selection together.
 //! Success comes from the authenticated monitoring socket, never the updater.
 use crate::{agent_ws::bearer, api::Admin, App, Shared};
 use axum::{
@@ -60,9 +60,18 @@ fn fleet(app: &App) -> Fleet {
 fn target() -> String {
     crate::agent_pin().tag.trim_start_matches('v').to_owned()
 }
-fn stop(tx: &Transaction, id: i64, reason: &str) -> rusqlite::Result<()> {
-    tx.execute("UPDATE upgrade_item SET status=CASE WHEN status='queued' THEN 'skipped' ELSE 'failed' END WHERE batch=? AND status IN ('ready','waiting','installing','observing','queued')",[id])?;
-    tx.execute("UPDATE upgrade_batch SET status='stopped',reason=? WHERE id=?", (reason, id))?;
+/// Revoke work up to the worker's apply gate. Nodes already authorised to
+/// replace the binary must still be able to report their individual outcomes.
+fn fail_item(tx: &Transaction, batch: i64, node: i64, reason: &str) -> rusqlite::Result<()> {
+    tx.execute("UPDATE upgrade_item SET status='failed' WHERE batch=? AND node=?", (batch, node))?;
+    tx.execute(
+        "UPDATE upgrade_batch SET reason=? WHERE id=? AND reason=''",
+        (format!("节点 #{node} · {reason}"), batch),
+    )?;
+    tx.execute(
+        "UPDATE upgrade_item SET status='skipped' WHERE batch=? AND status IN ('queued','ready','waiting')",
+        [batch],
+    )?;
     Ok(())
 }
 /// Called inside the same transaction as every claim. A restored DB or a new
@@ -75,40 +84,50 @@ fn advance(tx: &Transaction, f: &Fleet, now: i64) -> rusqlite::Result<()> {
         .optional()?;
     let Some((id, epoch, target)) = active else { return Ok(()) };
     if epoch != *EPOCH {
-        return stop(tx, id, "Hub 已重启，请重新选择尚未升级的节点");
+        tx.execute("UPDATE upgrade_item SET status=CASE WHEN status IN ('installing','observing') THEN 'unconfirmed' ELSE 'skipped' END WHERE batch=? AND status IN ('queued','ready','waiting','installing','observing')", [id])?;
+        tx.execute(
+            "UPDATE upgrade_batch SET status='stopped',reason='Hub 已重启，请核对节点版本后重试' WHERE id=?",
+            [id],
+        )?;
+        return Ok(());
     }
-    let item=tx.query_row("SELECT node,status,previous_session,deadline FROM upgrade_item WHERE batch=? AND status IN ('ready','waiting','installing','observing')",[id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?))).optional()?;
-    if let Some((node, state, old, end)) = item {
-        if now >= end {
-            return stop(tx, id, "等待领取或新版上报超时");
-        }
-        if state != "observing"
-            || !f
-                .get(&node)
-                .is_some_and(|(s, l)| l.tls && s.to_string() != old && l.reported && l.version == target)
+    let mut stmt = tx.prepare("SELECT node,status,previous_session,deadline FROM upgrade_item WHERE batch=? AND status IN ('ready','waiting','installing','observing') ORDER BY pos")?;
+    let mut rows = stmt.query([id])?;
+    let mut expired = Vec::new();
+    let mut verified = Vec::new();
+    while let Some(row) = rows.next()? {
+        let node: i64 = row.get(0)?;
+        let state: String = row.get(1)?;
+        let old: String = row.get(2)?;
+        if now >= row.get::<_, i64>(3)? {
+            expired.push(node);
+        } else if state == "observing"
+            && f.get(&node).is_some_and(|(session, live)| {
+                live.tls && session.to_string() != old && live.reported && live.version == target
+            })
         {
-            return Ok(());
+            verified.push(node);
         }
+    }
+    for node in verified {
         tx.execute("UPDATE upgrade_item SET status='verified' WHERE batch=? AND node=?", (id, node))?;
     }
-    let next = tx
-        .query_row(
-            "SELECT node FROM upgrade_item WHERE batch=? AND status='queued' ORDER BY pos LIMIT 1",
-            [id],
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()?;
-    if let Some(node) = next {
-        if !f.get(&node).is_some_and(|(_, l)| l.eligibility(&target, now) == "ready") {
-            return stop(tx, id, "下一台节点已离线、版本变化或升级器未就绪");
-        }
-        tx.execute(
-            "UPDATE upgrade_item SET status='ready',deadline=? WHERE batch=? AND node=?",
-            (now + TIMEOUT, id, node),
-        )?;
-    } else {
-        tx.execute("UPDATE upgrade_batch SET status='done' WHERE id=?", [id])?;
+    for node in expired {
+        fail_item(tx, id, node, "等待领取或新版上报超时")?;
     }
+    // All followers become claimable in the same transaction. Poll and apply
+    // re-check each node's current identity, transport, and eligibility.
+    tx.execute(
+        "UPDATE upgrade_item SET status='ready',deadline=? WHERE batch=? AND status='queued'
+        AND EXISTS (SELECT 1 FROM upgrade_item WHERE batch=? AND pos=0 AND status='verified')",
+        (now + TIMEOUT, id, id),
+    )?;
+    finish_if_settled(tx, id)?;
+    Ok(())
+}
+fn finish_if_settled(tx: &Transaction, id: i64) -> rusqlite::Result<()> {
+    tx.execute("UPDATE upgrade_batch SET status=CASE WHEN reason='' THEN 'done' ELSE 'stopped' END WHERE id=?
+        AND NOT EXISTS (SELECT 1 FROM upgrade_item WHERE batch=? AND status IN ('queued','ready','waiting','installing','observing'))", (id, id))?;
     Ok(())
 }
 #[derive(Deserialize)]
@@ -146,7 +165,10 @@ fn create(app: &App, ids: &[i64], f: &Fleet, now: i64) -> rusqlite::Result<Respo
     for (pos, node) in ids.iter().enumerate() {
         tx.execute("INSERT INTO upgrade_item(batch,pos,node) VALUES(?,?,?)", (id, pos as i64, node))?;
     }
-    advance(&tx, f, now)?;
+    tx.execute(
+        "UPDATE upgrade_item SET status='ready',deadline=? WHERE batch=? AND pos=0",
+        (now + TIMEOUT, id),
+    )?;
     tx.commit()?;
     Ok(Json(json!({"id":id})).into_response())
 }
@@ -239,7 +261,8 @@ fn process(app: &App, node: i64, input: Poll, now: i64) -> rusqlite::Result<Valu
                     Some("restart") => "新服务启动失败，已尝试恢复旧程序",
                     _ => "节点升级器报告失败，请检查节点日志",
                 };
-                stop(&tx, id, reason)?;
+                fail_item(&tx, id, node, reason)?;
+                finish_if_settled(&tx, id)?;
             }
             _ => {}
         }
@@ -350,6 +373,64 @@ mod tests {
                 "skipped"
             );
         }
+    }
+    fn start_with_verified_canary(count: i64) -> App {
+        let app = fixture();
+        let ids: Vec<_> = (1..=count).collect();
+        for &id in &ids {
+            node(&app, id, id as u64, "1.0.0", true, true);
+        }
+        assert_eq!(create(&app, &ids, &fleet(&app), NOW).unwrap().status(), 200);
+        poll(&app, 1, "poll", None, NOW);
+        poll(&app, 1, "apply", Some(1), NOW);
+        poll(&app, 1, "installed", Some(1), NOW);
+        node(&app, 1, 1001, &target(), true, true);
+        app
+    }
+    fn snapshot(app: &App) -> (String, Vec<String>) {
+        let db = app.db.conn();
+        let status = db.query_row("SELECT status FROM upgrade_batch", [], |r| r.get(0)).unwrap();
+        let mut query = db.prepare("SELECT status FROM upgrade_item ORDER BY pos").unwrap();
+        let items = query.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        (status, items)
+    }
+    #[test]
+    fn nineteen_followers_can_apply_before_any_one_finishes() {
+        let app = start_with_verified_canary(20);
+        for id in 2..=20 {
+            assert_eq!(poll(&app, id, "poll", None, NOW)["batch"], 1);
+            assert_eq!(poll(&app, id, "apply", Some(1), NOW)["batch"], 1);
+        }
+        assert!(snapshot(&app).1[1..].iter().all(|status| status == "installing"));
+        for id in (2..=20).rev() {
+            poll(&app, id, "installed", Some(1), NOW);
+            node(&app, id, 1000 + id as u64, &target(), true, true);
+            poll(&app, id, "poll", None, NOW);
+            assert_eq!(snapshot(&app).0, if id == 2 { "done" } else { "running" });
+        }
+        assert!(snapshot(&app).1.iter().all(|status| status == "verified"));
+    }
+    #[test]
+    fn failure_revokes_unapproved_work_but_drains_already_approved_siblings() {
+        let app = start_with_verified_canary(6);
+        for id in 2..=5 {
+            poll(&app, id, "poll", None, NOW);
+        }
+        for id in [2, 3, 4] {
+            poll(&app, id, "apply", Some(1), NOW);
+        }
+        poll(&app, 4, "installed", Some(1), NOW);
+        poll(&app, 2, "failed", Some(1), NOW);
+        assert_eq!(snapshot(&app).1, ["verified", "failed", "installing", "observing", "skipped", "skipped"]);
+        assert!(poll(&app, 5, "apply", Some(1), NOW).is_null());
+        assert!(poll(&app, 6, "poll", None, NOW).is_null());
+        assert_eq!(create(&app, &[6], &fleet(&app), NOW).unwrap().status(), 409);
+        node(&app, 4, 1004, &target(), true, true);
+        poll(&app, 4, "poll", None, NOW + 1);
+        poll(&app, 3, "poll", None, NOW + TIMEOUT);
+        let (status, items) = snapshot(&app);
+        assert_eq!(status, "stopped");
+        assert_eq!(items, ["verified", "failed", "failed", "verified", "skipped", "skipped"]);
     }
     #[test]
     fn selecting_http_offline_current_unenrolled_or_duplicates_rejects_the_entire_batch() {

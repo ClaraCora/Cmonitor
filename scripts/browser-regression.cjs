@@ -9,7 +9,7 @@ const dist = path.resolve(process.env.UX_DIST || path.join(__dirname, '../web-ad
 const output = path.resolve(process.env.UX_OUTPUT || path.join(__dirname, '../target/ux-evidence'))
 
 const metric = { uptime: 1000, cpu: 5, load: [0, 0, 0], mem_total: 1024, mem_used: 128, swap_total: 0, swap_used: 0, disk_total: 2048, disk_used: 256, net_rx: 10, net_tx: 20, total_rx: 1000, total_tx: 2000, month_rx: 100, month_tx: 200, tcp: 3, udp: 1, procs: 10 }
-const nodes = [1, 2].map(id => ({ id, name: `测试节点 ${id}`, sort: id, public: true, online: true, country: 'SG', last_seen: Math.floor(Date.now()/1000), metrics: metric, hostname: 'fixture', ip: `198.51.100.${id}`, ipv4: '', ipv6: '', os: 'Linux', kernel: '', arch: 'x86_64', virt: 'kvm', cpu_name: 'Test CPU', cpu_cores: 2, mem_total: 1024, swap_total: 0, disk_total: 2048, agent_version: '1.2.0', price: 5, currency: 'USD', billing_cycle: 'monthly', expires_at: '2026-12-10', permanent: false, traffic_limit: 1024**3, traffic_mode: 'sum', traffic_reset_day: 1, total_rx: 1000, total_tx: 2000, month_rx: 100, month_tx: 200, month_start: '2026-11-01', day_rx: 10, day_tx: 20, traffic_incomplete: false, token: 'fixture-only', notify: true, muted_until: 0, remark: '', tags: '', website: 'https://example.com', pings: [{id: 1, name: '测试探测', latency: 20, updated_at: Math.floor(Date.now()/1000), samples: [20,21,19]}] }))
+const nodes = (mode === 'admin' ? [1, 2, 3, 4] : [1, 2]).map(id => ({ id, name: `测试节点 ${id}`, sort: id, public: true, online: true, country: 'SG', last_seen: Math.floor(Date.now()/1000), metrics: metric, hostname: 'fixture', ip: `198.51.100.${id}`, ipv4: '', ipv6: '', os: 'Linux', kernel: '', arch: 'x86_64', virt: 'kvm', cpu_name: 'Test CPU', cpu_cores: 2, mem_total: 1024, swap_total: 0, disk_total: 2048, agent_version: '1.2.0', price: 5, currency: 'USD', billing_cycle: 'monthly', expires_at: '2026-12-10', permanent: false, traffic_limit: 1024**3, traffic_mode: 'sum', traffic_reset_day: 1, total_rx: 1000, total_tx: 2000, month_rx: 100, month_tx: 200, month_start: '2026-11-01', day_rx: 10, day_tx: 20, traffic_incomplete: false, token: 'fixture-only', notify: true, muted_until: 0, remark: '', tags: '', website: 'https://example.com', pings: [{id: 1, name: '测试探测', latency: 20, updated_at: Math.floor(Date.now()/1000), samples: [20,21,19]}] }))
 const settings = { site_name: 'Monitor', retention_days: '7', public_page: 'on', visitor_card: 'on', notify_grace: '3', notify_traffic: '80', notify_expiry: '7', notify_disk_percent: '90', notify_disk_minutes: '10', notify_ping_failures: '3', notify_cooldown: '60', notify_login: 'on', notify_telegram_chat: '', notify_telegram_text: '{{title}}', notify_webhook_body: '{"text":"{{message}}"}', password_login: 'on' }
 const me = { authed: true, github: false, password_login: true, hub_version: 'test', site_name: 'Monitor', public_page: true, site: 'https://monitor.example.com', can_provision: true, admin_url: '/clara/nodes', visitor_card: true }
 
@@ -35,7 +35,7 @@ async function main() {
     await context.route('**/api/**', async route => {
       const req = route.request(), pathname = new URL(req.url()).pathname
       const fail = body => route.fulfill({status:503,body})
-      if (pathname === '/api/agent-upgrades' && req.method()==='GET') return route.fulfill({json:{target:'1.2.1',nodes:{1:'ready',2:'plaintext'},batch:null}})
+      if (pathname === '/api/agent-upgrades' && req.method()==='GET') return route.fulfill({json:{target:'1.2.1',nodes:{1:'ready',2:'plaintext',3:'ready',4:'ready'},batch:null}})
       if (outage && pathname === '/api/nodes') return fail('模拟网络中断')
       if (settingsFail && pathname === '/api/settings') return fail('模拟设置加载失败')
       if (pingFail && pathname === '/api/ping-tasks') return fail('模拟探测加载失败')
@@ -93,13 +93,15 @@ async function main() {
       await page.getByRole('button',{name:'升级 Agent',exact:true}).click()
       const picker=page.getByRole('dialog'); await picker.getByRole('checkbox').first().waitFor()
       assert(await picker.getByRole('checkbox').nth(1).isDisabled(),'HTTP node cannot be selected')
-      await picker.getByRole('checkbox').first().check()
-      await picker.getByText('首台验证：测试节点 1').waitFor()
+      await picker.getByRole('checkbox').nth(3).check()
+      await picker.getByRole('button',{name:'全选可升级节点'}).click()
+      await picker.getByText('首台验证：测试节点 4').waitFor()
+      assert.equal(await picker.getByRole('checkbox',{checked:true}).count(),3)
       await page.screenshot({animations:'disabled',path:path.join(output,'rollout-desktop.png')})
       await page.setViewportSize({width:390,height:844})
       await page.screenshot({animations:'disabled',path:path.join(output,'rollout-mobile.png')})
-      await picker.getByRole('button',{name:'开始升级（1 台）'}).click()
-      assert.deepEqual(JSON.parse(writes.find(w=>w.pathname==='/api/agent-upgrades').body),{nodes:[1]})
+      await picker.getByRole('button',{name:'开始升级（3 台）'}).click()
+      assert.deepEqual(JSON.parse(writes.find(w=>w.pathname==='/api/agent-upgrades').body),{nodes:[4,1,3]})
       await page.keyboard.press('Escape');await page.setViewportSize({width:1440,height:1000})
       await page.getByRole('button',{name:'编辑节点',exact:true}).first().click()
       const dialog=page.getByRole('dialog')
