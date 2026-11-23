@@ -136,6 +136,7 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 /// Where the agent binaries are published. Not a setting: redirecting it
 /// implies a fork, which rebuilds this line anyway.
 const AGENT_REPO: &str = "ClaraCora/Cagent";
+const AGENT_UPDATER: &str = include_str!("../deploy/agent-updater.py");
 
 #[derive(serde::Deserialize)]
 struct AgentPin {
@@ -466,13 +467,9 @@ async fn main() -> Result<()> {
         .route("/install.sh", get(install_script))
         .route(
             "/agent-updater.py",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                    include_str!("../deploy/agent-updater.py"),
-                )
-            }),
+            get(|| async { ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], AGENT_UPDATER) }),
         )
+        .route("/agent-updater.py/sha256", get(|| async { auth::sha256(AGENT_UPDATER) }))
         .route("/api/agent/upgrade", post(rollout::poll))
         .route("/api/agent-upgrades", get(rollout::status).post(rollout::start))
         .route("/agent/{arch}", get(agent_binary))

@@ -176,6 +176,7 @@ function CreateNode({ onClose, onSaved }: {
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>添加节点</DialogTitle>
+          <DialogDescription>添加后，在节点的「安装 Agent」中复制命令。新装的 HTTPS 节点默认启用升级器 v2。</DialogDescription>
         </DialogHeader>
         <form className="space-y-4" onSubmit={save}>
           <Field label="名称">
@@ -469,22 +470,31 @@ function BillingForm({ node, onClose, onSaved }: {
 // Built here rather than fetched: the node list already carries the token, so
 // viewing an install command is a read rather than an action. Reissuing one to
 // display it would take the running agent offline.
-function installCommand(site: string, token: string, seconds: number) {
+function installCommand(site: string, token: string, seconds: number, skipUpdater: boolean) {
   site = provisioningSite(site)
   if (!site) return ""
   const args = [`--server ${site}`, `--token ${token}`, `--interval ${seconds}`]
-  return `curl -fsSL ${site}/install.sh | sh -s -- ${args.join(" ")}`
+  if (skipUpdater) args.push("--no-updater")
+  return `curl --proto '=https' -fsS ${site}/install.sh | sh -s -- ${args.join(" ")}`
 }
 
 // One command for a batch of machines. The key belongs to the hub, is valid only
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
 // used directly in a loop.
-function registerCommand(site: string, key: string) {
+function registerCommand(site: string, key: string, skipUpdater: boolean) {
   site = provisioningSite(site)
   if (!site) return ""
   const args = [`--server ${site}`, `--register ${key}`]
-  return `curl -fsSL ${site}/install.sh | sh -s -- ${args.join(" ")}`
+  if (skipUpdater) args.push("--no-updater")
+  return `curl --proto '=https' -fsS ${site}/install.sh | sh -s -- ${args.join(" ")}`
+}
+
+function UpdaterOption({ skip, onChange }: { skip: boolean; onChange: (value: boolean) => void }) {
+  return <div className="space-y-2 text-sm">
+    <p className="text-muted-foreground">新装的 HTTPS 节点默认启用升级器 v2。之后可在后台发起 Agent 升级。</p>
+    <label className="flex items-center gap-2"><input type="checkbox" checked={skip} onChange={event => onChange(event.target.checked)} />本次跳过升级器安装</label>
+  </div>
 }
 
 // The window lives on the hub; this reads it back and counts down, which is also
@@ -532,7 +542,8 @@ function RegisterDialog({ site, reg, onClose }: {
   reg: ReturnType<typeof useRegisterWindow>
   onClose: () => void
 }) {
-  const command = reg.left > 0 ? registerCommand(site, reg.key) : ""
+  const [skipUpdater, setSkipUpdater] = useState(false)
+  const command = reg.left > 0 ? registerCommand(site, reg.key, skipUpdater) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -543,11 +554,11 @@ function RegisterDialog({ site, reg, onClose }: {
         </DialogHeader>
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">
-            开一个一小时的注册窗口。期间这条命令在任意机器上跑一次，那台机器就会自己出现在
-            列表里，名字取自它的 hostname。命令里没有任何一台机器的凭证，可以直接进循环。
+            开启窗口后，在每台能访问 Hub HTTPS 域名的机器上以 root 执行同一条命令。每台机器以自己的主机名注册并取得独立凭证。仅能通过 HTTP 上报的机器请单独添加节点并离线安装。
           </p>
           {command ? (
             <div className="space-y-2">
+              <UpdaterOption skip={skipUpdater} onChange={setSkipUpdater} />
               <Label className="text-sm font-medium">安装命令</Label>
               <pre className="h-24 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
                 {command}
@@ -587,9 +598,11 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   const [interval, setInterval] = useState("1")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
+  const [skipUpdater, setSkipUpdater] = useState(false)
+  const [offline, setOffline] = useState(node.terminal_reason === "plaintext")
 
   const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
-  const command = token ? installCommand(site, token, seconds) : ""
+  const command = token ? installCommand(site, token, seconds, skipUpdater) : ""
 
   async function rotate() {
     setRotating(true)
@@ -597,7 +610,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
       const fresh = await api<{ token: string }>(`/nodes/${node.id}/token`, { method: "POST" })
       setToken(fresh.token)
       setConfirmRotate(false)
-      toast.success("凭证已换发，需用新命令重装")
+      toast.success("凭证已换发，请更新节点上的 Token")
       onRotated()
     } catch (e) {
       toast.error((e as Error).message)
@@ -613,22 +626,36 @@ function InstallDialog({ node, site, onClose, onRotated }: {
           <DialogTitle>{node.name}</DialogTitle>
         </DialogHeader>
         <div className="space-y-5">
-          <Field label="上报间隔（秒）" hint="1–3600，默认 1 秒">
-            <Input type="number" min={1} max={3600} value={interval} onChange={(e) => setInterval(e.target.value)} />
+          <Field label="安装方式">
+            <Select value={offline ? "offline" : "https"} onValueChange={value => setOffline(value === "offline")}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent><SelectItem value="https">HTTPS 在线安装</SelectItem><SelectItem value="offline">HTTP 上报 · 离线维护</SelectItem></SelectContent>
+            </Select>
           </Field>
-          <div className="space-y-2">
-            <Label className="text-sm font-medium">安装命令</Label>
-            <pre className="h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
-              {/* A node added before the hub kept tokens has nothing to show
-                  until one is reissued. */}
-              {command || "旧版本创建的凭证不可读取，换发后显示"}
-            </pre>
-          </div>
+          {offline ? <div className="space-y-3 text-sm">
+            <p>在联网设备下载并校验与 Hub 版本对应的离线包，传到目标机。已有节点解压后以 root 执行以下命令，沿用原 HTTP 地址、凭证和服务配置。</p>
+            <pre className="overflow-auto rounded-lg border bg-muted/40 p-3 text-xs select-all">sh ./install.sh --offline-dir .</pre>
+            <p>首次安装须使用本节点 Token 配置 HTTP 地址和服务。<a href="https://github.com/ClaraCora/Cmonitor/blob/main/OFFLINE_DEPLOY.md" target="_blank" rel="noreferrer" className="text-primary underline">查看离线安装步骤</a></p>
+            {token && <Button variant="outline" size="sm" onClick={() => copy(token)}>复制节点 Token</Button>}
+          </div> : <>
+            <Field label="上报间隔（秒）" hint="1–3600，默认 1 秒">
+              <Input type="number" min={1} max={3600} value={interval} onChange={(e) => setInterval(e.target.value)} />
+            </Field>
+            <UpdaterOption skip={skipUpdater} onChange={setSkipUpdater} />
+            <div className="space-y-2">
+              <Label className="text-sm font-medium">安装命令</Label>
+              <pre className="h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
+                {/* A node added before the hub kept tokens has nothing to show
+                    until one is reissued. */}
+                {command || "旧版本创建的凭证不可读取，换发后显示"}
+              </pre>
+            </div>
+          </>}
           <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
             <span>
               <span className="block font-medium">换发凭证</span>
               <span className="mt-0.5 block text-xs text-muted-foreground">
-                旧凭证立即作废，agent 掉线，需用新命令重装
+                旧凭证立即作废，节点需要使用新 Token 才能恢复上报
               </span>
             </span>
             <Button variant="outline" size="sm" disabled={rotating} onClick={() => setConfirmRotate(true)}>
@@ -638,15 +665,15 @@ function InstallDialog({ node, site, onClose, onRotated }: {
         </div>
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>关闭</Button>
-          <Button onClick={() => copy(command)} disabled={!command}>
-            <Copy className="size-4" /> 复制
+          <Button onClick={() => copy(offline ? "sh ./install.sh --offline-dir ." : command)} disabled={!offline && !command}>
+            <Copy className="size-4" /> {offline ? "复制离线升级命令" : "复制"}
           </Button>
         </DialogFooter>
       </DialogContent>
       {confirmRotate && (
         <ConfirmDialog
           title={`给「${node.name}」换发凭证？`}
-          description="旧凭证立即作废，agent 掉线，必须用新命令重装。仅在凭证可能泄露时使用。"
+          description="旧凭证立即作废，节点需要更新 Token 后才能恢复上报。"
           confirmLabel="换发凭证"
           busy={rotating}
           onClose={() => setConfirmRotate(false)}
@@ -757,7 +784,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
-        <AgentRollout nodes={nodes} />
+        <AgentRollout nodes={nodes} site={site} />
         {/* An open window is visible from the list itself, so nobody has to
             remember they left one open. */}
         <Button variant="outline" disabled={!canProvision} onClick={() => setRegistering(true)}>

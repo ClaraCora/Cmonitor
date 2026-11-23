@@ -19,6 +19,9 @@ INTERVAL=""
 INSECURE=""
 OFFLINE=""
 ALLOW_DOWNGRADE=""
+SKIP_UPDATER=""
+UPDATER_ONLY=""
+ARG_COUNT=$#
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
@@ -34,10 +37,13 @@ while [ $# -gt 0 ]; do
 	--interval) INTERVAL="$2"; shift 2 ;;
 	--offline-dir) OFFLINE="$2"; shift 2 ;;
 	--allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
+	--no-updater) SKIP_UPDATER=1; shift ;;
+	--updater-only) UPDATER_ONLY=1; shift ;;
 	--insecure) INSECURE=1; shift ;;
 	*) echo "unknown option: $1" >&2; exit 2 ;;
 	esac
 done
+[ -z "$UPDATER_ONLY" ] || [ "$ARG_COUNT" -eq 1 ] || { echo "--updater-only must be used on its own" >&2; exit 2; }
 [ -z "$ALLOW_DOWNGRADE" ] || [ -n "$OFFLINE" ] || { echo "--allow-downgrade requires --offline-dir" >&2; exit 2; }
 
 # An offline update with no connection arguments only replaces the executable.
@@ -45,6 +51,12 @@ done
 SYSTEM_UNIT=/etc/systemd/system/monitor-agent.service
 OPENRC_UNIT=/etc/init.d/monitor-agent
 if [ -f "$SYSTEM_UNIT" ]; then EXISTING=$SYSTEM_UNIT; else EXISTING=$OPENRC_UNIT; fi
+# Existing installs keep the administrator's maintenance policy, including
+# an updater timer that was deliberately stopped.
+if [ -f "$BIN" ] || [ -f "$EXISTING" ] || [ -f "$ENV_FILE" ]; then SKIP_UPDATER=1; fi
+if [ -n "$UPDATER_ONLY" ] && { [ ! -f "$EXISTING" ] || [ ! -f "$BIN" ] || [ ! -r "$ENV_FILE" ]; }; then
+	echo "--updater-only requires an installed Agent" >&2; exit 1
+fi
 saved_server=$(sed -n 's/^MONITOR_SERVER=//p' "$ENV_FILE" 2>/dev/null || true)
 keep_unit=""
 if [ -z "$SERVER$TOKEN$REGISTER$INTERVAL$INSECURE" ] && [ -f "$EXISTING" ] && [ -f "$BIN" ]; then
@@ -58,7 +70,7 @@ fi
 INTERVAL=${INTERVAL:-1}
 if [ "$SERVER" = "$saved_server" ] && [ -f "$EXISTING" ] && grep -Eq '^(ExecStart|command_args)=.* --insecure([^[:alnum:]_-]|$)' "$EXISTING"; then INSECURE=1; fi
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
-	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--insecure]" >&2
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--insecure] [--no-updater], or install.sh --updater-only" >&2
 	exit 2
 }
 case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3600" >&2; exit 2 ;; esac
@@ -135,6 +147,73 @@ elif command -v rc-update >/dev/null; then
 else
 	echo "this installer needs systemd or OpenRC" >&2
 	exit 1
+fi
+
+# Keep the interpreter used by the service identical to the one that passed
+# this check (some distributions install a newer Python alongside /usr/bin/python3).
+find_python() {
+	for name in python3 python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python3.8; do
+		interpreter=$(command -v "$name") || continue
+		if "$interpreter" -I -c 'import fcntl, ssl, sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
+			printf '%s\n' "$interpreter"
+			return 0
+		fi
+	done
+	return 1
+}
+
+install_python() {
+	if command -v apt-get >/dev/null 2>&1; then
+		DEBIAN_FRONTEND=noninteractive apt-get update &&
+			DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3
+	elif command -v apk >/dev/null 2>&1; then
+		apk add --no-cache python3
+	elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+		if command -v dnf >/dev/null 2>&1; then rpm_tool=dnf; else rpm_tool=yum; fi
+		"$rpm_tool" -y install python3 && find_python >/dev/null && return 0
+		# Enterprise Linux 8 ships an older default and packages a parallel Python.
+		"$rpm_tool" -y install python3.11
+	elif command -v zypper >/dev/null 2>&1; then
+		zypper --non-interactive install python3 && find_python >/dev/null && return 0
+		zypper --non-interactive install python311
+	elif command -v pacman >/dev/null 2>&1; then
+		pacman -S --needed --noconfirm python
+	else
+		echo "install Python 3.8 or later using the distribution package manager" >&2
+		return 1
+	fi
+}
+
+enable_updater() (
+	case "$SERVER" in https://*) ;; *) echo "the updater requires an HTTPS Agent connection" >&2; return 1 ;; esac
+	[ -z "$INSECURE" ] || { echo "the updater requires a secure Agent service" >&2; return 1; }
+	case "$SERVER" in *'?'* | *'#'* | *'\'*) echo "invalid Hub URL for the updater" >&2; return 1 ;; esac
+	command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum is required" >&2; return 1; }
+	if ! python=$(find_python); then
+		echo "installing Python 3.8 or later for the upgrade service"
+		install_python && python=$(find_python) || { echo "no usable Python 3.8+ with SSL support" >&2; return 1; }
+	fi
+	stage=$(mktemp -d "$ROOT/.agent-updater-install.XXXXXX") || return 1
+	trap 'rm -rf "$stage"' EXIT
+	trap 'exit 1' HUP INT TERM
+	url="${SERVER%/}/agent-updater.py"
+	# Neither resource takes a credential or a redirect. -q ignores an inherited
+	# curlrc that could otherwise relax TLS or follow another origin.
+	curl -q --proto '=https' -fsSL --max-redirs 0 --max-time 60 "$url" -o "$stage/worker.py" || return 1
+	expected=$(curl -q --proto '=https' -fsSL --max-redirs 0 --max-time 30 "$url/sha256") || return 1
+	actual=$(sha256sum "$stage/worker.py") || return 1
+	actual=${actual%% *}
+	if [ "${#expected}" -ne 64 ] || [ "$actual" != "$expected" ]; then
+		echo "updater SHA-256 mismatch; refusing to execute the download" >&2
+		return 1
+	fi
+	"$python" -I "$stage/worker.py" enable || return 1
+	echo "monitor-agent updater enabled"
+)
+
+if [ -n "$UPDATER_ONLY" ]; then
+	enable_updater
+	exit $?
 fi
 
 case "$(uname -m)" in
@@ -257,6 +336,20 @@ finish_agent() {
 	else rm -rf "$UPGRADE_BACKUP"; fi
 	exit "$code"
 }
+finish_install() {
+	save_offline_previous
+	echo "$1"
+	# The agent and its identity are now healthy. A maintenance dependency
+	# failure must leave them available for a standalone --updater-only retry.
+	trap - EXIT HUP INT TERM
+	rm -f "$TMP"; rm -rf "$UPGRADE_BACKUP"
+	if [ -z "$SKIP_UPDATER$OFFLINE$INSECURE" ]; then
+		case "$SERVER" in
+		https://*) enable_updater || { echo "Agent already installed; retry install.sh --updater-only after correcting the error" >&2; exit 1; } ;;
+		esac
+	fi
+	exit 0
+}
 trap finish_agent EXIT; trap 'exit 1' HUP INT TERM
 if [ -f "$UNIT" ] && service_active >/dev/null 2>&1; then service_stop; fi
 mv -f "$UPGRADE_BACKUP/new-bin" "$BIN"
@@ -270,8 +363,7 @@ save_offline_previous() {
 }
 if [ -n "$keep_unit" ]; then
 	service_start && sleep 2 && service_active || exit 1
-	save_offline_previous
-	echo "updated binary; kept the existing service, credentials and reporting settings"; exit 0
+	finish_install "updated binary; kept the existing service, credentials and reporting settings"
 fi
 
 # Preserve every existing setting while replacing only the connection values.
@@ -291,8 +383,7 @@ mv -f "$ENV_TMP" "$ENV_FILE"
 
 if [ -n "$preserve_definition" ]; then
 	service_start && sleep 2 && service_active || exit 1
-	save_offline_previous
-	echo "updated agent and connection settings; existing service options retained"; exit 0
+	finish_install "updated agent and connection settings; existing service options retained"
 fi
 
 if [ "$INIT" = openrc ]; then
@@ -324,9 +415,7 @@ RC
 		echo "agent upgrade failed; starting recovery" >&2
 		exit 1
 	fi
-	save_offline_previous
-	echo "monitor-agent installed; follow it with: tail -f /var/log/monitor-agent.log"
-	exit 0
+	finish_install "monitor-agent installed; follow it with: tail -f /var/log/monitor-agent.log"
 fi
 
 cat >/etc/systemd/system/monitor-agent.service <<UNIT
@@ -363,5 +452,4 @@ if ! systemctl is-active --quiet monitor-agent; then
 	echo "agent did not remain active; starting recovery" >&2
 	exit 1
 fi
-save_offline_previous
-echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
+finish_install "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"

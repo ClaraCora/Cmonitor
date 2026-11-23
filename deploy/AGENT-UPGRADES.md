@@ -5,17 +5,16 @@
 ## 部署新版升级器
 
 1. 在没有运行中批次时升级 Hub。Hub 重启或恢复数据库会停止原批次，已经获准安装但还没有验证的节点显示「结果待核实」。
-2. 在要参与批量升级的 HTTPS 节点上安装或更新升级器。升级 Agent 二进制不会更新升级器。已启用旧升级器的节点也要重新执行下方命令，才能使用 v2 的回执重发和回滚授权。
+2. 新建 HTTPS 节点时，运行后台为单台节点生成的安装命令，或通过「批量添加」注册。两种方式默认安装 Agent 并启用 v2 升级器。需要单独维护 Agent 的机器可勾选「本次跳过升级器安装」，命令会带上 `--no-updater`。该选项只作用于本次安装，已有升级器的启用状态会保留。
 3. 节点通常每 30 秒轮询一次。更新后，打开「后台 → 节点 → 升级 Agent」，核对该节点显示「升级器 v2」，并检查最近心跳是否晚于本次更新。已达到目标 Agent 版本的节点也会显示升级器信息。有批次正在运行时，展开「查看各节点升级器」。显示「升级器协议未记录」时，Hub 还没有可用的协议记录。管理员也可从 `GET /api/agent-upgrades` 的 `workers` 按节点 ID 核对 `protocol` 和 `last_seen`。
 
-在已有 Agent 的 Linux 节点上以 root 执行下面的命令，把示例域名替换为该节点使用的 Hub HTTPS 域名。节点需要 Python 3.8 或以上、系统 CA、systemd 或 OpenRC。升级器沿用 `/opt/monitor/agent.env` 中的原地址及 Token。公网反代需要向 Hub 传递真实的 `Host` 和 `X-Forwarded-Proto`，包括 Agent 的 WebSocket 路径。
+要将已有 HTTPS 节点的旧升级器更新到 v2，或重新启用停用的升级器，在「升级 Agent」展开「在已有 HTTPS 节点上启用或修复升级器」，复制命令并在目标机以 root 执行。以下示例中的域名应替换为节点现用的 Hub HTTPS 域名。
 
 ```sh
-install -d -m 0700 /root/cmonitor-maintenance &&
-  cd /root/cmonitor-maintenance &&
-  curl --proto '=https' -fsS https://hub.example.com/agent-updater.py -o agent-updater.py &&
-  python3 -I agent-updater.py enable
+curl --proto '=https' -fsS https://hub.example.com/install.sh | sh -s -- --updater-only
 ```
+
+安装器按原 `/opt/monitor/agent.env` 中的 HTTPS 地址和 Token 安装升级器。节点需要系统 CA、Python 3.8 或以上，以及 systemd 或 OpenRC。缺少 Python 时，安装器会尝试使用系统包管理器补齐。若升级器未能启用，查看安装输出，解决依赖或网络问题后用 `--updater-only` 重试。普通重装保留手动停用的升级器状态。公网反代需要向 Hub 传递真实的 `Host` 和 `X-Forwarded-Proto`，包括 Agent 的 WebSocket 路径。
 
 **只能通过 HTTP 上报的节点继续离线升级。** 从与当前 Hub 对应的发布版本取得并校验离线包，搬到目标机，在解压后的目录运行 `sh ./install.sh --offline-dir .`。该命令沿用原 HTTP 地址、Token 和服务的 `--insecure` 参数。联网后在原节点核对版本和指标。[离线包获取、校验与回退](../OFFLINE_DEPLOY.md#已安装节点离线升级)
 

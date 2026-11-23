@@ -57,4 +57,4 @@ sudo /opt/monitor/monitor-hub --db /opt/monitor/data/monitor.db --reset-password
 - 将修复提交到 GitHub 后，可在 Actions 的 `ci` 工作流手动运行完整检查。`release` 的手动运行只构建二进制产物；创建 `v*` 标签才会发布二进制和容器。
 - 现有服务器应通过原有安装脚本的升级入口或更新已发布容器进行升级。同机其他 PHP/Node 服务需要分别升级其实际运行时，Hub 的更新不会替它们修复漏洞。
 
-从后台升级已启用的 HTTPS 节点，请参阅[分批升级 Agent](deploy/AGENT-UPGRADES.md)。
+新 HTTPS 节点通过后台的「安装 Agent」或「批量添加」命令安装后，默认启用 v2 升级器。管理员可在「升级 Agent」中查看升级器心跳并发起批次。已有节点可单独修复升级器。仅能通过 HTTP 上报的节点继续使用离线包维护。[分批升级 Agent](deploy/AGENT-UPGRADES.md) · [离线部署指南](OFFLINE_DEPLOY.md)

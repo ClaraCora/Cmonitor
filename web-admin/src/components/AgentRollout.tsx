@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Download } from 'lucide-react'
-import { api, ApiError, type Node } from '@/lib/api'
+import { api, ApiError, provisioningSite, type Node } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 
@@ -61,7 +61,7 @@ function BatchProgress({ batch, name }: { batch: Batch; name: (id: number) => st
   )
 }
 
-export function AgentRollout({ nodes }: { nodes: Node[] }) {
+export function AgentRollout({ nodes, site }: { nodes: Node[]; site: string }) {
   const [open, setOpen] = useState(false)
   const [state, setState] = useState<Overview | null>(null)
   const [fresh, setFresh] = useState(false)
@@ -104,6 +104,7 @@ export function AgentRollout({ nodes }: { nodes: Node[] }) {
     : []
   const selectionStale = chosen.some(id => !ready.has(id))
   const bulkCount = Math.min(eligible.length, maxBatchSize)
+  const updaterSite = provisioningSite(site)
   const canChoose = state && batch?.status !== 'running'
   function select(ids: number[]) {
     setChosen(ids)
@@ -189,11 +190,12 @@ export function AgentRollout({ nodes }: { nodes: Node[] }) {
               </label>
             })}
           </div>
-          {Object.values(state.nodes).includes('unenrolled') && <details className="pt-2 text-sm">
-            <summary className="cursor-pointer">如何启用节点升级器</summary>
-            <p className="mt-2">在已安装 Agent 的 HTTPS 节点上以 root 下载本 Hub 的 <code>/agent-updater.py</code>，运行 <code>python3 -I agent-updater.py enable</code>。首次心跳后即可勾选。</p>
-          </details>}
         </fieldset>}
+        {updaterSite && state && <details className="text-sm">
+          <summary className="cursor-pointer">在已有 HTTPS 节点上启用或修复升级器</summary>
+          <p className="mt-2 text-muted-foreground">在目标节点以 root 执行。安装器沿用原 Agent 的地址和 Token，只更新升级器。完成后核对本次操作后的 v2 心跳。</p>
+          <pre className="mt-2 whitespace-pre-wrap break-all rounded-lg border p-3 text-xs select-all">{`curl --proto '=https' -fsS ${updaterSite}/install.sh | sh -s -- --updater-only`}</pre>
+        </details>}
         {canChoose && <DialogFooter>
           <span className="mr-auto min-w-0 self-center text-sm [overflow-wrap:anywhere]">{chosen.length ? `首台验证：${name(chosen[0])}` : '先勾选要验证的首台节点'}</span>
           <Button disabled={!fresh || busy || !chosen.length || selectionStale} onClick={start}>

@@ -342,9 +342,12 @@ def once():
 
 def enable():
     connection()  # Refuse plaintext before installing any service or schedule.
-    python = shutil.which('python3', path='/usr/bin:/usr/local/bin:/bin')
-    if not python:
-        raise RuntimeError('python3 not installed')
+    # The installer can select a parallel distro interpreter on a host whose
+    # default python3 is too old. Persist the interpreter that actually ran enable.
+    python = str(Path(sys.executable).resolve(strict=True))
+    trusted(Path(python))
+    if not re.fullmatch(r'/[A-Za-z0-9_./+-]+', python):
+        raise ValueError('unsupported Python path for the service')
     with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
         dest = Path(tmp) / 'worker'
         shutil.copyfile(__file__, dest)
