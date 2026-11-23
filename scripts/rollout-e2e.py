@@ -93,9 +93,9 @@ class FixtureNode:
             assert url.startswith(PUBLIC + '/'), 'unexpected pairing origin'
             return network_fetch(LOCAL + url[len(PUBLIC):], *args)
 
-        def fixture_owner(info, private):
+        def fixture_owner(info, private, allow_hardlink=False):
             assert info.st_uid == os.geteuid(), 'unexpected fixture file owner'
-            check_file(SimpleNamespace(st_uid=0, st_mode=info.st_mode, st_nlink=info.st_nlink), private)
+            check_file(SimpleNamespace(st_uid=0, st_mode=info.st_mode, st_nlink=info.st_nlink), private, allow_hardlink=allow_hardlink)
 
         pair.fetch, pair.check_file = loopback_fetch, fixture_owner
         report = pair.local_identity(PUBLIC)
