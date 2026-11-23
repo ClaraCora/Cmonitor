@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the distributed shell installers with isolated paths and stub init systems."""
+import fcntl
 import hashlib
 import os
 import shlex
@@ -28,7 +29,21 @@ class Installers(unittest.TestCase):
         self.stub('id', 'echo 0')
         self.stub('sleep', ':')
         self.stub('uname', 'echo x86_64')
-        self.stub('sha256sum', shlex.quote(sys.executable) + ''' -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest()," ",sys.argv[1])' "$1"''')
+        # Model Linux root ownership on the developer host; preserve actual mode
+        # bits so an unsafe writable file is still rejected.
+        py = shlex.quote(sys.executable)
+        self.stub('stat', py + """ -c 'import os,stat,sys; print("0:%o" % stat.S_IMODE(os.lstat(sys.argv[1]).st_mode))' "$3" """)
+        self.stub('flock', py + """ -c 'import fcntl,sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)' "$2" """)
+        self.stub('sync', ':')
+        # Linux CI uses the platform implementations for checksums and flock.
+        if sys.platform == 'linux':
+            (self.tools / 'flock').unlink()
+            (self.tools / 'flock').symlink_to(shutil.which('flock'))
+        sha = shutil.which('sha256sum')
+        if sha:
+            (self.tools / 'sha256sum').symlink_to(sha)
+        else:
+            self.stub('sha256sum', 'exec ' + shlex.quote(shutil.which('shasum')) + ' -a 256 "$@"')
 
     def stub(self, name, script):
         p = self.tools / name
@@ -37,6 +52,8 @@ class Installers(unittest.TestCase):
 
     def installer(self, name, edits, args):
         s = (ROOT / name).read_text()
+        if name != 'install-hub.sh':
+            s = s.replace('PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'PATH="$PATH"')
         for old, new in edits:
             self.assertIn(old, s)
             s = s.replace(old, str(new))
@@ -88,7 +105,6 @@ class Installers(unittest.TestCase):
             ('/opt/monitor', self.root),
             ('/etc/systemd/system/monitor-agent.service', self.unit),
             ('/etc/init.d/monitor-agent', self.openrc),
-            ('PATH="$PATH:/usr/sbin:/sbin"', 'PATH="$PATH"'),
         ]
         service = 'echo "service $*" >> "$CALLS"'
         if openrc:
@@ -118,7 +134,7 @@ case "$url" in
   https://hub.example/agent-updater.py)
     [ ! -e "$FIXTURE/no-download" ] || exit 22
     if [ -e "$FIXTURE/corrupt" ]; then echo damaged > "$out"; else cp "$FIXTURE_WORKER" "$out"; fi;;
-  */api/agent/register) echo fixture-issued-token;;
+  */api/agent/register) if [ -f "$FIXTURE/registration" ]; then cat "$FIXTURE/registration"; else printf "%064d\\n" 1; fi;;
   *) echo "unexpected URL: $url" >&2; exit 1;;
 esac''')
         self.stub('python3', '''
@@ -150,7 +166,7 @@ esac''')
         proc = self.installer('install.sh', self.edits, command)
         self.assertEqual(proc.returncode == 0, success, proc.stderr + proc.stdout)
         self.assertEqual((self.root / 'monitor-agent').read_bytes(), self.image.read_bytes())
-        self.assertIn('MONITOR_TOKEN=' + ('fixture-issued-token' if register else 'fixture-token'),
+        self.assertIn('MONITOR_TOKEN=' + (f'{1:064d}' if register else 'fixture-token'),
                       (self.root / 'agent.env').read_text())
         return self.calls.read_text().splitlines(), proc.stdout + proc.stderr
 
@@ -218,7 +234,11 @@ esac''')
 
     def test_http_node_never_enrolls_or_installs_python(self):
         self.online_fixture(python=False, package_manager='apt-get')
-        calls, _ = self.install_online(args=['--insecure'], server='http://hub.example')
+        refused = self.installer('install.sh', self.edits, ['--server', 'http://hub.example', '--token', 'existing', '--insecure'])
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertFalse(self.calls.read_text())
+        self.assertFalse((self.root / 'monitor-agent').exists())
+        calls, _ = self.install_online(args=['--offline-dir', str(self.base), '--insecure'], server='http://hub.example')
         self.assertIn('--insecure', self.unit.read_text())
         self.assertFalse(any(c.startswith('package ') or 'agent-updater' in c for c in calls))
         self.calls.write_text('')
@@ -252,6 +272,185 @@ esac''')
         self.online_fixture(python=False, package_manager='apt-get')
         calls, _ = self.install_online(args=['--offline-dir', str(self.base)])
         self.assertFalse(any(c.startswith(('fetch ', 'package ')) or c == 'enable' for c in calls))
+
+    def test_https_registration_pairs_without_exposing_maintenance_to_agent(self):
+        self.online_fixture()
+        credential = '{"format":1,"credential":"private-maintenance-fixture"}'
+        (self.base / 'registration').write_text(f'{1:064d}\n{credential}\n')
+        calls, msg = self.install_online(register=True)
+        maintenance = self.root / 'agent-maintenance.json'
+        self.assertEqual(maintenance.read_text(), credential + '\n')
+        self.assertEqual(maintenance.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn('private-maintenance', (self.root / 'agent.env').read_text() + msg)
+        self.assertIn('enable', calls)
+
+    def test_registration_failure_does_not_start_agent_or_install_unexpected_lines(self):
+        self.online_fixture()
+        for value in ('short', 'A' * 64, f'{1:064d}\nnot-json', f'{1:064d}\n{{}}\nextra'):
+            (self.base / 'registration').write_text(value)
+            proc = self.installer('install.sh', self.edits, ['--server', 'https://hub.example', '--register', 'enroll'])
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse((self.root / 'agent.env').exists())
+        self.assertNotIn('service ', self.calls.read_text())
+
+    def test_retry_reuses_the_registered_identity_after_init_failure(self):
+        self.online_fixture()
+        self.stub('systemctl', 'test "$1" != restart')
+        args = ['--server', 'https://hub.example', '--register', 'fixture-enroll']
+        self.assertNotEqual(self.installer('install.sh', self.edits, args).returncode, 0)
+        self.assertTrue((self.root / '.agent-registration.pending').is_dir())
+        self.stub('systemctl', ':')
+        proc = self.installer('install.sh', self.edits, args)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.calls.read_text().count('/api/agent/register'), 1)
+        self.assertFalse((self.root / '.agent-registration.pending').exists())
+
+    def test_shared_worker_lock_and_journal_block_replacement(self):
+        self.online_fixture()
+        args = ['--server', 'https://hub.example', '--token', 'fixture']
+        with (self.root / '.agent-updater.lock').open('a') as locked:
+            fcntl.flock(locked, fcntl.LOCK_EX)
+            proc = self.installer('install.sh', self.edits, args)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn('maintenance', proc.stderr)
+        for marker in ('.agent-updater.state', '.agent-updater.pending'):
+            p = self.root / marker
+            p.touch()
+            proc = self.installer('install.sh', self.edits, args)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn('rollout', proc.stderr)
+            p.unlink()
+        self.assertFalse(self.calls.read_text())
+
+    def test_worker_repair_preserves_unfinished_rollout_and_agent(self):
+        self.online_fixture()
+        self.install_online(args=['--no-updater'])
+        journal = self.root / '.agent-updater.state'
+        journal.write_text('old worker state')
+        self.calls.write_text('')
+        proc = self.installer('install.sh', self.edits, ['--updater-only'])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(journal.read_text(), 'old worker state')
+        self.assertIn('enable', self.calls.read_text())
+        self.assertNotIn('restart monitor-agent', self.calls.read_text())
+        self.assertNotIn('fetch https://hub.example/agent/x86_64', self.calls.read_text())
+        (self.root / '.agent-install.recovery').mkdir(mode=0o700)
+        self.calls.write_text('')
+        proc = self.installer('install.sh', self.edits, ['--updater-only'])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue((self.root / '.agent-install.recovery').is_dir())
+        self.assertFalse(self.calls.read_text())
+
+    def test_recovers_interrupted_manual_replacement_on_next_run(self):
+        self.online_fixture()
+        backup = self.root / '.agent-install.recovery'
+        backup.mkdir(mode=0o700)
+        (backup / 'monitor-agent').write_text('original executable')
+        (backup / 'agent.env').write_text('MONITOR_SERVER=https://previous.example\nMONITOR_TOKEN=kept\n')
+        (backup / 'agent-maintenance.json').write_text('existing maintenance identity')
+        (backup / 'saved-unit').write_text('original unit')
+        (backup / 'was-active').touch()
+        (self.root / 'monitor-agent').write_text('partially applied new release')
+        # Stop after the previous transaction is resolved, without starting a new installation.
+        proc = self.installer('install.sh', self.edits, ['--server', 'ftp://other', '--token', 'invalid'])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual((self.root / 'monitor-agent').read_text(), 'original executable')
+        self.assertEqual(self.unit.read_text(), 'original unit')
+        self.assertEqual((self.root / 'agent-maintenance.json').read_text(), 'existing maintenance identity')
+        self.assertFalse(backup.exists())
+        self.assertIn('restart monitor-agent', self.calls.read_text())
+
+    def test_migrates_legacy_openrc_reader_and_preserves_literal_network_settings(self):
+        self.online_fixture(openrc=True)
+        self.install_online(args=['--no-updater'])
+        config = self.root / 'agent.env'
+        config.write_text(config.read_text() + 'MONITOR_NET_INCLUDE=eth0; literal text\nMONITOR_HTTP_PROBE_ALLOWLIST="probe.example:443=192.0.2.1|192.0.2.2"\nUNRELATED_SETTING=ignored\n')
+        legacy = f'command_args="--interval 19"\nstart_pre() {{\n  set -a\n  . "{config}"\n  set +a\n}}\n'
+        self.openrc.write_text(legacy)
+        proc = self.installer('install.sh', self.edits, ['--offline-dir', str(self.base)])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('command_args="--interval 19"', self.openrc.read_text())
+        got = subprocess.run(['sh', '-c', '. "$1"; start_pre; printf "%s/%s/%s" "$MONITOR_NET_INCLUDE" "${UNRELATED_SETTING:-unset}" "$MONITOR_HTTP_PROBE_ALLOWLIST"',
+                              'sh', str(self.openrc)], capture_output=True, text=True, check=True)
+        self.assertEqual(got.stdout, 'eth0; literal text/unset/probe.example:443=192.0.2.1|192.0.2.2')
+
+    def test_unsafe_url_credential_or_writable_binary_is_rejected(self):
+        self.online_fixture()
+        for url, token in [('https://hub.example/\nfoo', 'abcd'), ('ftp://invalid', 'abcd'),
+                           ('https://user@other', 'abcd'), ('https://hub.example', 'line1\nline2')]:
+            proc = self.installer('install.sh', self.edits, ['--server', url, '--token', token])
+            self.assertNotEqual(proc.returncode, 0)
+        binary = self.root / 'monitor-agent'
+        binary.touch()
+        binary.chmod(0o777)
+        proc = self.installer('install.sh', self.edits, ['--server', 'https://hub.example', '--token', 'abcd'])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('unsafe ownership', proc.stderr)
+        self.assertFalse(self.calls.read_text())
+
+    def test_verifier_accepts_trusted_local_file_and_stops_before_extracting_on_mismatch(self):
+        import tarfile
+        folder = self.base / 'cmonitor-agent-offline'
+        folder.mkdir()
+        (folder / 'install.sh').write_text('test "$1:$2" = "--offline-dir:." && touch "$MARKER"\n')
+        (folder / 'sha256sums.txt').write_text(hashlib.sha256((folder / 'install.sh').read_bytes()).hexdigest() + '  install.sh\n')
+        package = self.base / 'archive.tar.gz'
+        with tarfile.open(package, 'w:gz') as tar:
+            tar.add(folder, arcname=folder.name)
+        self.env['MARKER'] = str(self.base / 'ran')
+        cache = self.base / 'cache'
+        edits = [('/var/lib/cmonitor-offline', cache)]
+        trusted = hashlib.sha256(package.read_bytes()).hexdigest()
+        p = self.installer('deploy/agent-offline-install.sh', edits, ['0' * 64, str(package)])
+        self.assertNotEqual(p.returncode, 0)
+        self.assertFalse(Path(self.env['MARKER']).exists())
+        self.assertFalse(any(cache.glob('unpack.*')))
+        p = self.installer('deploy/agent-offline-install.sh', edits, [trusted, str(package)])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(Path(self.env['MARKER']).is_file())
+
+    def test_verifier_resumes_partial_http_transfer_then_verifies_exact_body(self):
+        import http.server
+        import tarfile
+        import threading
+        folder = self.base / 'cmonitor-agent-offline'
+        folder.mkdir()
+        (folder / 'install.sh').write_text('touch "$MARKER"\n')
+        (folder / 'sha256sums.txt').write_text(hashlib.sha256((folder / 'install.sh').read_bytes()).hexdigest() + '  install.sh\n')
+        package = self.base / 'archive.tar.gz'
+        with tarfile.open(package, 'w:gz') as tar:
+            tar.add(folder, arcname=folder.name)
+        body = package.read_bytes()
+        digest = hashlib.sha256(body).hexdigest()
+        cache = self.base / 'cache'
+        cache.mkdir(mode=0o700)
+        (cache / (digest + '.part')).write_bytes(body[:32])
+        observed = []
+        class Serve(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                observed.append(self.headers.get('Range'))
+                if observed[-1] != 'bytes=32-':
+                    self.send_error(400)
+                    return
+                self.send_response(206)
+                self.send_header('Content-Length', str(len(body) - 32))
+                self.send_header('Content-Range', f'bytes 32-{len(body)-1}/{len(body)}')
+                self.end_headers()
+                self.wfile.write(body[32:])
+            def log_message(self, *args):
+                pass
+        with http.server.HTTPServer(('127.0.0.1', 0), Serve) as httpd:
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            try:
+                self.env.update(MARKER=str(self.base / 'ran'), NO_PROXY='127.0.0.1', no_proxy='127.0.0.1')
+                url = f'http://127.0.0.1:{httpd.server_port}/archive'
+                proc = self.installer('deploy/agent-offline-install.sh', [('/var/lib/cmonitor-offline', cache)], [digest, url])
+            finally:
+                httpd.shutdown(); t.join()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(observed, ['bytes=32-'])
+        self.assertTrue(Path(self.env['MARKER']).exists())
 
     def hub_failure(self, old_healthy):
         import sqlite3

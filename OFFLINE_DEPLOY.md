@@ -6,7 +6,7 @@
 
 HTTP 上报中 Token 和监控数据以明文传输；当前 Cagent v1.2.1 会禁用这种远程明文连接上的 Web Terminal，CPU、内存、流量等监控上报仍可使用。
 
-操作流程是：在联网电脑下载 Agent → 复制到目标机器 → 写入现有 HTTP IP 入口和节点 Token → 创建带 `--insecure` 的服务 → 向原面板上报。
+在可信电脑上获取校验工具和归档摘要。目标机通过本地文件或 HTTP 获取归档，验包后通过现有 HTTP IP 入口上报。
 
 Agent 版本以部署的 Hub 随附的 `agent.pin` 为准。目标机器为 Linux，提供 systemd 和 Alpine/OpenRC 两种服务配置。命令使用 Linux Bash 语法；在 Windows 上准备下载文件时，可以使用 WSL，或通过浏览器下载同名文件。
 
@@ -47,253 +47,84 @@ curl -fsSL https://status.example.net/install.sh | sh -s -- --server https://sta
 
 Agent 主动连接原面板，一般不需要给节点额外开放入站端口。如果安装时节点尚未联网，可以先创建服务；恢复网络后 Agent 会自动尝试连接。
 
-## 2. 在联网电脑准备 Agent 离线包
+## 2. 在可信联网电脑获取校验值和安装工具
 
-### 2.1 选择架构
+在已有 Hub 的对应 GitHub Release 中，使用 HTTPS 取得 `cmonitor-agent-offline.tar.gz` 的官方 SHA-256，以及独立发布的 `agent-offline-install.sh`。归档包含 x86_64、aarch64 两种 Linux 二进制及安装器。联网电脑安装了 GitHub CLI 时可运行下面的命令，将 `vX.Y.Z` 换成 Hub 发布标签。
 
-在目标机器查看：
-
-```bash
-uname -m
+```sh
+(
+  set -eu
+  tag=vX.Y.Z
+  repo=ClaraCora/Cmonitor
+  gh release download "$tag" -R "$repo" -p agent-offline-install.sh -p sha256sums.txt
+  awk '$2 == "agent-offline-install.sh" {print; found=1} END {exit !found}' sha256sums.txt > verifier.sha256
+  sha256sum -c verifier.sha256
+  awk '$2 == "cmonitor-agent-offline.tar.gz" {print $1; found=1} END {exit !found}' sha256sums.txt
+)
 ```
 
-| 输出 | 使用的文件 |
-| --- | --- |
-| `x86_64` / `amd64` | `monitor-agent-x86_64-unknown-linux-musl` |
-| `aarch64` / `arm64` | `monitor-agent-aarch64-unknown-linux-musl` |
+通过 SSH、受信 U 盘或已有的受信管理通道，把已校验的脚本放到目标机的 `/root/agent-offline-install.sh`。通过同一可信渠道保存或抄录显示的 **64 位归档摘要**。若从源码打包，请在可信联网电脑从匹配的 Hub 发布标签运行 `python3 scripts/agent-offline.py cmonitor-agent-offline.tar.gz`，通过本地 `sha256sum` 取得摘要。旧发布没有独立工具时，可以使用新版可信工具验证旧包。
 
-下面一次打包两种架构，每台机器安装时再选择自己的文件。
+## 3. 已安装节点离线升级
 
-### 2.2 下载、校验和打包
+先在目标机的 root 会话里设置真实的归档摘要和包的位置。能访问 HTTP 文件服务器时填写包 URL，即可用同一条命令重试中断的下载。也可事先搬入归档，将 `PACKAGE` 设置为本地绝对路径。
 
-从与生产 Hub **相同版本**的 GitHub Release 获取 `cmonitor-agent-offline.tar.gz` 和 `sha256sums.txt`，按清单核对归档的 SHA-256，再用受信任的介质或 SSH 搬入目标机。包内含两种架构、对应的摘要、安装器及版本说明。也可在可信联网电脑上，从对应 Hub 源码目录自行制包：
-
-```bash
-python3 scripts/agent-offline.py cmonitor-agent-offline.tar.gz
-sha256sum cmonitor-agent-offline.tar.gz > cmonitor-agent-offline.tar.gz.sha256
+```sh
+SHA256='填写从可信联网电脑取得的64位摘要'
+PACKAGE='http://203.0.113.20/updates/cmonitor-agent-offline.tar.gz'
+sh /root/agent-offline-install.sh "$SHA256" "$PACKAGE"
 ```
 
-脚本从当前源码的 `agent.pin` 读取版本并逐项验证摘要。下载 Release 时可以从正式清单提取 `cmonitor-agent-offline.tar.gz` 行，存为同名的 `.sha256` 文件供下节使用。
+工具把未完成的下载留在 root 私有目录，校验整个归档后才解压，并在包内二进制通过校验后调用安装器。HTTP 镜像只提供归档；校验工具和摘要都必须通过独立的可信渠道取得。请勿通过 HTTP 下载并直接运行安装脚本。若镜像不支持续传，工具会重新下载。摘要不符会删除错误文件并停止。
 
-### 已安装节点离线升级
+该命令沿用已安装节点的 HTTP 地址、Token、上报间隔、网卡与终端策略。安装器会把旧 OpenRC 服务内直接执行 `agent.env` 的语句替换为按字面值读取的方式。离线模式不联网注册，也不启用升级器。通过节点 ID、版本和指标确认已恢复上报。
 
-在目标机上验包、解压，然后以 root 执行：
+## 4. 首次安装 HTTP 上报节点
 
-```bash
-sha256sum -c cmonitor-agent-offline.tar.gz.sha256
-tar xzf cmonitor-agent-offline.tar.gz
-cd cmonitor-agent-offline
-sh ./install.sh --offline-dir .
+使用同一个受信工具与独立摘要，传入该节点自己的 Token 和实际 HTTP 地址。以下命令在目标机 root 会话里执行。将 `SHA256` 和 `PACKAGE` 按第 3 节设置好。
+
+```sh
+(
+  set -eu
+  printf '节点 Token：' >&2
+  IFS= read -r token
+  sh /root/agent-offline-install.sh "$SHA256" "$PACKAGE" \
+    --server http://203.0.113.10:28081 --token "$token" --interval 1 --insecure
+)
 ```
 
-此命令保留原服务定义和环境文件，只替换二进制。现有 HTTP 地址、`--insecure`、采样间隔、节点身份、网卡与终端策略均沿用。离线升级不会下载或启用升级器，也不会重新注册。检查原节点 ID 持续上报及版本即可。首次安装见下文。
+安装器自动选择 systemd 或 OpenRC，写入权限为 0600 的 `/opt/monitor/agent.env`，启动服务并检查运行状态。根目录按 Linux 通常权限由 root 管理。目标机需要 `flock`（util-linux 或提供该命令的 BusyBox），如已有 Python 3，安装器也可用其标准库加锁。HTTP 注册不受支持，请通过原面板取得每台机器独立的 Token。
 
-安装器会在停止服务前检查本机和候选版本。如果确实需要降到旧版本，使用已校验的旧包并在命令后添加 `--allow-downgrade`。成功替换后，上一份不同的程序保存在 `/opt/monitor/.agent-offline.previous`，重复安装相同程序会保留这份副本。
+## 5. 检查服务和修改配置
 
-若本地服务已经启动，但联网后原节点仍无法上报，可在目标机以 root 执行以下命令恢复上一份程序，并按第 8 节核实上报。OpenRC 机器将最后一行换为 `rc-service monitor-agent restart`。
+systemd 使用 `systemctl status monitor-agent --no-pager` 和 `journalctl -u monitor-agent -n 50 --no-pager`。OpenRC 使用 `rc-service monitor-agent status` 和 `tail -n 50 /var/log/monitor-agent.log`。
 
-```bash
-cd /opt/monitor &&
-  restore_tmp=$(mktemp .agent-restore.XXXXXX) &&
-  install -m 0755 .agent-offline.previous "$restore_tmp" &&
-  mv -f "$restore_tmp" monitor-agent &&
-  systemctl restart monitor-agent
-```
+网络恢复后，Agent 会自动重试原上报地址。手动修改 `agent.env` 后，systemd 使用 `systemctl restart monitor-agent`，OpenRC 使用 `rc-service monitor-agent restart`。修改 systemd unit 后需先执行 `systemctl daemon-reload`。OpenRC 的新服务按字面值读取 `MONITOR_SERVER`、`MONITOR_TOKEN`、`MONITOR_DISABLE_TERMINAL`、`MONITOR_NET_INCLUDE`、`MONITOR_NET_EXCLUDE` 和 `MONITOR_HTTP_PROBE_ALLOWLIST`。一行一个 `KEY=value`，不要使用 shell 引号或变量展开。
 
-## 3. 把文件复制到目标机器
+若已有自定义 OpenRC 服务采用非标准方式加载环境文件，安装器会停止并提示人工检查。可保留其他服务设置，将其加载配置的部分改为下面的 `start_pre`：
 
-通过 U 盘、SFTP、SCP 或内网文件服务器，把以下文件放到目标机器 `/tmp/`：
-
-```text
-cmonitor-agent-offline.tar.gz
-cmonitor-agent-offline.tar.gz.sha256
-```
-
-以下步骤均在**被监控的目标机器**上以 root 执行，可先运行 `sudo -i`。
-
-```bash
-cd /tmp
-sha256sum -c cmonitor-agent-offline.tar.gz.sha256
-
-# 仅在上一条校验显示 OK 后继续。
-tar -xzf cmonitor-agent-offline.tar.gz -C /opt
-cd /opt/cmonitor-agent-offline
-sha256sum -c sha256sums.txt
-```
-
-全部校验通过后继续。后面的安装步骤只读取本地文件，不会访问 GitHub。
-
-## 4. 手动安装二进制并写配置
-
-### 4.1 安装二进制
-
-以下按首次安装编写。如果机器已有 Agent，先按第 7 节停止并备份原服务、二进制和配置，再替换。
-
-```bash
-case "$(uname -m)" in
-    x86_64|amd64) ARCH=x86_64 ;;
-    aarch64|arm64) ARCH=aarch64 ;;
-    *) echo "不支持的架构"; exit 1 ;;
-esac
-
-install -d -m 0755 /opt/monitor
-install -m 0755 -o root -g root \
-    "/opt/cmonitor-agent-offline/monitor-agent-${ARCH}-unknown-linux-musl" \
-    /opt/monitor/monitor-agent
-```
-
-最终运行的文件为 `/opt/monitor/monitor-agent`。发布文件是静态链接二进制，无需在目标机器编译。
-
-### 4.2 手写 `/opt/monitor/agent.env`
-
-创建配置文件，**把下面的 IP、端口替换成现有 HTTP 入口，Token 替换成第 1 节取得的节点 Token**：
-
-```bash
-install -m 0600 -o root -g root /dev/null /opt/monitor/agent.env
-cat > /opt/monitor/agent.env <<'EOF'
-MONITOR_SERVER=http://203.0.113.10:28081
-MONITOR_TOKEN=REPLACE_WITH_THIS_NODE_TOKEN
-EOF
-```
-
-配置要求：
-
-- `MONITOR_SERVER` 填现有 HTTP IP 入口，形如 `http://IP:端口`；运行时不需要解析原面板域名。
-- `MONITOR_TOKEN` 是这个节点的完整 Token。
-- 每行一个 `KEY=value`，不要写 `export`，等号两边不要留空格。
-- 文件权限为 `0600`，只允许 root 读取和修改。
-
-例如最终文件可以是：
-
-```ini
-MONITOR_SERVER=http://203.0.113.10:28081
-MONITOR_TOKEN=这里替换成原面板生成的完整Token
-```
-
-`agent.env` 由下文的服务配置加载；Agent 不会仅因这个文件存在就自动读取它。上报间隔写在服务启动参数中。
-
-## 5. systemd：手写服务并启动
-
-适用于 Debian、Ubuntu、Rocky Linux 等使用 systemd 的机器。Alpine/OpenRC 使用第 6 节，两种方式选一种。
-
-### 5.1 创建 `/etc/systemd/system/monitor-agent.service`
-
-```bash
-cat > /etc/systemd/system/monitor-agent.service <<'EOF'
-[Unit]
-Description=Cmonitor Agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-EnvironmentFile=/opt/monitor/agent.env
-ExecStart=/opt/monitor/monitor-agent --interval 1 --insecure
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-```
-
-`--interval 1` 表示每秒上报，可改成 1–3600 的整数，例如 `--interval 5`。`--insecure` 用于允许连接远程 HTTP IP 入口，不能遗漏。使用 root 与项目官方安装方式一致；在本方案的远程明文连接上，Agent 不开放 Web Terminal。
-
-### 5.2 启用和检查
-
-```bash
-systemctl daemon-reload
-systemctl enable --now monitor-agent
-systemctl status monitor-agent --no-pager
-journalctl -u monitor-agent -n 50 --no-pager
-```
-
-安装时仍无网络，日志会显示连接失败并重试；网络恢复后，Agent 会自动连接 `MONITOR_SERVER` 中配置的原探针地址。也可以在联网后主动执行：
-
-```bash
-systemctl restart monitor-agent
-```
-
-需要实时查看日志时执行 `journalctl -u monitor-agent -f`，按 `Ctrl+C` 返回。
-
-## 6. Alpine / OpenRC：手写服务并启动
-
-先完成第 3、4 节的二进制和 `agent.env` 配置，再创建 `/etc/init.d/monitor-agent`：
-
-```bash
-cat > /etc/init.d/monitor-agent <<'EOF'
-#!/sbin/openrc-run
-description="Cmonitor Agent"
-command="/opt/monitor/monitor-agent"
-command_args="--interval 1 --insecure"
-command_user="root:root"
-supervisor="supervise-daemon"
-respawn_delay=5
-output_log="/var/log/monitor-agent.log"
-error_log="/var/log/monitor-agent.log"
-
-depend() {
-    need net
-}
-
+```sh
 start_pre() {
-    set -a
-    . /opt/monitor/agent.env
-    set +a
+    while IFS= read -r entry || [ -n "$entry" ]; do
+        case "$entry" in
+        MONITOR_HTTP_PROBE_ALLOWLIST=\"*\"|MONITOR_HTTP_PROBE_ALLOWLIST=\'*\')
+            probe_list=${entry#*=}; probe_list=${probe_list#?}
+            export MONITOR_HTTP_PROBE_ALLOWLIST="${probe_list%?}"
+            unset probe_list ;;
+        MONITOR_SERVER=*|MONITOR_TOKEN=*|MONITOR_DISABLE_TERMINAL=*|MONITOR_NET_INCLUDE=*|MONITOR_NET_EXCLUDE=*|MONITOR_HTTP_PROBE_ALLOWLIST=*) export "$entry" ;;
+        esac
+    done < /opt/monitor/agent.env
+    unset entry
 }
-EOF
-
-chmod 0755 /etc/init.d/monitor-agent
-rc-update add monitor-agent default
-rc-service monitor-agent start
-rc-service monitor-agent status
-tail -n 50 /var/log/monitor-agent.log
 ```
 
-网络恢复后 Agent 会自动重连；手动重启使用 `rc-service monitor-agent restart`。
+## 6. 升级中断与回退
 
-## 7. 后续修改、重装和升级
+手动安装和后台升级器使用同一把维护锁。有批次正在进行时先完成该批次，再执行手动维护。手动替换中断时，使用受信工具重试原命令，安装器会先恢复之前的文件与服务状态。恢复失败会保留 `/opt/monitor/.agent-install.recovery` 供检查。
 
-如果这台机器已经按此前的 HTTPS 域名方案安装，只需把 `agent.env` 中的 `MONITOR_SERVER` 改为现有 `http://IP:端口`，保留 Token，再将服务启动参数按第 5.1 或第 6 节补上 `--insecure`。systemd 执行 `daemon-reload` 后重启；OpenRC 直接重启。无需重新下载二进制或重复创建节点。
+离线安装会比较新旧版本，默认拒绝降级。要回退，请用独立核实的旧归档及对应摘要重跑第 3 节命令，并在命令结尾附加 `--allow-downgrade`。每次成功替换后，上一次不同的可执行文件也会保存在 `/opt/monitor/.agent-offline.previous`。
 
-### 修改原地址或 Token
-
-编辑 `/opt/monitor/agent.env` 后重启服务即可：
-
-```bash
-# systemd
-systemctl restart monitor-agent
-```
-
-OpenRC 使用 `rc-service monitor-agent restart`。如果后台“换发凭证”，旧 Token 会立即失效，要把新值写回这个文件。
-
-只改 `agent.env` 不需要 `daemon-reload`；修改了 systemd 服务文件或上报间隔时，执行：
-
-```bash
-systemctl daemon-reload
-systemctl restart monitor-agent
-```
-
-### 重新安装或升级已存在的 Agent
-
-先按第 2、3 节准备并校验新二进制。systemd 机器停止服务并备份：
-
-```bash
-BACKUP_DIR="/opt/monitor-agent-backups/$(date +%Y%m%d-%H%M%S)"
-install -d -m 0700 "$BACKUP_DIR"
-systemctl stop monitor-agent
-cp -a /opt/monitor/monitor-agent "$BACKUP_DIR/monitor-agent"
-cp -a /opt/monitor/agent.env "$BACKUP_DIR/agent.env"
-cp -a /etc/systemd/system/monitor-agent.service "$BACKUP_DIR/monitor-agent.service"
-printf '备份位置：%s\n' "$BACKUP_DIR"
-```
-
-确认备份成功后，只执行第 4.1 节的二进制安装命令，**保留原 `agent.env` 中的地址和 Token**，再执行 `systemctl start monitor-agent`。无需在面板重复创建节点。
-
-OpenRC 使用 `rc-service monitor-agent stop/start`，并将服务脚本 `/etc/init.d/monitor-agent` 一起备份。若新版本运行异常，停止服务、装回备份的旧二进制，再启动。
-
-## 8. 安装后确认仍然接入原探针
+## 7. 安装后确认仍然接入原探针
 
 联网后检查三件事：
 
@@ -345,7 +176,7 @@ systemctl cat monitor-agent
 
 如果存在额外的 `monitor-agent.service.d/*.conf` 覆盖启动命令，需要同步确保最终命令包含 `--insecure`。Token 应只保存在 `agent.env` 中，不要写进可公开读取的服务文件。
 
-## 9. 本方案的地址与功能边界
+## 8. 本方案的地址与功能边界
 
 - 只把节点的上报地址配置成原 Hub 的现有 HTTP IP 入口。原 Hub 的 `--site` 继续使用其管理后台原地址，不需要改成 IP；后台添加节点等操作仍在能够访问原后台的电脑上完成。
 - `--insecure` 允许远程 HTTP/WS，不是跳过 HTTPS/WSS 的证书校验。不要把只有域名证书的原站点直接改写成 `https://IP`。
@@ -355,20 +186,20 @@ systemctl cat monitor-agent
 
 本流程中 GitHub 只用于联网电脑准备安装文件；目标机器运行时通过配置的 IP 和端口连接原 Hub。
 
-配置依据：本仓库 `install.sh`、`agent.pin`、`src/agent_ws.rs`，以及对应 Cagent v1.2.1 的参数、环境变量和连接实现。示例尚未在你的目标机器上执行，实际连接按第 8 节验收。
+配置依据：本仓库 `install.sh`、`agent.pin`、`src/agent_ws.rs`，以及对应 Cagent v1.2.1 的参数、环境变量和连接实现。示例尚未在你的目标机器上执行，实际连接按第 7 节验收。
 
-## 10. 宝塔 Nginx：IP 入口只允许 Agent 连接
+## 9. 宝塔 Nginx：IP 入口只允许 Agent 连接
 
 适用于已在宝塔把 Hub 的本机地址反代为 HTTP IP 入口，并希望这个入口只接收 Agent 连接、不能打开探针页面的情况。下文使用文档示例 IP `203.0.113.10`，部署时替换为实际 IP。
 
-### 10.1 修改哪个站点
+### 9.1 修改哪个站点
 
 1. 在宝塔进入“网站 → 对应的 IP 站点 → 设置 → 配置文件”，先备份原配置。
 2. 确认这是 IP 专用的 `server { ... }`。如果原域名和 IP 共用同一个站点，先将 IP 入口拆成独立站点；下面规则会屏蔽该站点内除 Agent 路径外的所有访问。
 3. 保留当前正确的 `listen` 端口和 IP 站点设置。下面只调整访问路径，不改变现有对外端口。
 4. 在这个 `server` 内、其他 `rewrite` 或代理配置 `include` 之前，加入下面的白名单规则及精确代理。
 
-### 10.2 放入 `server { ... }` 内的配置
+### 9.2 放入 `server { ... }` 内的配置
 
 下例使用 Hub 的默认本机地址 **`127.0.0.1:28080`**，部署时应换成原配置中的实际上游地址。将该 IP 站点中从 `#PROXY-START/` 到 `#PROXY-END/` 的整段原配置替换为下面内容，移除原来的全站代理和静态资源缓存规则。原来的 `location ^~ /` 全站代理会把整个探针站点代理出来。
 
@@ -413,7 +244,7 @@ location = /api/agent/ws {
 
 同时确认 IP 站点没有把所有请求重定向到域名或 HTTPS 的规则，也不要把 404 错误页设置为跳转到探针域名。这里需要直接返回 404，并让 Agent 路径直接进入 Hub。保存后在宝塔检测 Nginx 配置，成功后重载；若通过宝塔“反向代理”界面重新编辑，需再检查自定义规则是否被覆盖。
 
-### 10.3 Agent 地址与验证
+### 9.3 Agent 地址与验证
 
 Agent 继续使用目前能连通的 HTTP IP 地址和实际端口、原 Token，以及 `--insecure`。例如入口为标准 HTTP 80 端口时：
 
@@ -430,10 +261,10 @@ MONITOR_TOKEN=REPLACE_WITH_THIS_NODE_TOKEN
 | --- | --- |
 | 浏览器打开 `http://203.0.113.10:端口/` | 404 |
 | 打开同一入口的 `/clara`、`/api/nodes` | 404 |
-| 使用第 8 节带 WebSocket 头的请求检查该 IP 的 `/api/agent/ws`，不传 Token | 401，响应包含 `missing token` |
+| 使用第 7 节带 WebSocket 头的请求检查该 IP 的 `/api/agent/ws`，不传 Token | 401，响应包含 `missing token` |
 | 正常启动 Agent，使用有效 Token | 日志出现 `connected`，原面板继续显示节点在线、数据更新 |
 | 通过原域名访问后台 | 正常访问，由原来的域名站点处理 |
 
 直接在浏览器打开 `/api/agent/ws` 没有 WebSocket 握手头，可能返回 400，这不代表反向代理失效。最终以上报是否持续为准。
 
-这份路径限制控制的是 IP 站点暴露哪些接口，不会把 HTTP 变成加密传输；本方案仍适用第 9 节的明文传输与终端限制。
+这份路径限制控制的是 IP 站点暴露哪些接口，不会把 HTTP 变成加密传输；本方案仍适用第 8 节的明文传输与终端限制。

@@ -100,7 +100,7 @@ class WebSocket:
 
 def main():
     assert sys.platform.startswith("linux") and os.geteuid() == 0, "run only on the Linux CI runner as root"
-    hub_binary, agent_binary = [str(Path(p).resolve()) for p in sys.argv[1:3]]
+    hub_binary, agent_binary, tls_dir = [str(Path(p).resolve()) for p in sys.argv[1:4]]
     with tempfile.TemporaryDirectory(prefix="cmonitor-security-") as directory:
         directory = Path(directory)
         database = directory / "monitor.db"
@@ -165,10 +165,14 @@ def main():
                 sockets.append(result)
             return result
 
-        def agent_online(cookie, terminal_capable=True):
+        def agent_online(cookie, node, terminal_capable=True, reason="available"):
             for _ in range(100):
                 status, nodes, _ = api("/api/nodes", cookie=cookie)
-                if status == 200 and any(n["online"] and n.get("terminal_capable") is terminal_capable for n in nodes["nodes"]):
+                if status == 200 and any(
+                    n["id"] == node and n["online"] and n.get("terminal_capable") is terminal_capable
+                    and n.get("terminal_reason") == reason and (n.get("metrics") or {}).get("uptime", 0) > 0
+                    for n in nodes["nodes"]
+                ):
                     return
                 time.sleep(0.1)
             raise AssertionError("Agent did not connect")
@@ -242,12 +246,34 @@ def main():
             ws(cookie, path="/api/ws", request_origin="http://evil.example.com", expected=403)
             print("PASS: version visibility, password prerequisite and cross-origin protection", flush=True)
 
+            plaintext_token = secrets.token_hex(32)
+            with sqlite3.connect(database) as db:
+                plaintext_node = db.execute("INSERT INTO node(name,token,created_at) VALUES(?,?,?)",
+                                            ("CI HTTP", plaintext_token, int(time.time()))).lastrowid
+                db.execute("INSERT INTO traffic(node_id) VALUES(?)", (plaintext_node,))
+            http_agent, _ = start(agent_binary, [], dict(os.environ, MONITOR_SERVER=origin, MONITOR_TOKEN=plaintext_token))
+            agent_online(cookie, plaintext_node, terminal_capable=False, reason="plaintext")
+            refused = ws(cookie)
+            refused.send({"type": "connect", "node_id": plaintext_node, "cols": 80, "rows": 24})
+            assert refused.receive().get("type") == "error", "loopback HTTP terminal should be denied"
+            stop(http_agent)
+            print("PASS: real HTTP Agent reports metrics with its root terminal disabled", flush=True)
+
+            ready_file = directory / "tls-port"
+            proxy, _ = start(sys.executable, [str(Path(__file__).resolve().with_name("security-smoke-tls.py")),
+                                              "proxy", tls_dir, str(port), str(ready_file)])
+            for _ in range(100):
+                if ready_file.exists() and ready_file.read_text().strip():
+                    break
+                assert proxy.poll() is None, "test TLS proxy exited during startup"
+                time.sleep(0.05)
+            secure_origin = f"https://127.0.0.1:{int(ready_file.read_text())}"
             token = secrets.token_hex(32)
             with sqlite3.connect(database) as db:
                 node = db.execute("INSERT INTO node(name,token,created_at) VALUES(?,?,?)", ("CI", token, int(time.time()))).lastrowid
                 db.execute("INSERT INTO traffic(node_id) VALUES(?)", (node,))
-            agent, _ = start(agent_binary, [], dict(os.environ, MONITOR_SERVER=origin, MONITOR_TOKEN=token))
-            agent_online(cookie)
+            agent, _ = start(agent_binary, [], dict(os.environ, MONITOR_SERVER=secure_origin, MONITOR_TOKEN=token))
+            agent_online(cookie, node)
             assert api("/api/terminal/access", cookie=cookie)[1]["allowed"] is True
             with sqlite3.connect(database) as db:
                 db.execute("UPDATE session SET expires_at=expires_at-601")
@@ -276,8 +302,8 @@ def main():
 
             with sqlite3.connect(database) as db:
                 token = db.execute("SELECT token FROM node WHERE id=?", (node,)).fetchone()[0]
-            agent, _ = start(agent_binary, [], dict(os.environ, MONITOR_SERVER=origin, MONITOR_TOKEN=token))
-            agent_online(cookie)
+            agent, _ = start(agent_binary, [], dict(os.environ, MONITOR_SERVER=secure_origin, MONITOR_TOKEN=token))
+            agent_online(cookie, node)
             channel, pid = terminal(cookie, node)
             assert api("/api/auth/logout", {}, cookie)[0] == 200
             channel.closed()
@@ -285,14 +311,14 @@ def main():
             ws(cookie, expected=401)
             cookie = login(password)
             stop(agent)
-            agent, _ = start(agent_binary, ["--disable-terminal"], dict(os.environ, MONITOR_SERVER=origin, MONITOR_TOKEN=token))
-            agent_online(cookie, terminal_capable=False)
+            agent, _ = start(agent_binary, ["--disable-terminal"], dict(os.environ, MONITOR_SERVER=secure_origin, MONITOR_TOKEN=token))
+            agent_online(cookie, node, terminal_capable=False, reason="policy")
             blocked = ws(cookie)
             blocked.send({"type": "connect", "node_id": node, "cols": 80, "rows": 24})
             assert blocked.receive().get("type") == "error"
             stop(agent)
-            agent, _ = start(agent_binary, [], dict(os.environ, MONITOR_SERVER=origin, MONITOR_TOKEN=token))
-            agent_online(cookie)
+            agent, _ = start(agent_binary, [], dict(os.environ, MONITOR_SERVER=secure_origin, MONITOR_TOKEN=token))
+            agent_online(cookie, node)
             print("PASS: Agent local terminal disable cannot be overridden by Hub policy", flush=True)
             channel, pid = terminal(cookie, node)
             assert api(f"/api/nodes/{node}", cookie=cookie, method="DELETE")[0] == 200

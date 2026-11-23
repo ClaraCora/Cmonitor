@@ -233,6 +233,16 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
     let nodes = app.db.nodes()?;
     let traffic = app.db.all_traffic();
     let tasks = app.db.ping_tasks()?;
+    let offline = if full {
+        let conn = app.db.conn();
+        let mut query = conn.prepare("SELECT node FROM node_maintenance WHERE offline_only=1")?;
+        let ids = query
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+        ids
+    } else {
+        std::collections::HashSet::new()
+    };
     let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
     let none = Traffic::default();
     Ok(nodes
@@ -241,8 +251,14 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
         .map(|n| {
             let mut view = node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), &tasks, full);
             if full {
-                view["terminal_enabled"] =
-                    json!(app.db.get(&format!("terminal_node_{}", n.id)).as_deref() != Some("off"));
+                view["terminal_enabled"] = json!(
+                    !offline.contains(&n.id)
+                        && app.db.get(&format!("terminal_node_{}", n.id)).as_deref() != Some("off")
+                );
+                if offline.contains(&n.id) {
+                    view["terminal_capable"] = json!(false);
+                    view["terminal_reason"] = json!("plaintext");
+                }
             }
             view
         })
@@ -950,12 +966,38 @@ pub async fn agent_register(
         Err(e) => return fail(e),
     };
     let token = random_token();
-    match app.db.create_node(&node, &token) {
-        Ok(_) => {
+    const PAIRED: &str = "application/vnd.cmonitor.agent-registration+text";
+    let wants_grant = headers.get(header::ACCEPT).is_some_and(|v| v == PAIRED);
+    if wants_grant && crate::forwarded_proto(&headers) != Some("https") {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let credential = wants_grant.then(|| format!("cmu_{}", random_token()));
+    let hash = credential.as_deref().map(crate::auth::sha256);
+    match app.db.create_node_with(
+        &node,
+        &token,
+        Some((&key, REGISTER_WINDOW, REGISTER_LIMIT, hash.as_deref())),
+    ) {
+        Ok(Some(id)) => {
             app.registrations.clear(ip);
             invalidate_snapshot(&app);
-            token.into_response()
+            if let Some(key) = credential {
+                let grant = crate::maintenance::grant_file(
+                    &crate::maintenance::server(&app, &headers),
+                    id,
+                    &token,
+                    &key,
+                );
+                (
+                    [(header::CACHE_CONTROL, "no-store"), (header::CONTENT_TYPE, PAIRED)],
+                    format!("{token}\n{grant}\n"),
+                )
+                    .into_response()
+            } else {
+                ([(header::CACHE_CONTROL, "no-store")], token).into_response()
+            }
         }
+        Ok(None) => closed(),
         Err(e) => fail(e),
     }
 }

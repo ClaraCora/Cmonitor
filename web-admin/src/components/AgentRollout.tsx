@@ -7,7 +7,9 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 type BatchItem = { node: number; status: string; reason?: string; deadline?: number; updated_at?: number }
 type Batch = { id: number; target: string; status: string; reason: string; items: BatchItem[] }
 type WorkerHeartbeat = { protocol: number; last_seen: number }
-type Overview = { target: string; nodes: Record<number, string>; batch: Batch | null; workers?: Record<number, WorkerHeartbeat> }
+type Policy = 'offline_only' | 'paired' | 'unpaired'
+type Overview = { target: string; nodes: Record<number, string>; batch: Batch | null; workers?: Record<number, WorkerHeartbeat>; maintenance?: Record<number, Policy> }
+const policyLabel: Record<Policy, string> = { offline_only: '仅上报 · 仅离线升级', paired: '已配对维护凭据', unpaired: '待配对维护凭据' }
 const labels: Record<string, string> = { ready: '可升级', offline: '离线', unenrolled: '需启用升级器', plaintext: 'HTTP 或未确认 HTTPS · 离线升级', current: '已达到目标版本', unknown: '版本未知', no_report: '等待指标上报' }
 const phases: Record<string, string> = {
   ready: '等待节点领取', queued: '等待首台验证', waiting: '下载并校验', installing: '正在安装并重启服务',
@@ -24,6 +26,63 @@ function WorkerInfo({ heartbeat }: { heartbeat?: WorkerHeartbeat }) {
     {known ? `升级器 v${heartbeat.protocol}` : '升级器协议未记录'}
     {!!heartbeat?.last_seen && <> · 最近心跳 {timeFormat.format(heartbeat.last_seen * 1000)}</>}
   </span>
+}
+
+function MaintenanceSettings({ nodes, policies, refresh }: {
+  nodes: Node[]; policies: Record<number, Policy>; refresh: () => void
+}) {
+  const [id, setId] = useState('')
+  const [message, setMessage] = useState('')
+  const [pending, setPending] = useState(false)
+  const policy = policies[Number(id)]
+  async function change(action: 'grant' | 'revoke' | 'offline') {
+    if (!id || pending || !policy) return
+    const node = nodes.find(n => n.id === Number(id))
+    if (!node) return
+    if (action !== 'grant' && !window.confirm(action === 'offline'
+      ? `将 ${node.name} 固定为仅上报并撤销在线维护权限？`
+      : `撤销 ${node.name} 的维护凭据？再次在线升级前需要重新配对。`)) return
+    setPending(true)
+    setMessage('')
+    try {
+      const result = await api<{ node?: number; credential?: string }>(`/nodes/${id}/maintenance`, {
+        method: 'POST', body: JSON.stringify({ action }),
+      })
+      if (action === 'grant') {
+        if (result.node !== node.id || !result.credential?.startsWith('cmu_')) throw new Error('凭据响应不完整，请重新读取配对状态。')
+        const url = URL.createObjectURL(new Blob([JSON.stringify(result)], { type: 'application/json' }))
+        const link = document.createElement('a')
+        link.href = url
+        link.download = `agent-maintenance-node-${node.id}.json`
+        link.click()
+        setTimeout(() => URL.revokeObjectURL(url), 1000)
+        setMessage('已生成凭据文件。通过 SSH 或 SFTP 放到本节点的 /opt/monitor/agent-maintenance.json，设为 root 所有、权限 0600，再启用升级器。')
+      } else {
+        setMessage(action === 'offline' ? '已设为仅离线升级。' : '已撤销维护凭据。')
+      }
+    } catch (error) {
+      setMessage((error as Error).message || '操作结果未确认，请刷新后查看。')
+    } finally {
+      setPending(false)
+      refresh()
+    }
+  }
+  return <details className="text-sm">
+    <summary className="cursor-pointer font-medium">管理节点维护凭据</summary>
+    <div className="mt-2 space-y-2">
+      <select aria-label="维护凭据所属节点" value={id} disabled={pending} onChange={event => { setId(event.target.value); setMessage('') }}
+        className="w-full rounded-md border bg-background px-2 py-2">
+        <option value="">选择节点</option>
+        {nodes.map(node => <option key={node.id} value={node.id}>{node.name} · {policyLabel[policies[node.id]] ?? '未知'}</option>)}
+      </select>
+      {policy && policy !== 'offline_only' && <div className="flex flex-wrap gap-2">
+        {policy === 'unpaired' && <Button type="button" size="sm" variant="outline" disabled={pending} onClick={() => change('grant')}>下载本节点维护凭据</Button>}
+        {policy === 'paired' && <Button type="button" size="sm" variant="outline" disabled={pending} onClick={() => change('revoke')}>撤销凭据</Button>}
+        <Button type="button" size="sm" variant="ghost" disabled={pending} onClick={() => change('offline')}>设为仅离线升级</Button>
+      </div>}
+      {message && <p role="status" className="break-words text-xs">{message}</p>}
+    </div>
+  </details>
 }
 
 function BatchProgress({ batch, name }: { batch: Batch; name: (id: number) => string }) {
@@ -191,9 +250,11 @@ export function AgentRollout({ nodes, site }: { nodes: Node[]; site: string }) {
             })}
           </div>
         </fieldset>}
+        {updaterSite && canChoose && fresh && state.maintenance && <MaintenanceSettings
+          nodes={nodes} policies={state.maintenance} refresh={() => setRevision(value => value + 1)} />}
         {updaterSite && state && <details className="text-sm">
           <summary className="cursor-pointer">在已有 HTTPS 节点上启用或修复升级器</summary>
-          <p className="mt-2 text-muted-foreground">在目标节点以 root 执行。安装器沿用原 Agent 的地址和 Token，只更新升级器。完成后核对本次操作后的 v2 心跳。</p>
+          <p className="mt-2 text-muted-foreground">先通过 SSH 或 SFTP 将本节点的维护凭据放到位，再以 root 执行。完成后核对升级器的最近心跳。</p>
           <pre className="mt-2 whitespace-pre-wrap break-all rounded-lg border p-3 text-xs select-all">{`curl --proto '=https' -fsS ${updaterSite}/install.sh | sh -s -- --updater-only`}</pre>
         </details>}
         {canChoose && <DialogFooter>

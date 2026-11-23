@@ -59,6 +59,9 @@ class FixtureNode:
         self.binary.chmod(0o755)
         self.env = self.root / 'agent.env'
         self.env.write_text(f'MONITOR_SERVER={PUBLIC}\nMONITOR_TOKEN={self.token}\n')
+        grant = self.root / 'agent-maintenance.json'
+        grant.write_text(json.dumps(admin(f'/api/nodes/{self.id}/maintenance', {'action': 'grant'})))
+        grant.chmod(0o600)
         self.arch = 'x86_64' if canary else 'aarch64'
         self.channel = None
         self.restarts = 0
@@ -137,6 +140,7 @@ def run():
         assert all(n.restarts == 0 for n in fleet)
 
         first.worker.once()
+        first.channel.send({'method': 'report', 'params': METRICS})
         wait(lambda: [i['status'] for i in overview()['batch']['items']] == ['verified'] + ['ready'] * 19,
              'the original canary to report the pinned version and release every follower')
         barrier = threading.Barrier(19)
@@ -158,6 +162,8 @@ def run():
                 n.worker.once()
 
         list(group.map(upgrade, followers))
+        for node in followers:
+            node.channel.send({'method': 'report', 'params': METRICS})
         wait(lambda: overview()['batch']['status'] == 'done', '20 verified versions on the original node IDs')
         items = overview()['batch']['items']
         assert [i['node'] for i in items] == ids and all(i['status'] == 'verified' for i in items)
@@ -169,7 +175,7 @@ def run():
         list(group.map(lambda n: n.worker.once(), fleet))
         assert len(faulty.attempts) == 2 and faulty.attempts[0] == faulty.attempts[1]
         assert all(n.restarts == 1 and not (n.root / '.agent-updater.state').exists() for n in fleet)
-        print('Verified 1 canary + 19 parallel workers, same credentials, one HTTP 503 and a replayed receipt.')
+        print('Verified 1 canary + 19 parallel workers, separate report and maintenance credentials, one HTTP 503 and a replayed receipt.')
 
 
 if __name__ == '__main__':

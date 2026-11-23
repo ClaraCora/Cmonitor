@@ -240,6 +240,10 @@ async fn serve(
         let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
         // A token may be rotated between the HTTP check and the upgrade task.
         anyhow::ensure!(app.db.node_by_token(&token)? == Some(node_id), "node credential revoked");
+        if !tls {
+            crate::maintenance::observe_http(&app.db, node_id)?;
+            app.terminals.disconnect_node(node_id);
+        }
         agents.insert(node_id, agent);
     }
     info!("node {node_id} connected from {ip}");
@@ -366,6 +370,8 @@ fn dispatch_session(app: &App, node_id: i64, ip: &str, text: &str, session: Opti
                     rpc.params["agent_version"].as_str().filter(|s| s.len() < 40).unwrap_or("").to_owned();
                 agent.rollout.reset_report();
                 if rpc.params["terminal_reason"] == "plaintext" {
+                    crate::maintenance::observe_http(&app.db, node_id)?;
+                    app.terminals.disconnect_node(node_id);
                     agent.rollout.tls = false;
                 }
                 agent.terminal_enabled =

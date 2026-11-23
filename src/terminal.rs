@@ -157,7 +157,7 @@ fn default_rows() -> u32 {
     32
 }
 
-fn recent_session(app: &App, hash: &str) -> bool {
+pub(crate) fn recent_session(app: &App, hash: &str) -> bool {
     app.db.session_actor(hash).is_some_and(|(actor, time)| {
         !actor.starts_with("legacy:") && (0..=600).contains(&(Utc::now().timestamp() - time))
     })
@@ -182,6 +182,9 @@ pub async fn policy(
 ) -> Response {
     if !app.db.node(node).ok().flatten().is_some() {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    if policy.enabled && crate::maintenance::offline(&app.db.conn(), node).unwrap_or(true) {
+        return (StatusCode::CONFLICT, "该节点固定为离线维护").into_response();
     }
     let actor =
         current_session(&headers).and_then(|h| app.db.session_actor(&h)).map(|v| v.0).unwrap_or_default();
@@ -249,6 +252,10 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
         send_error(&mut socket, "请重新登录后打开终端").await;
         return;
     }
+    if crate::maintenance::offline(&app.db.conn(), node_id).unwrap_or(true) {
+        send_error(&mut socket, "该节点固定为离线维护").await;
+        return;
+    }
     if app.db.get(&format!("terminal_node_{node_id}")).as_deref() == Some("off") {
         send_error(&mut socket, "管理员已禁用该节点终端").await;
         return;
@@ -289,7 +296,7 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
         return;
     };
     let lease = Lease { app: app.clone(), id: terminal_id.clone(), agent, cancel_agent, actor, node_id };
-    if *agent_cancelled.borrow() || !authed_hash(&app, &session) {
+    if *agent_cancelled.borrow() || !terminal_session_allowed(&app, &session, node_id) {
         return;
     }
     let open = rpc("terminal.open", json!({"terminal_id": terminal_id, "cols": cols, "rows": rows}));
@@ -308,17 +315,17 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
             _ = agent_cancelled.changed() => break,
             _ = cancelled.changed() => break,
             _ = check.tick() => {
-                if !authed_hash(&app, &session) { break }
+                if !terminal_session_allowed(&app, &session, node_id) { break }
             }
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(text))) => {
-                    if !authed_hash(&app, &session) { break }
+                    if !terminal_session_allowed(&app, &session, node_id) { break }
                     if let Some(message) = to_agent(&terminal_id, &text) {
                         if lease.agent.try_send(message).is_err() { break }
                     }
                 }
                 Some(Ok(Message::Binary(data))) if data.len() <= MAX_INPUT => {
-                    if !authed_hash(&app, &session) { break }
+                    if !terminal_session_allowed(&app, &session, node_id) { break }
                     if lease.agent.try_send(rpc("terminal.input", json!({"terminal_id": terminal_id, "data": String::from_utf8_lossy(&data)}))).is_err() { break }
                 }
                 Some(Ok(Message::Close(_))) | None => break,
@@ -329,7 +336,7 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
             },
             message = browser_rx.recv() => match message {
                 Some(message) => {
-                    if !authed_hash(&app, &session) { break }
+                    if !terminal_session_allowed(&app, &session, node_id) { break }
                     let terminal_event = event_type(&message);
                     if terminal_event.as_deref() == Some("terminal.ready") {
                         ready = true;
@@ -357,6 +364,10 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
 
 fn authed_hash(app: &App, session: &str) -> bool {
     app.db.session_valid(session)
+}
+
+fn terminal_session_allowed(app: &App, session: &str, node: i64) -> bool {
+    authed_hash(app, session) && !crate::maintenance::offline(&app.db.conn(), node).unwrap_or(true)
 }
 
 fn valid_size(cols: u32, rows: u32) -> bool {
@@ -444,6 +455,15 @@ mod tests {
         drop(cloned_sender);
     }
 
+    #[test]
+    fn an_open_terminal_checks_the_persistent_node_policy() {
+        let app = App::for_test(Db::open(":memory:").unwrap());
+        app.db.create_session("live", i64::MAX).unwrap();
+        let node = app.db.create_node(&Default::default(), "report").unwrap();
+        assert!(terminal_session_allowed(&app, "live", node));
+        crate::maintenance::observe_http(&app.db, node).unwrap();
+        assert!(!terminal_session_allowed(&app, "live", node));
+    }
     #[test]
     fn browser_terminal_messages_are_bounded_and_bound_to_the_server_id() {
         assert!(to_agent("server-id", r#"{"type":"input","data":"echo ok\r"}"#)

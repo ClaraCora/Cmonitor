@@ -135,8 +135,8 @@ def restart_healthy():
     service('status')
 
 
-def sync_dir():
-    fd = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY)
+def sync_dir(directory=None):
+    fd = os.open(ROOT if directory is None else directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)
     finally:
@@ -309,15 +309,70 @@ def resume(state, server, request):
             complete(state, status)
 
 
+def archive_attempt(marker):
+    # A new authenticated identity cannot resume or roll back an old attempt.
+    # Under the shared lock, retain its journal and images before freeing the
+    # active filenames. The marker is removed last so even a power loss retries.
+    trusted(marker)
+    if not stat.S_ISREG(marker.lstat().st_mode):
+        raise ValueError('unexpected upgrade marker')
+    name = '.agent-updater-archive-' + hashlib.sha256(marker.name.encode() + marker.read_bytes()).hexdigest()
+    archive = ROOT / name
+    archive.mkdir(mode=0o700, exist_ok=True)
+    trusted(archive)
+    if not archive.is_dir() or archive.stat().st_mode & 0o077:
+        raise ValueError('upgrade archive is not private')
+    sync_dir()
+    candidates = [ROOT / '.agent-updater.candidate', PREVIOUS, ROOT / '.agent-updater.state', PENDING]
+    sources = [p for p in candidates if p != marker and os.path.lexists(p)] + [marker]
+    for source in sources:
+        trusted(source)
+        if not stat.S_ISREG(source.lstat().st_mode):
+            raise ValueError('unexpected upgrade artifact')
+        dest = archive / source.name
+        try:
+            os.link(source, dest, follow_symlinks=False)
+        except FileExistsError:
+            if not dest.samefile(source):
+                raise ValueError('upgrade archive conflicts with this attempt')
+    sync_dir(archive)
+    for source in sources[:-1]:
+        source.unlink()
+    sync_dir()
+    marker.unlink()
+    sync_dir()
+    print('Archived a previous maintenance attempt; its images remain available in ' + name, flush=True)
+
+
+def maintenance_key(server, report_token):
+    path = ROOT / 'agent-maintenance.json'
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    trusted(path)
+    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+        raise ValueError('maintenance credential must be a private regular file (0600)')
+    identity = hashlib.sha256(report_token.encode()).hexdigest()
+    with path.open('rb') as stream:
+        contents = stream.read(4097)
+    if len(contents) > 4096:
+        raise ValueError('invalid maintenance credential')
+    grant = json.loads(contents)
+    if (not isinstance(grant, dict) or type(grant.get('format')) is not int or grant['format'] != 1 or grant.get('server') != server
+            or grant.get('report_identity') != identity or type(grant.get('node')) is not int or grant['node'] < 1
+            or not isinstance(grant.get('credential'), str) or not re.fullmatch(r'cmu_[0-9a-f]{64}', grant['credential'])):
+        raise ValueError('maintenance credential does not match the local Agent identity and Hub')
+    return grant['credential']
+
+
 def once():
-    server, token = connection()
-    # An empty marker was written by the old worker only while replacing the
-    # binary; an interrupted v1 transaction keeps its original recovery rule.
-    if PENDING.exists():
-        link_replace(PREVIOUS, BIN)
-        restart_healthy()
-        PENDING.unlink()
-        sync_dir()
+    if (ROOT / '.agent-install.recovery').exists():
+        return
+    server, report_token = connection()
+    token = maintenance_key(server, report_token)
+    if token is None:
+        return
 
     def request(action, **fields):
         return json.loads(fetch(server + '/api/agent/upgrade', 2048,
@@ -325,23 +380,39 @@ def once():
 
     journal = ROOT / '.agent-updater.state'
     identity = hashlib.sha256((server + '\0' + token).encode()).hexdigest()
+    state = None
+    marker = None
     if journal.exists():
+        trusted(journal)
+        if not stat.S_ISREG(journal.lstat().st_mode):
+            raise ValueError('upgrade journal is not a regular file')
         state = json.loads(journal.read_text())
-        if state.get('identity') != identity or not valid_job(state.get('job')):
-            raise ValueError('upgrade journal belongs to a different identity or is damaged')
-    else:
+        if (not isinstance(state, dict) or not isinstance(state.get('identity'), str)
+                or not re.fullmatch(r'[a-f0-9]{64}', state['identity']) or not valid_job(state.get('job'))):
+            raise ValueError('upgrade journal is damaged; inspect before continuing')
+        if state['identity'] != identity:
+            marker = journal
+    if os.path.lexists(PENDING):
+        if state is not None and marker is None:
+            raise ValueError('legacy and current attempts both exist; inspect before continuing')
+        marker = PENDING
+    if state is None or marker is not None:
+        # Confirm the Hub accepts this exact maintenance key before archiving.
         job = request('poll')
+        if job is not None and not valid_job(job):
+            raise ValueError('Hub must support the recoverable upgrade protocol')
+        if marker is not None:
+            archive_attempt(marker)
         if job is None:
             return
-        if not valid_job(job):
-            raise ValueError('Hub must support the recoverable upgrade protocol')
         state = dict(identity=identity, job=job)
         checkpoint(state, phase='download')
     resume(state, server, request)
 
 
 def enable():
-    connection()  # Refuse plaintext before installing any service or schedule.
+    server, report_token = connection()
+    paired = maintenance_key(server, report_token)  # Validate an existing grant before installing a schedule.
     # The installer can select a parallel distro interpreter on a host whose
     # default python3 is too old. Persist the interpreter that actually ran enable.
     python = str(Path(sys.executable).resolve(strict=True))
@@ -371,6 +442,8 @@ def enable():
         subprocess.run(['rc-service', 'monitor-agent-updater', 'restart'], check=True)
     else:
         raise RuntimeError('requires systemd or OpenRC')
+    if paired is None:
+        print('Upgrade worker installed; waiting for an administrator-issued maintenance credential.')
 
 
 def main():

@@ -1,5 +1,5 @@
 //! Verify the first node before releasing the rest of the selection together.
-//! Success comes from the authenticated monitoring socket, never the updater.
+//! Success requires both a maintenance receipt and a new authenticated reporting session.
 use crate::{agent_ws::bearer, api::Admin, App, Shared};
 use axum::{
     extract::State,
@@ -13,11 +13,20 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    sync::LazyLock,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        LazyLock,
+    },
     time::Duration,
 };
 
 static EPOCH: LazyLock<String> = LazyLock::new(crate::auth::random_token);
+// Active batches never survive a Hub restart. This process-local order lets a
+// receipt and an Agent report within the same second be compared exactly.
+static OBSERVATION_ORDER: AtomicI64 = AtomicI64::new(1);
+fn next_observation() -> i64 {
+    OBSERVATION_ORDER.fetch_add(1, Ordering::Relaxed)
+}
 const TIMEOUT: i64 = 600; // Each phase gets a fresh budget.
 const ROLLBACK_OFFER: i64 = 120;
 const ROLLBACK_WINDOW: i64 = 180;
@@ -27,6 +36,7 @@ pub struct Live {
     pub tls: bool,
     pub version: String,
     pub reported: bool,
+    complete_order: i64,
     seen: i64,
     incomplete_since: i64,
     incomplete_latest: i64,
@@ -38,12 +48,14 @@ fn triple(v: &str) -> Option<[u32; 3]> {
 impl Live {
     pub fn reset_report(&mut self) {
         self.reported = false;
+        self.complete_order = 0;
         self.incomplete_since = 0;
         self.incomplete_latest = 0;
     }
     pub fn record_report(&mut self, complete: bool, now: i64) {
         self.reported = complete;
         if complete {
+            self.complete_order = next_observation();
             self.incomplete_since = 0;
             self.incomplete_latest = 0;
         } else {
@@ -121,6 +133,19 @@ pub(crate) fn invalidate_running(tx: &Transaction, reason: &str, now: i64) -> ru
     Ok(())
 }
 
+pub(crate) fn revoke_node(tx: &Transaction, node: i64) -> rusqlite::Result<()> {
+    let batch = tx.query_row("SELECT b.id FROM upgrade_batch b JOIN upgrade_item i ON i.batch=b.id WHERE b.status='running' AND i.node=?", [node], |r|r.get::<_,i64>(0)).optional()?;
+    if let Some(batch) = batch {
+        let now = Utc::now().timestamp();
+        let why = "节点维护授权已撤销";
+        tx.execute("UPDATE upgrade_item SET status='unconfirmed', reason=?, deadline=0, updated_at=?
+            WHERE node=? AND batch=? AND status IN ('installing','observing','rollback_pending','rolling_back')", (why,now,node,batch))?;
+        stop_pending(tx, batch, node, why, now)?;
+        finish_if_settled(tx, batch)?;
+    }
+    Ok(())
+}
+
 fn target_session<'a>(fleet: &'a Fleet, node: i64, previous: &str, target: &str) -> Option<&'a Live> {
     fleet
         .get(&node)
@@ -149,7 +174,7 @@ fn advance(tx: &Transaction, f: &Fleet, now: i64) -> rusqlite::Result<()> {
     if epoch != *EPOCH {
         return invalidate_running(tx, "Hub 已重启，请核对节点版本后重试", now);
     }
-    let mut stmt=tx.prepare("SELECT node,status,previous_session,deadline,attempt FROM upgrade_item WHERE batch=? AND status IN ('ready','waiting','installing','observing','rollback_pending','rolling_back') ORDER BY pos")?;
+    let mut stmt=tx.prepare("SELECT node,status,previous_session,deadline,attempt,receipt_order FROM upgrade_item WHERE batch=? AND status IN ('ready','waiting','installing','observing','rollback_pending','rolling_back') ORDER BY pos")?;
     let items = stmt
         .query_map([id], |r| {
             Ok((
@@ -158,16 +183,19 @@ fn advance(tx: &Transaction, f: &Fleet, now: i64) -> rusqlite::Result<()> {
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     // Evaluate already-authorised peers even when another node has stopped the
     // batch. Apply expiration to the expired item itself before skipping siblings.
     let mut failures = Vec::new();
-    for (node, state, old, deadline, attempt) in items {
+    for (node, state, old, deadline, attempt, receipt_order) in items {
         let live = target_session(f, node, &old, &target);
-        if matches!(state.as_str(), "installing" | "observing" | "rollback_pending")
-            && live.is_some_and(|l| l.reported)
+        // The independent worker must acknowledge installation as well as the
+        // reporting channel showing the new version. Either identity alone is insufficient.
+        if matches!(state.as_str(), "observing" | "rollback_pending")
+            && live.is_some_and(|l| l.reported && l.complete_order > receipt_order)
         {
             set_item(tx, id, node, "verified", "原节点已使用目标版本恢复上报", 0, now)?;
             continue;
@@ -224,7 +252,14 @@ fn create(app: &App, ids: &[i64], f: &Fleet, now: i64) -> rusqlite::Result<Respo
         tx.commit()?;
         return Ok((StatusCode::CONFLICT, "已有升级批次正在进行").into_response());
     }
-    if ids.is_empty()
+    let mut authorized=tx.prepare("SELECT EXISTS(SELECT 1 FROM upgrade_worker w JOIN node_maintenance m ON m.node=w.node WHERE w.node=? AND w.last_seen BETWEEN ? AND ? AND m.key_hash IS NOT NULL AND m.offline_only=0)")?;
+    let mut paired = true;
+    for &node in ids.iter().take(100) {
+        paired &= authorized.query_row((node, now - 120, now), |r| r.get::<_, bool>(0))?;
+    }
+    drop(authorized);
+    if !paired
+        || ids.is_empty()
         || ids.len() > 100
         || ids.iter().collect::<HashSet<_>>().len() != ids.len()
         || !ids.iter().all(|id| f.get(id).is_some_and(|(_, l)| l.eligibility(&target, now) == "ready"))
@@ -287,12 +322,28 @@ fn overview(app: &App) -> rusqlite::Result<Value> {
         })?;
         rows.collect::<rusqlite::Result<serde_json::Map<_, _>>>()?
     };
+    let policies = {
+        let mut query=tx.prepare("SELECT n.id,CASE WHEN m.offline_only=1 THEN 'offline_only' WHEN m.key_hash IS NOT NULL THEN 'paired' ELSE 'unpaired' END FROM node n LEFT JOIN node_maintenance m ON n.id=m.node")?;
+        let rows =
+            query.query_map([], |r| Ok((r.get::<_, i64>(0)?.to_string(), json!(r.get::<_, String>(1)?))))?;
+        rows.collect::<rusqlite::Result<serde_json::Map<_, _>>>()?
+    };
     tx.commit()?;
     let nodes = f
         .into_iter()
-        .map(|(id, (_, l))| (id.to_string(), json!(l.eligibility(&target, now))))
+        .map(|(id, (_, l))| {
+            let key = id.to_string();
+            let reason = if policies.get(&key).and_then(Value::as_str) == Some("offline_only") {
+                "plaintext"
+            } else if l.eligibility(&target, now) == "ready" && !workers.contains_key(&key) {
+                "unenrolled"
+            } else {
+                l.eligibility(&target, now)
+            };
+            (key, json!(reason))
+        })
         .collect::<serde_json::Map<_, _>>();
-    Ok(json!({"target":target,"nodes":nodes,"batch":batch,"workers":workers}))
+    Ok(json!({"target":target,"nodes":nodes,"batch":batch,"workers":workers,"maintenance":policies}))
 }
 pub async fn status(_: Admin, State(app): State<Shared>) -> Response {
     tokio::task::block_in_place(|| overview(&app).map(|v| Json(v).into_response()).unwrap_or_else(db_error))
@@ -306,16 +357,28 @@ pub struct Poll {
     protocol: Option<u8>,
     attempt: Option<String>,
 }
+#[cfg(test)]
 fn process(app: &App, node: i64, input: Poll, now: i64) -> rusqlite::Result<Value> {
-    {
-        let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(a) = agents.get_mut(&node).filter(|a| a.rollout.tls) {
-            a.rollout.seen = now;
-        }
-    }
-    let f = fleet(app);
+    process_key(app, &crate::auth::sha256(&format!("fixture-maint-{node}")), input, now)
+        .map(|r| r.expect("test worker is paired"))
+}
+fn process_key(app: &App, key_hash: &str, input: Poll, now: i64) -> rusqlite::Result<Option<Value>> {
+    // Check the credential in the same transaction that records or grants the
+    // operation, so a concurrent revocation takes effect on every subsequent call.
+    let mut f = fleet(app);
     let mut conn = app.db.conn();
     let tx = conn.transaction()?;
+    let Some(node) = tx
+        .query_row("SELECT node FROM node_maintenance WHERE key_hash=? AND offline_only=0", [key_hash], |r| {
+            r.get::<_, i64>(0)
+        })
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    if let Some((_, l)) = f.get_mut(&node).filter(|(_, l)| l.tls) {
+        l.seen = now;
+    }
     tx.execute(
         "INSERT INTO upgrade_worker(node,protocol,last_seen) SELECT id,?,? FROM node WHERE id=?
         ON CONFLICT(node) DO UPDATE SET protocol=excluded.protocol,last_seen=excluded.last_seen",
@@ -393,6 +456,10 @@ fn process(app: &App, node: i64, input: Poll, now: i64) -> rusqlite::Result<Valu
                     reply = job(&attempt);
                 }
                 "installed" if input.batch == Some(id) && same_worker && state == "installing" => {
+                    tx.execute(
+                        "UPDATE upgrade_item SET receipt_order=? WHERE batch=? AND node=?",
+                        (next_observation(), id, node),
+                    )?;
                     set_item(&tx, id, node, "observing", "", now + TIMEOUT, now)?;
                 }
                 "rollback"
@@ -451,7 +518,13 @@ fn process(app: &App, node: i64, input: Poll, now: i64) -> rusqlite::Result<Valu
         }
     }
     tx.commit()?;
-    Ok(reply)
+    drop(conn);
+    if let Some(a) =
+        app.agents.write().unwrap_or_else(|e| e.into_inner()).get_mut(&node).filter(|a| a.rollout.tls)
+    {
+        a.rollout.seen = now;
+    }
+    Ok(Some(reply))
 }
 pub async fn poll(State(app): State<Shared>, headers: HeaderMap, Json(input): Json<Poll>) -> Response {
     tokio::task::block_in_place(|| {
@@ -461,10 +534,10 @@ pub async fn poll(State(app): State<Shared>, headers: HeaderMap, Json(input): Js
             return StatusCode::FORBIDDEN.into_response();
         }
         let Some(token) = bearer(&headers) else { return StatusCode::UNAUTHORIZED.into_response() };
-        let Ok(Some(node)) = app.db.node_by_token(token) else {
+        if !token.starts_with("cmu_") || token.len() != 68 {
             return StatusCode::UNAUTHORIZED.into_response();
-        };
-        if !matches!(input.protocol, None | Some(1) | Some(2))
+        }
+        if input.protocol != Some(2)
             || !matches!(
                 input.action.as_str(),
                 "poll" | "apply" | "installed" | "failed" | "status" | "rollback"
@@ -472,8 +545,8 @@ pub async fn poll(State(app): State<Shared>, headers: HeaderMap, Json(input): Js
         {
             return StatusCode::BAD_REQUEST.into_response();
         }
-        process(&app, node, input, Utc::now().timestamp())
-            .map(|v| Json(v).into_response())
+        process_key(&app, &crate::auth::sha256(token), input, Utc::now().timestamp())
+            .map(|v| v.map_or_else(|| StatusCode::UNAUTHORIZED.into_response(), |v| Json(v).into_response()))
             .unwrap_or_else(db_error)
     })
 }
@@ -499,8 +572,27 @@ mod tests {
     use crate::{agent_ws::Agent, db::Db};
     const NOW: i64 = 1800000000;
     fn node(app: &App, id: i64, session: u64, version: &str, tls: bool, reported: bool) {
+        {
+            let db = app.db.conn();
+            db.execute(
+                "INSERT OR IGNORE INTO node(id,name,token,created_at) VALUES(?,?,'fixture-report-' || ?,0)",
+                (id, format!("fixture-{id}"), id),
+            )
+            .unwrap();
+            db.execute(
+                "INSERT OR IGNORE INTO node_maintenance(node,key_hash) VALUES(?,?)",
+                (id, crate::auth::sha256(&format!("fixture-maint-{id}"))),
+            )
+            .unwrap();
+            db.execute(
+                "INSERT OR IGNORE INTO upgrade_worker(node,protocol,last_seen) VALUES(?,2,?)",
+                (id, NOW),
+            )
+            .unwrap();
+        }
         let mut a = Agent::new(session, tokio::sync::mpsc::channel(1).0);
         a.rollout = Live { tls, version: version.into(), reported, seen: NOW, ..Default::default() };
+        a.rollout.record_report(reported, NOW);
         app.agents.write().unwrap().insert(id, a);
     }
     fn fixture() -> App {
@@ -698,13 +790,19 @@ mod tests {
     }
 
     #[test]
-    fn monitoring_recovers_a_lost_installed_receipt_before_releasing_followers() {
+    fn receipt_and_a_subsequent_complete_report_are_both_required() {
         let app = fixture();
         let job = begin_v2(&app);
         v2(&app, "apply", Some(&job), None, NOW);
         assert!(poll(&app, 2, "poll", None, NOW + 1).is_null());
         node(&app, 1, 21, &target(), true, true);
-        assert!(poll(&app, 2, "poll", None, NOW + 2).is_object());
+        assert!(poll(&app, 2, "poll", None, NOW + 2).is_null());
+        assert_eq!(snapshot(&app).1, ["installing", "queued"]);
+        v2(&app, "installed", Some(&job), None, NOW + 3);
+        assert!(poll(&app, 2, "poll", None, NOW + 4).is_null());
+        assert_eq!(snapshot(&app).1, ["observing", "queued"]);
+        app.agents.write().unwrap().get_mut(&1).unwrap().rollout.record_report(true, NOW + 5);
+        assert!(poll(&app, 2, "poll", None, NOW + 5).is_object());
         assert_eq!(snapshot(&app).1, ["verified", "waiting"]);
     }
 
@@ -802,6 +900,7 @@ mod tests {
             app.db.backup_into(backup.to_str().unwrap()).unwrap();
             v2(&app, "failed", Some(&job), Some("restart"), NOW + 1);
             create(&app, &[1], &fleet(&app), NOW + 2).unwrap();
+            crate::maintenance::observe_http(&app.db, 2).unwrap();
             app.db.check_backup(backup.to_str().unwrap()).unwrap();
             app.db.restore_from(backup.to_str().unwrap()).unwrap();
             let restored = overview(&app).unwrap();
@@ -810,6 +909,16 @@ mod tests {
             assert_eq!(restored["batch"]["items"][0]["status"], "unconfirmed");
             assert_eq!(restored["batch"]["items"][1]["status"], "skipped");
             assert!(restored["batch"]["items"][0]["reason"].as_str().unwrap().contains("恢复"));
+            assert_eq!(restored["maintenance"]["1"], "unpaired");
+            assert_eq!(restored["maintenance"]["2"], "offline_only");
+            app.db
+                .conn()
+                .execute(
+                    "UPDATE node_maintenance SET key_hash=? WHERE node=1",
+                    [crate::auth::sha256("fixture-maint-1")],
+                )
+                .unwrap();
+            v2(&app, "poll", None, None, NOW + 2);
             create(&app, &[1], &fleet(&app), NOW + 3).unwrap();
             let next = v2(&app, "poll", None, None, NOW + 3);
             assert_eq!(next["batch"], 3);

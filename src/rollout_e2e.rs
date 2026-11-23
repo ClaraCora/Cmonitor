@@ -27,6 +27,7 @@ async fn canary_then_nineteen_workers() {
         .build()
         .unwrap();
     let cookie = auth::issue_session(&app, &HeaderMap::new()).unwrap();
+    app.db.conn().execute("UPDATE session SET kind='password'", []).unwrap();
     let slots = app.relay_slots.clone();
     let source_reads = Arc::new(AtomicUsize::new(0));
     let reads = source_reads.clone();
@@ -66,6 +67,7 @@ async fn canary_then_nineteen_workers() {
         .route("/api/agent/upgrade", post(rollout::poll))
         .route("/api/agent-upgrades", get(rollout::status).post(rollout::start))
         .route("/api/nodes", get(api::nodes).post(api::create_node))
+        .route("/api/nodes/{id}/maintenance", post(maintenance::policy))
         .route("/agent/{arch}", get(agent_binary))
         .layer(from_fn(move |mut req: Request, next: Next| {
             let count = count.clone();

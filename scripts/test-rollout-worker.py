@@ -27,6 +27,11 @@ class Worker(unittest.TestCase):
         w.BIN.write_bytes(self.old)
         w.BIN.chmod(0o755)
         w.ENV.write_text('MONITOR_SERVER=https://monitor.example.org\nMONITOR_TOKEN=fixture\n')
+        self.credential = 'cmu_' + '1' * 64
+        self.grant_path = root / 'agent-maintenance.json'
+        self.grant_path.write_text(json.dumps(dict(format=1, node=1, server='https://monitor.example.org',
+            report_identity=hashlib.sha256(b'fixture').hexdigest(), credential=self.credential)))
+        self.grant_path.chmod(0o600)
         self.job = dict(batch=3, target='1.2.1', protocol=2, attempt='a' * 32)
         self.actions = []
         self.status = 'ready'
@@ -58,7 +63,7 @@ class Worker(unittest.TestCase):
             if self.fail_asset:
                 raise self.fail_asset.pop(0)
             return self.new
-        self.assertEqual(token, 'fixture')
+        self.assertEqual(token, self.credential)
         self.assertEqual(url, 'https://monitor.example.org/api/agent/upgrade')
         body = json.loads(data)
         self.assertEqual(body['protocol'], 2)
@@ -86,6 +91,69 @@ class Worker(unittest.TestCase):
         with patch.object(w, 'restart_healthy') as restart:
             w.once()
             restart.assert_called_once()
+
+    def test_missing_grant_and_installer_recovery_do_not_authorize_work(self):
+        credential = self.grant_path.read_bytes()
+        self.grant_path.unlink()
+        w.once()
+        self.grant_path.write_bytes(credential)
+        self.grant_path.chmod(0o600)
+        (w.ROOT / '.agent-install.recovery').touch()
+        w.once()
+        self.assertEqual(self.actions, [])
+        self.assertEqual(w.BIN.read_bytes(), self.old)
+
+    def test_identity_rotation_and_mismatched_or_exposed_grant_refuse_work(self):
+        self.install()
+        saved = self.journal.read_bytes()
+        for field, value in [('server', 'https://other.example.org'), ('report_identity', '0' * 64),
+                             ('credential', 'not-a-maintenance-key')]:
+            with self.subTest(field=field):
+                initial = self.grant_path.read_bytes()
+                self.grant_path.write_text(json.dumps({**json.loads(initial), field: value}))
+                with self.assertRaises(ValueError):
+                    w.once()
+                self.grant_path.write_bytes(initial)
+        self.grant_path.chmod(0o644)
+        with self.assertRaises(ValueError):
+            w.once()
+        self.assertEqual(self.journal.read_bytes(), saved)
+
+    def test_rotating_an_authenticated_identity_archives_journal_and_preserves_both_images(self):
+        self.install()
+        old_state = self.journal.read_bytes()
+        grant = json.loads(self.grant_path.read_text())
+        self.credential = grant['credential'] = 'cmu_' + '2' * 64
+        self.grant_path.write_text(json.dumps(grant))
+        self.job = None
+        before = self.actions.copy()
+        with patch.object(w, 'fetch', side_effect=TimeoutError), self.assertRaises(TimeoutError):
+            w.once()
+        self.assertEqual(self.journal.read_bytes(), old_state)
+        with patch.object(w, 'restart_healthy') as restart:
+            w.once()
+            w.once()
+            restart.assert_not_called()
+        self.assertEqual(self.actions[len(before):], ['poll', 'poll'])
+        self.assertFalse(self.journal.exists())
+        archives = list(w.ROOT.glob('.agent-updater-archive-*'))
+        self.assertEqual(len(archives), 1)
+        self.assertEqual((archives[0]/self.journal.name).read_bytes(), old_state)
+        self.assertEqual((archives[0]/w.PREVIOUS.name).read_bytes(), self.old)
+        self.assertEqual(w.BIN.read_bytes(), self.new)
+
+    def test_unbound_legacy_marker_is_archived_without_restoring(self):
+        w.PENDING.write_text('legacy')
+        w.PREVIOUS.write_bytes(b'previous')
+        self.job = None
+        with patch.object(w, 'restart_healthy') as restart:
+            w.once()
+            restart.assert_not_called()
+        self.assertFalse(w.PENDING.exists())
+        archive, = w.ROOT.glob('.agent-updater-archive-*')
+        self.assertEqual((archive / w.PENDING.name).read_text(), 'legacy')
+        self.assertEqual((archive / w.PREVIOUS.name).read_bytes(), b'previous')
+        self.assertEqual(w.BIN.read_bytes(), self.old)
 
     def test_install_preserves_identity_until_hub_verifies(self):
         env = w.ENV.read_bytes()

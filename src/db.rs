@@ -156,7 +156,13 @@ CREATE TABLE IF NOT EXISTS upgrade_item (
  batch INTEGER NOT NULL REFERENCES upgrade_batch(id) ON DELETE CASCADE, pos INTEGER NOT NULL, node INTEGER NOT NULL,
  status TEXT NOT NULL DEFAULT 'queued', previous_session TEXT NOT NULL DEFAULT '', deadline INTEGER NOT NULL DEFAULT 0,
  attempt TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0,
+ receipt_order INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(batch,pos), UNIQUE(batch,node)
+);
+CREATE TABLE IF NOT EXISTS node_maintenance (
+ node INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+ offline_only INTEGER NOT NULL DEFAULT 0 CHECK(offline_only IN (0,1)),
+ key_hash TEXT UNIQUE, CHECK(offline_only=0 OR key_hash IS NULL)
 );
 CREATE TABLE IF NOT EXISTS upgrade_worker (
  node INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
@@ -190,7 +196,8 @@ CREATE TABLE IF NOT EXISTS alert_state (
  key TEXT PRIMARY KEY, value INTEGER NOT NULL
 );
 "#;
-const EXTRA_TABLES: [&str; 9] = [
+const EXTRA_TABLES: [&str; 10] = [
+    "node_maintenance",
     "upgrade_worker",
     "upgrade_batch",
     "upgrade_item",
@@ -205,7 +212,7 @@ const EXTRA_TABLES: [&str; 9] = [
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 11;
+pub(crate) const SCHEMA_VERSION: i64 = 12;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -356,6 +363,14 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
             add_column(conn, "upgrade_item", column)?;
         }
         conn.execute("UPDATE upgrade_item SET deadline=0 WHERE status IN ('verified','skipped','failed','unconfirmed')", [])?;
+    }
+    if from < 12 {
+        add_column(conn, "upgrade_item", "receipt_order INTEGER NOT NULL DEFAULT 0")?;
+        // Every legacy heartbeat was authenticated by a reporting token.
+        // Neither it nor a registration window opened before dual credentials
+        // existed can grant a new maintenance identity.
+        conn.execute("DELETE FROM upgrade_worker", [])?;
+        conn.execute("DELETE FROM setting WHERE key IN ('register_key','register_until')", [])?;
     }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
@@ -708,8 +723,31 @@ impl Db {
     /// Both rows or neither: `accumulate` reads the `traffic` row on every
     /// report, so a node lacking one cannot report.
     pub fn create_node(&self, n: &Node, token: &str) -> Result<i64> {
+        self.create_node_with(n, token, None).map(|id| id.expect("unrestricted creation"))
+    }
+
+    /// Validate the administrator's registration window again inside the write
+    /// transaction, including its quota. Registration can only create a new
+    /// identity; it cannot grant maintenance on an existing node.
+    pub(crate) fn create_node_with(
+        &self,
+        n: &Node,
+        token: &str,
+        window: Option<(&str, i64, i64, Option<&str>)>,
+    ) -> Result<Option<i64>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        if let Some((key, duration, limit, _)) = window {
+            let until: i64 = tx.query_row(
+                "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM setting WHERE key='register_until'),0)",
+                [],
+                |r| r.get(0),
+            )?;
+            let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM setting WHERE key='register_key' AND value=?) AND (SELECT count(*) FROM node WHERE created_at>=?)<?", (key,until-duration,limit),|r|r.get(0))?;
+            if !valid || until <= Utc::now().timestamp() {
+                return Ok(None);
+            }
+        }
         tx.execute(
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
@@ -738,8 +776,11 @@ impl Db {
             "INSERT INTO traffic (node_id,history_since) VALUES (?1,?2)",
             params![id, Local::now().date_naive().to_string()],
         )?;
+        if let Some((_, _, _, Some(hash))) = window {
+            tx.execute("INSERT INTO node_maintenance(node,key_hash) VALUES(?,?)", (id, hash))?;
+        }
         tx.commit()?;
-        Ok(id)
+        Ok(Some(id))
     }
 
     /// How many nodes were created at or after `ts`. Bounds what one registration
@@ -974,7 +1015,12 @@ impl Db {
     /// Replaces a node's token, which immediately locks out the old one. False
     /// when no node has this id.
     pub fn reset_token(&self, id: i64, token: &str) -> Result<bool> {
-        Ok(self.conn().execute("UPDATE node SET token=?2 WHERE id=?1", params![id, token])? > 0)
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let updated = tx.execute("UPDATE node SET token=?2 WHERE id=?1", params![id, token])? > 0;
+        crate::maintenance::revoke(&tx, id, false)?;
+        tx.commit()?;
+        Ok(updated)
     }
 
     pub fn node_by_token(&self, token: &str) -> Result<Option<i64>> {
@@ -1872,6 +1918,19 @@ impl Db {
         let tx = candidate.transaction()?;
         tx.execute("DELETE FROM session", [])?;
         tx.execute("DELETE FROM upgrade_worker", [])?;
+        tx.execute("UPDATE node_maintenance SET key_hash=NULL", [])?;
+        tx.execute("DELETE FROM setting WHERE key IN ('register_key','register_until')", [])?;
+        // An older backup must not undo an offline policy observed since it was made.
+        let mut offline = conn.prepare("SELECT node FROM node_maintenance WHERE offline_only=1")?;
+        for row in offline.query_map([], |r| r.get::<_, i64>(0))? {
+            let id = row?;
+            tx.execute(
+                "INSERT INTO node_maintenance(node,offline_only) SELECT id,1 FROM node WHERE id=?
+                ON CONFLICT(node) DO UPDATE SET offline_only=1,key_hash=NULL",
+                [id],
+            )?;
+        }
+        drop(offline);
         crate::rollout::invalidate_running(
             &tx,
             "数据库已恢复，请核对节点版本后重试",
@@ -2795,6 +2854,34 @@ mod tests {
             .unwrap();
         db.set_traffic(id, &TrafficPatch { total_rx: Some(130_000), ..Default::default() }).unwrap();
         assert_eq!(db.all_traffic()[&id].month_tx, 0);
+    }
+
+    #[test]
+    fn schema_eleven_cannot_promote_legacy_workers_or_registration_windows() {
+        let scratch = Scratch::new();
+        {
+            let old = Db::open(&scratch.0).unwrap();
+            let node = old.create_node(&Default::default(), "legacy-report").unwrap();
+            old.set("register_key", "legacy-window").unwrap();
+            old.set("register_until", "10000000000").unwrap();
+            old.conn()
+                .execute("INSERT INTO upgrade_worker(node,protocol,last_seen) VALUES(?,2,1)", [node])
+                .unwrap();
+            old.conn().execute_batch("DROP TABLE node_maintenance; ALTER TABLE upgrade_item DROP COLUMN receipt_order; PRAGMA user_version=11").unwrap();
+        }
+        let db = Db::open(&scratch.0).unwrap();
+        assert!(db.node_by_token("legacy-report").unwrap().is_some());
+        assert!(db.get("register_key").is_none());
+        assert!(db.get("register_until").is_none());
+        let rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT (SELECT count(*) FROM upgrade_worker)+(SELECT count(*) FROM node_maintenance)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod auth;
 mod backup;
 mod db;
 mod frontend;
+mod maintenance;
 mod notify;
 mod rollout;
 #[cfg(test)]
@@ -22,7 +23,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::extract::{Path, State};
 use axum::http::{header, Extensions, HeaderMap, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
@@ -309,6 +310,8 @@ struct Args {
     database: String,
     reset_password: bool,
     check_db: bool,
+    maintenance: Option<(maintenance::Action, i64)>,
+    maintenance_output: Option<PathBuf>,
     site: String,
     themes: PathBuf,
 }
@@ -330,7 +333,9 @@ fn default_listen() -> &'static str {
 
 fn parse_args() -> Result<Args> {
     let mut listen = None;
-    let mut database = "monitor.db".to_owned();
+    let mut database = None;
+    let mut maintenance = None;
+    let mut maintenance_output = None;
     let mut reset_password = false;
     let mut check_db = false;
     let mut site = String::new();
@@ -340,7 +345,25 @@ fn parse_args() -> Result<Args> {
         let mut value = || it.next().unwrap_or_default();
         match arg.as_str() {
             "--listen" => listen = Some(value()),
-            "--db" => database = value(),
+            "--db" => {
+                anyhow::ensure!(database.is_none(), "duplicate --db");
+                database = Some(value());
+            }
+            "--maintenance-grant" | "--maintenance-revoke" | "--maintenance-offline" => {
+                anyhow::ensure!(maintenance.is_none(), "choose exactly one maintenance action and node");
+                let node: i64 = value().parse().context("expected a positive node ID")?;
+                anyhow::ensure!(node > 0, "expected a positive node ID");
+                let action = match arg.as_str() {
+                    "--maintenance-grant" => maintenance::Action::Grant,
+                    "--maintenance-revoke" => maintenance::Action::Revoke,
+                    _ => maintenance::Action::Offline,
+                };
+                maintenance = Some((action, node));
+            }
+            "--maintenance-output" => {
+                anyhow::ensure!(maintenance_output.is_none(), "duplicate --maintenance-output");
+                maintenance_output = Some(PathBuf::from(value()));
+            }
             "--reset-password" => reset_password = true,
             "--check-db" => check_db = true,
             "--site" => site = value(),
@@ -349,6 +372,9 @@ fn parse_args() -> Result<Args> {
                 println!(
                     "monitor-hub {}\n\n\
                      Usage: monitor-hub [--check-db] [--reset-password] [--listen [::]:28080] [--db monitor.db] [--themes themes] [--site https://hub.example.com]\n\n\
+                     Linux root: monitor-hub --db /path/monitor.db --maintenance-offline NODE_ID\n\
+                     Linux root: monitor-hub --db /path/monitor.db --maintenance-revoke NODE_ID\n\
+                     Linux root: monitor-hub --db /path/monitor.db --maintenance-grant NODE_ID --site https://hub.example.com --maintenance-output /root/node.json\n\n\
                      --listen defaults to [::]:28080, one socket serving IPv6 and IPv4\n\
                      both; where the kernel has no dual-stack sockets it is 0.0.0.0:28080.\n\
                      --themes defaults to a themes/ directory beside the database.\n\
@@ -363,6 +389,25 @@ fn parse_args() -> Result<Args> {
             other => anyhow::bail!("unknown argument: {other}"),
         }
     }
+    anyhow::ensure!(
+        maintenance_output.is_some() == matches!(maintenance, Some((maintenance::Action::Grant, _))),
+        "--maintenance-grant requires one --maintenance-output file; other operations accept none"
+    );
+    if let Some((action, _)) = maintenance {
+        anyhow::ensure!(
+            database.as_ref().is_some_and(|path| std::path::Path::new(path).is_absolute()),
+            "maintenance requires --db /absolute/path/to/existing.db"
+        );
+        anyhow::ensure!(
+            !reset_password && !check_db && listen.is_none() && themes.is_none(),
+            "maintenance cannot start the server or another operation"
+        );
+        anyhow::ensure!(
+            action != maintenance::Action::Grant || api::https_domain(&site).is_some(),
+            "signing a node requires --site https://hub.example.com"
+        );
+    }
+    let database = database.unwrap_or_else(|| "monitor.db".to_owned());
     let listen_defaulted = listen.is_none();
     let listen: SocketAddr = listen.unwrap_or_else(|| default_listen().to_owned()).parse()?;
     let themes = themes.unwrap_or_else(|| {
@@ -374,6 +419,8 @@ fn parse_args() -> Result<Args> {
         database,
         reset_password,
         check_db,
+        maintenance,
+        maintenance_output,
         site: site.trim_end_matches('/').to_owned(),
         themes,
     })
@@ -389,6 +436,17 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
+    if let Some((action, node)) = args.maintenance {
+        maintenance::local_root(
+            &args.database,
+            action,
+            node,
+            &args.site,
+            args.maintenance_output.as_deref(),
+        )?;
+        println!("Maintenance policy updated for node {node}.");
+        return Ok(());
+    }
     if args.check_db {
         anyhow::ensure!(std::path::Path::new(&args.database).is_file(), "database does not exist");
         let db = Db::open(&args.database)?;
@@ -497,6 +555,7 @@ async fn main() -> Result<()> {
         .route("/api/nodes/order", put(api::reorder_nodes))
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
         .route("/api/nodes/{id}/token", post(api::reset_token))
+        .route("/api/nodes/{id}/maintenance", post(maintenance::policy))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))

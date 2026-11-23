@@ -176,7 +176,7 @@ function CreateNode({ onClose, onSaved }: {
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>添加节点</DialogTitle>
-          <DialogDescription>添加后，在节点的「安装 Agent」中复制命令。新装的 HTTPS 节点默认启用升级器 v2。</DialogDescription>
+          <DialogDescription>添加后，在节点的「安装 Agent」中复制命令。使用注册窗口安装的 HTTPS 节点会自动配对升级器。单节点使用上报 Token 安装后，须另行配对维护凭据。</DialogDescription>
         </DialogHeader>
         <form className="space-y-4" onSubmit={save}>
           <Field label="名称">
@@ -492,7 +492,7 @@ function registerCommand(site: string, key: string, skipUpdater: boolean) {
 
 function UpdaterOption({ skip, onChange }: { skip: boolean; onChange: (value: boolean) => void }) {
   return <div className="space-y-2 text-sm">
-    <p className="text-muted-foreground">新装的 HTTPS 节点默认启用升级器 v2。之后可在后台发起 Agent 升级。</p>
+    <p className="text-muted-foreground">使用注册窗口安装的 HTTPS 节点会自动配对升级器。单节点使用上报 Token 安装后，须另行配对维护凭据。之后可在后台发起 Agent 升级。</p>
     <label className="flex items-center gap-2"><input type="checkbox" checked={skip} onChange={event => onChange(event.target.checked)} />本次跳过升级器安装</label>
   </div>
 }
@@ -633,8 +633,8 @@ function InstallDialog({ node, site, onClose, onRotated }: {
             </Select>
           </Field>
           {offline ? <div className="space-y-3 text-sm">
-            <p>在联网设备下载并校验与 Hub 版本对应的离线包，传到目标机。已有节点解压后以 root 执行以下命令，沿用原 HTTP 地址、凭证和服务配置。</p>
-            <pre className="overflow-auto rounded-lg border bg-muted/40 p-3 text-xs select-all">sh ./install.sh --offline-dir .</pre>
+            <p>从可信设备取得该版本的归档摘要，并通过 SSH 放入校验工具。将 SHA256 和 PACKAGE 分别设为可信摘要和 HTTP 包地址，在原节点以 root 执行以下命令。</p>
+            <pre className="overflow-auto rounded-lg border bg-muted/40 p-3 text-xs select-all">sh /root/agent-offline-install.sh "$SHA256" "$PACKAGE"</pre>
             <p>首次安装须使用本节点 Token 配置 HTTP 地址和服务。<a href="https://github.com/ClaraCora/Cmonitor/blob/main/OFFLINE_DEPLOY.md" target="_blank" rel="noreferrer" className="text-primary underline">查看离线安装步骤</a></p>
             {token && <Button variant="outline" size="sm" onClick={() => copy(token)}>复制节点 Token</Button>}
           </div> : <>
@@ -655,7 +655,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
             <span>
               <span className="block font-medium">换发凭证</span>
               <span className="mt-0.5 block text-xs text-muted-foreground">
-                旧凭证立即作废，节点需要使用新 Token 才能恢复上报
+                旧凭证和维护授权会失效。更新 Token 后，HTTPS 节点需重新配对升级器。
               </span>
             </span>
             <Button variant="outline" size="sm" disabled={rotating} onClick={() => setConfirmRotate(true)}>
@@ -665,7 +665,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
         </div>
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>关闭</Button>
-          <Button onClick={() => copy(offline ? "sh ./install.sh --offline-dir ." : command)} disabled={!offline && !command}>
+          <Button onClick={() => copy(offline ? 'sh /root/agent-offline-install.sh "$SHA256" "$PACKAGE"' : command)} disabled={!offline && !command}>
             <Copy className="size-4" /> {offline ? "复制离线升级命令" : "复制"}
           </Button>
         </DialogFooter>
