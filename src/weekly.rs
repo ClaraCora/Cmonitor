@@ -1,4 +1,5 @@
 //! Daily accounting totals for the seven completed Hub-local calendar days.
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,7 @@ use crate::{App, Shared};
 #[derive(PartialEq)]
 struct Member {
     id: i64,
+    name: String,
     region: String,
     created_at: i64,
 }
@@ -27,27 +29,54 @@ pub(crate) struct Cache {
     bytes: Bytes,
 }
 
-#[derive(Default, Clone, Copy, Serialize)]
-struct Bucket {
+#[derive(Clone, Copy, Serialize)]
+struct RankedNode<'a> {
+    id: i64,
+    name: &'a str,
+    rx: u64,
+    tx: u64,
+}
+
+impl RankedNode<'_> {
+    fn order(&self) -> (Reverse<u128>, i64) {
+        (Reverse(u128::from(self.rx) + u128::from(self.tx)), self.id)
+    }
+}
+
+#[derive(Default, Serialize)]
+struct Bucket<'a> {
     rx: Option<u64>,
     tx: Option<u64>,
     observed_nodes: usize,
     expected_nodes: usize,
+    top_nodes: Vec<RankedNode<'a>>,
 }
 
-impl Bucket {
-    fn record(&mut self, rx: u64, tx: u64) {
+impl<'a> Bucket<'a> {
+    fn record(&mut self, node: RankedNode<'a>) {
         self.observed_nodes += 1;
-        self.rx = Some(self.rx.unwrap_or_default().saturating_add(rx));
-        self.tx = Some(self.tx.unwrap_or_default().saturating_add(tx));
+        self.rx = Some(self.rx.unwrap_or_default().saturating_add(node.rx));
+        self.tx = Some(self.tx.unwrap_or_default().saturating_add(node.tx));
+
+        // Retain only the best ten as the ledger is read. Country and global
+        // rankings are independent, without a second query or a fleet-wide sort.
+        const LIMIT: usize = 10;
+        let order = node.order();
+        let index = self.top_nodes.partition_point(|other| other.order() < order);
+        if index < LIMIT {
+            if self.top_nodes.len() == LIMIT {
+                self.top_nodes.pop();
+            }
+            self.top_nodes.insert(index, node);
+        }
     }
 }
 
 #[derive(Serialize)]
-struct Week {
+struct Week<'a> {
     days: [NaiveDate; 7],
-    all: [Bucket; 7],
-    regions: BTreeMap<String, [Bucket; 7]>,
+    all: [Bucket<'a>; 7],
+    regions: BTreeMap<String, [Bucket<'a>; 7]>,
 }
 
 fn snapshot(app: &App, today: NaiveDate, admin: bool) -> Result<Option<Bytes>> {
@@ -61,15 +90,16 @@ fn snapshot(app: &App, today: NaiveDate, admin: bool) -> Result<Option<Bytes>> {
             return Ok(None);
         }
     }
-    // A cache hit checks only current public membership. This also catches an
-    // IP/region change and never serves a recently hidden node's old figures.
+    // A cache hit checks only current public membership. This also catches a
+    // rename or region change and never serves a recently hidden node's old figures.
     let members = conn
-        .prepare_cached("SELECT id,country,created_at FROM node WHERE public=1 ORDER BY id")?
+        .prepare_cached("SELECT id,country,created_at,name FROM node WHERE public=1 ORDER BY id")?
         .query_map([], |row| {
             Ok(Member {
                 id: row.get(0)?,
                 region: row.get::<_, String>(1)?.trim().to_ascii_uppercase(),
                 created_at: row.get(2)?,
+                name: row.get(3)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -104,10 +134,14 @@ fn snapshot(app: &App, today: NaiveDate, admin: bool) -> Result<Option<Bytes>> {
             if i >= days.len() || created.is_none_or(|first| first > day) {
                 continue;
             }
-            let rx = u64::try_from(row.get::<_, i64>(1)?)?;
-            let tx = u64::try_from(row.get::<_, i64>(2)?)?;
-            region[i].record(rx, tx);
-            week.all[i].record(rx, tx);
+            let node = RankedNode {
+                id: member.id,
+                name: &member.name,
+                rx: u64::try_from(row.get::<_, i64>(1)?)?,
+                tx: u64::try_from(row.get::<_, i64>(2)?)?,
+            };
+            region[i].record(node);
+            week.all[i].record(node);
         }
     }
     let bytes = Bytes::from(serde_json::to_vec(&week)?);
@@ -197,18 +231,67 @@ mod tests {
                 "2026-11-22"
             ])
         );
-        assert_eq!(result["regions"]["SG"][0], json!({"rx":0,"tx":0,"expected_nodes":1,"observed_nodes":1}));
-        assert_eq!(result["all"][0], json!({"rx":0,"tx":0,"expected_nodes":2,"observed_nodes":1}));
-        assert_eq!(result["all"][1], json!({"rx":null,"tx":null,"expected_nodes":2,"observed_nodes":0}));
+        let zero = json!({"id": a, "name": "Secret name A", "rx": 0, "tx": 0});
+        let fa = json!({"id": a,"name": "Secret name A","rx":11,"tx":25});
+        let fb = json!({"id": b,"name": "New node","rx":88,"tx":20});
+        let fu = json!({"id": unknown,"name": "Unknown address","rx":100,"tx":5});
+        assert_eq!(
+            result["regions"]["SG"][0],
+            json!({"rx":0,"tx":0,"expected_nodes":1,"observed_nodes":1,"top_nodes":[zero]})
+        );
+        assert_eq!(
+            result["all"][0],
+            json!({"rx":0,"tx":0,"expected_nodes":2,"observed_nodes":1,"top_nodes":[zero]})
+        );
+        assert_eq!(
+            result["all"][1],
+            json!({"rx":null,"tx":null,"expected_nodes":2,"observed_nodes":0,"top_nodes":[]})
+        );
         assert_eq!(result["all"][5]["expected_nodes"], 3);
         assert_eq!(
             result["regions"]["SG"][6],
-            json!({"rx":99,"tx":45,"expected_nodes":2,"observed_nodes":2})
+            json!({"rx":99,"tx":45,"expected_nodes":2,"observed_nodes":2,"top_nodes":[fb,fa]})
         );
         assert_eq!(result["regions"][""][6]["rx"], 100);
-        assert_eq!(result["all"][6], json!({"rx":199,"tx":50,"expected_nodes":3,"observed_nodes":3}));
+        assert_eq!(
+            result["all"][6],
+            json!({"rx":199,"tx":50,"expected_nodes":3,"observed_nodes":3,"top_nodes":[fb,fu,fa]})
+        );
         assert!(result["regions"].get("JP").is_none());
         assert_eq!(read(&app, "2026-11-24")["all"][6]["rx"], 12345);
+    }
+
+    #[test]
+    fn each_day_and_region_ranks_its_own_top_ten_without_truncating_totals() {
+        let app = app();
+        let mut sg = vec![];
+        for n in 0..12 {
+            let id = node(&app, &format!("SG {n}"), "SG", true, "2026-01-01");
+            sg.push(id);
+            record(&app, id, "2026-11-22", n, 100 - n); // 12 equal totals tie on id.
+        }
+        let jp = node(&app, "JP leader", "JP", true, "2026-01-01");
+        let other_jp = node(&app, "JP runner-up", "JP", true, "2026-01-01");
+        record(&app, jp, "2026-11-22", i64::MAX, i64::MAX);
+        record(&app, other_jp, "2026-11-22", i64::MAX, i64::MAX - 1);
+        record(&app, sg[11], "2026-11-21", 101, 2);
+        let result = read(&app, "2026-11-23");
+        let ids = |bucket: &Value| {
+            bucket["top_nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n["id"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&result["all"][6]), [vec![jp, other_jp], sg[..8].to_vec()].concat());
+        assert_eq!(ids(&result["regions"]["SG"][6]), sg[..10]);
+        assert_eq!(ids(&result["regions"]["JP"][6]), vec![jp, other_jp]);
+        assert_eq!(result["all"][6]["observed_nodes"], 14);
+        assert_eq!(result["all"][6]["rx"], u64::MAX);
+        assert_eq!(result["all"][6]["tx"], u64::MAX);
+        assert_eq!(ids(&result["all"][5]), vec![sg[11]]);
+        assert!(ids(&result["all"][0]).is_empty());
     }
 
     #[test]
@@ -220,6 +303,8 @@ mod tests {
         let bytes = snapshot(&app, date, false).unwrap().unwrap();
         let hit = snapshot(&app, date, false).unwrap().unwrap();
         assert_eq!(bytes.as_ptr(), hit.as_ptr(), "cache reuses serialized public data");
+        app.db.conn().execute("UPDATE node SET name='renamed' WHERE id=?1", [a]).unwrap();
+        assert_eq!(read(&app, "2026-11-23")["all"][6]["top_nodes"][0]["name"], "renamed");
         app.db.conn().execute("UPDATE node SET country='CN' WHERE id=?1", [a]).unwrap();
         let changed = read(&app, "2026-11-23");
         assert!(changed["regions"].get("JP").is_none());
@@ -227,7 +312,10 @@ mod tests {
         app.db.conn().execute("UPDATE node SET public=0 WHERE id=?1", [a]).unwrap();
         let hidden = read(&app, "2026-11-23");
         assert_eq!(hidden["regions"], json!({}));
-        assert_eq!(hidden["all"][6], json!({"rx":null,"tx":null,"expected_nodes":0,"observed_nodes":0}));
+        assert_eq!(
+            hidden["all"][6],
+            json!({"rx":null,"tx":null,"expected_nodes":0,"observed_nodes":0,"top_nodes":[]})
+        );
     }
 
     #[test]
