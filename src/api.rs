@@ -465,6 +465,7 @@ fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
 /// Drops the cached frames so the next push rebuilds. Without it a node just
 /// added in the panel would disappear from the list until the frame expires.
 fn invalidate_snapshot(app: &App) {
+    *app.weekly.lock().unwrap_or_else(|e| e.into_inner()) = None;
     for slot in app.snapshot.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
         slot.0 = 0;
     }

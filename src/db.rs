@@ -1292,9 +1292,10 @@ impl Db {
                 today,
                 traffic_incomplete
             ])?;
+            // A missing reading must not turn an unobserved day into a measured zero.
+            conn.execute("INSERT INTO traffic_daily(node_id,day,rx,tx) VALUES(?1,?2,?3,?4)
+                ON CONFLICT(node_id,day) DO UPDATE SET rx=MIN(9223372036854775807,rx+excluded.rx), tx=MIN(9223372036854775807,tx+excluded.tx)", params![node_id,today,d_rx,d_tx])?;
         }
-        conn.execute("INSERT INTO traffic_daily(node_id,day,rx,tx) VALUES(?1,?2,?3,?4)
-            ON CONFLICT(node_id,day) DO UPDATE SET rx=MIN(9223372036854775807,rx+excluded.rx), tx=MIN(9223372036854775807,tx+excluded.tx)", params![node_id,today,d_rx,d_tx])?;
         conn.commit()?;
         Ok(Traffic {
             total_rx,

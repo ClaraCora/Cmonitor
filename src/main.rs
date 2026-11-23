@@ -19,6 +19,7 @@ mod rollout;
 mod rollout_e2e;
 mod security;
 mod terminal;
+mod weekly;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -52,6 +53,7 @@ pub struct App {
     /// millisecond it was built. Shared by every browser stream so viewers do
     /// not multiply the query load. See `api::live_snapshot`.
     pub snapshot: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
+    weekly: Mutex<Option<weekly::Cache>>,
     pub throttle: auth::Throttle,
     /// Failed agent registrations, counted separately from failed sign-ins: the
     /// two have different threat models, and a batch install run with a stale
@@ -84,6 +86,7 @@ impl App {
             db,
             agents: RwLock::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
+            weekly: Mutex::default(),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
             terminals: terminal::Registry::default(),
@@ -545,6 +548,7 @@ async fn main() -> Result<()> {
         .route("/api/visitor", get(api::visitor))
         .route("/api/visitor-log", get(api::visitor_log).delete(api::clear_visitor_log))
         .route("/api/nodes", get(api::nodes))
+        .route("/api/traffic/weekly", get(weekly::get))
         .route("/api/nodes/{id}/metrics", get(api::metrics))
         .route("/api/ws", get(api::live_ws))
         .route("/api/terminal/ws", get(terminal::handler))
