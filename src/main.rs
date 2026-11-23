@@ -12,6 +12,7 @@ mod db;
 mod frontend;
 mod maintenance;
 mod notify;
+mod offline_upgrade;
 mod rollout;
 #[cfg(test)]
 mod rollout_e2e;
@@ -556,6 +557,7 @@ async fn main() -> Result<()> {
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
         .route("/api/nodes/{id}/token", post(api::reset_token))
         .route("/api/nodes/{id}/maintenance", post(maintenance::policy))
+        .route("/api/nodes/{id}/offline-upgrade-command", get(offline_upgrade::command))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))

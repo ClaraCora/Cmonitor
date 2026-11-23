@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Download } from 'lucide-react'
 import { api, ApiError, provisioningSite, type Node } from '@/lib/api'
 import { Button } from '@/components/ui/button'
+import { OfflineUpgradeButton } from './OfflineUpgradeButton'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 
 type BatchItem = { node: number; status: string; reason?: string; deadline?: number; updated_at?: number }
@@ -219,6 +220,7 @@ export function AgentRollout({ nodes, site }: { nodes: Node[]; site: string }) {
             {nodes.map(node => <li key={node.id} className="py-2">
               <span className="[overflow-wrap:anywhere]">{node.name}</span>
               <WorkerInfo heartbeat={state.workers?.[node.id]} />
+              {state.maintenance?.[node.id] === 'offline_only' && <div className="mt-1"><OfflineUpgradeButton node={node} /></div>}
             </li>)}
           </ul>
         </details>}
@@ -239,14 +241,17 @@ export function AgentRollout({ nodes, site }: { nodes: Node[]; site: string }) {
             {nodes.map(node => {
               const reason = state.nodes[node.id] ?? 'offline'
               const selected = chosen.includes(node.id)
-              return <label key={node.id} className="grid min-h-11 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-3 border-b py-2 text-sm">
+              return <div key={node.id} className="border-b py-2">
+                <label className="grid min-h-7 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-3 text-sm">
                 <input type="checkbox" disabled={!selected && (reason !== 'ready' || chosen.length >= maxBatchSize)} checked={selected}
                   onChange={() => select(selected ? chosen.filter(id => id !== node.id) : [...chosen, node.id])} />
                 <span className="min-w-0 font-medium [overflow-wrap:anywhere]">{node.name}</span>
                 <span className="col-start-2 text-xs leading-relaxed text-muted-foreground">Agent v{node.agent_version || '?'} · {labels[reason] ?? '状态未知'}
                   <WorkerInfo heartbeat={state.workers?.[node.id]} />
                 </span>
-              </label>
+                </label>
+                {state.maintenance?.[node.id] === 'offline_only' && <div className="mt-1 pl-6"><OfflineUpgradeButton node={node} /></div>}
+              </div>
             })}
           </div>
         </fieldset>}

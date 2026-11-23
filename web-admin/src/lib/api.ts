@@ -70,6 +70,8 @@ export type Node = {
   token?: string
   /** Panel only. Whether going offline and returning are announced. */
   notify?: boolean
+  /** Panel only. This node uses manual, offline upgrades. */
+  offline_only?: boolean
   terminal_capable?: boolean
   terminal_enabled?: boolean
   terminal_reason?: "available" | "policy" | "plaintext" | "unknown" | "offline"

@@ -251,6 +251,7 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
         .map(|n| {
             let mut view = node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), &tasks, full);
             if full {
+                view["offline_only"] = json!(offline.contains(&n.id));
                 view["terminal_enabled"] = json!(
                     !offline.contains(&n.id)
                         && app.db.get(&format!("terminal_node_{}", n.id)).as_deref() != Some("off")

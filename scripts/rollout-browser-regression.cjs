@@ -15,6 +15,10 @@ async function run() {
       price: 0, billing_cycle: '', traffic_limit: 0, ip: '', ipv4: '', ipv6: '', os: '', tags: '',
     }))
     const states = { 1: 'current', 2: 'ready', 3: 'plaintext', 4: 'ready', 5: 'ready', 6: 'ready', 7: 'ready' }
+    nodes[2].offline_only = true
+    const command = "sh /root/agent-offline-install.sh '" + 'a'.repeat(64) + "' 'http://fixture.test/agent-v1.2.2.tar.gz'"
+    const commandReads = []
+    let commandAvailable = true
     let workers
     let batch = { id: 42, target: '1.2.1', status: 'running', reason: '', items: [{ node: 1, status: 'observing' }] }
     let failRead = true
@@ -25,6 +29,13 @@ async function run() {
       const url = new URL(route.request().url())
       if (url.origin !== origin) return route.abort()
       const pathname = url.pathname
+      if (pathname.endsWith('/offline-upgrade-command')) {
+        commandReads.push([route.request().method(), pathname])
+        assert.equal(pathname, '/api/nodes/3/offline-upgrade-command')
+        return commandAvailable
+          ? route.fulfill({ json: { command, version: '1.2.2' } })
+          : route.fulfill({ status: 409, body: '请先配置该版本的离线包' })
+      }
       if (pathname === '/api/agent-upgrades') {
         if (route.request().method() === 'POST') {
           writes.push(route.request().postDataJSON())
@@ -34,7 +45,7 @@ async function run() {
           // The Hub accepted the write but its HTTP response was lost.
           return route.abort('connectionreset')
         }
-        return failRead ? route.fulfill({ status: 503, body: '模拟暂时中断' }) : route.fulfill({ json: { target: '1.2.1', nodes: states, batch, workers } })
+        return failRead ? route.fulfill({ status: 503, body: '模拟暂时中断' }) : route.fulfill({ json: { target: '1.2.1', nodes: states, batch, workers, maintenance: workers ? { 3: 'offline_only' } : undefined } })
       }
       if (pathname === '/api/me') return route.fulfill({ json: { authed: true, site_name: 'Cmonitor' } })
       if (pathname === '/api/nodes') return route.fulfill({ json: { nodes, admin: true } })
@@ -45,6 +56,42 @@ async function run() {
     await page.routeWebSocket('**/api/ws', ws => ws.send(JSON.stringify({ nodes, admin: true })))
     await page.clock.install()
     await page.goto(origin + '/clara/nodes')
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin })
+    const copy = page.getByRole('button', { name: '复制升级命令', exact: true })
+    assert.equal(commandReads.length, 0, 'rendering and receiving node data do not fetch a command')
+    await copy.waitFor()
+    assert.equal(await copy.count(), 1, 'only the explicitly offline-maintained node has a visible copy action')
+    await copy.click()
+    await page.getByText('已复制 节点 3 的升级命令').waitFor()
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), command)
+    assert.deepEqual(writes, [], 'copying does not start an upgrade')
+    await page.setViewportSize({ width: 1280, height: 900 })
+    assert.equal(await page.getByRole('row').filter({ hasText: '节点 3' }).getByRole('button', { name: '复制升级命令' }).count(), 1)
+    await page.evaluate(() => {
+      for (const method of ['write', 'writeText']) {
+        Object.defineProperty(navigator.clipboard, method, { configurable: true, value: async () => {
+          throw new DOMException('Clipboard blocked in test', 'NotAllowedError')
+        } })
+      }
+    })
+    await copy.click()
+    const fallback = page.getByRole('dialog', { name: '节点 3 · 手动复制升级命令' })
+    const text = fallback.getByRole('textbox', { name: 'Agent v1.2.2 升级命令' })
+    await fallback.getByText(/通过独立 SSH 登录此节点/).waitFor()
+    assert.equal(await text.inputValue(), command)
+    await fallback.getByRole('button', { name: '全选命令' }).click()
+    assert.deepEqual(await text.evaluate(el => [el.selectionStart, el.selectionEnd]), [0, command.length])
+    await fallback.getByRole('button', { name: '关闭', exact: true }).click()
+    await fallback.waitFor({ state: 'hidden' })
+    await page.clock.runFor(50) // Radix restores focus on the next timer tick.
+    assert(await copy.evaluate(el => el === document.activeElement))
+    await page.setViewportSize({ width: 390, height: 844 })
+    commandAvailable = false
+    await copy.click()
+    await page.getByText('请先配置该版本的离线包').waitFor()
+    assert.equal(await fallback.count(), 0, 'failed GET must not offer an old command')
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false)
+    commandAvailable = true
     const trigger = page.getByRole('button', { name: '升级 Agent', exact: true })
     await trigger.click()
     const dialog = page.getByRole('dialog')
@@ -86,6 +133,16 @@ async function run() {
     assert(await current.isDisabled(), 'target-version nodes still show the protocol from their last heartbeat')
     assert(await dialog.getByRole('checkbox', { name: /节点 2 .*升级器 v1.*最近心跳/ }).isEnabled(), 'legacy workers remain selectable')
     assert(await dialog.getByRole('checkbox', { name: /节点 3 .*升级器协议未记录/ }).isDisabled())
+    const offlineChoice = dialog.getByRole('checkbox', { name: /节点 3/ })
+    const rowCopy = dialog.getByRole('button', { name: '复制升级命令' })
+    await rowCopy.click()
+    await fallback.waitFor()
+    assert.equal(await text.inputValue(), command)
+    assert.equal(await fallback.evaluate(el => el.scrollWidth > el.clientWidth), false)
+    await fallback.getByRole('button', { name: '关闭', exact: true }).click()
+    assert.equal(await offlineChoice.isChecked(), false)
+    assert.deepEqual(commandReads, Array(4).fill(['GET', '/api/nodes/3/offline-upgrade-command']))
+    assert.deepEqual(writes, [])
     const retry = dialog.getByRole('button', { name: '选择可重试节点（3 台）' })
     await retry.click()
     await dialog.getByText('首台验证：节点 2').waitFor()
@@ -116,7 +173,7 @@ async function run() {
     await recent.getByText(/截止/).waitFor()
     assert.deepEqual(writes, [{ nodes: [2, 4, 6] }])
     assert.deepEqual(errors, [])
-    console.log('Upgrade dialog passed: legacy overview, polling recovery, retry selection, lost acknowledgement, ongoing rollback.')
+    console.log('Offline commands and upgrade dialog passed: clipboard, manual fallback, read-only requests, polling, retry selection and rollback.')
   } finally { await browser.close() }
 }
 

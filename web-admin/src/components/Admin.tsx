@@ -16,6 +16,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { addresses, api, changes, GIB, provisioningSite, terminalControl, trafficCorrection, upload, type Node, type PingTask, type VisitorRow } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 import { AgentRollout } from "./AgentRollout"
+import { OfflineUpgradeButton } from "./OfflineUpgradeButton"
 import { trackRestore, useRestoreOperation } from "@/lib/restore"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -599,7 +600,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
   const [skipUpdater, setSkipUpdater] = useState(false)
-  const [offline, setOffline] = useState(node.terminal_reason === "plaintext")
+  const [offline, setOffline] = useState(node.offline_only || node.terminal_reason === "plaintext")
 
   const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
   const command = token ? installCommand(site, token, seconds, skipUpdater) : ""
@@ -633,8 +634,9 @@ function InstallDialog({ node, site, onClose, onRotated }: {
             </Select>
           </Field>
           {offline ? <div className="space-y-3 text-sm">
+            {node.offline_only ? <p>通过独立 SSH 登录该节点，使用预置的校验工具。点击下方按钮取得当前版本的完整升级命令。</p> : <>
             <p>从可信设备取得该版本的归档摘要，并通过 SSH 放入校验工具。将 SHA256 和 PACKAGE 分别设为可信摘要和 HTTP 包地址，在原节点以 root 执行以下命令。</p>
-            <pre className="overflow-auto rounded-lg border bg-muted/40 p-3 text-xs select-all">sh /root/agent-offline-install.sh "$SHA256" "$PACKAGE"</pre>
+            <pre className="overflow-auto rounded-lg border bg-muted/40 p-3 text-xs select-all">sh /root/agent-offline-install.sh "$SHA256" "$PACKAGE"</pre></>}
             <p>首次安装须使用本节点 Token 配置 HTTP 地址和服务。<a href="https://github.com/ClaraCora/Cmonitor/blob/main/OFFLINE_DEPLOY.md" target="_blank" rel="noreferrer" className="text-primary underline">查看离线安装步骤</a></p>
             {token && <Button variant="outline" size="sm" onClick={() => copy(token)}>复制节点 Token</Button>}
           </div> : <>
@@ -665,9 +667,9 @@ function InstallDialog({ node, site, onClose, onRotated }: {
         </div>
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>关闭</Button>
-          <Button onClick={() => copy(offline ? 'sh /root/agent-offline-install.sh "$SHA256" "$PACKAGE"' : command)} disabled={!offline && !command}>
-            <Copy className="size-4" /> {offline ? "复制离线升级命令" : "复制"}
-          </Button>
+          {offline && node.offline_only ? <OfflineUpgradeButton node={node} /> : <Button onClick={() => copy(offline ? 'sh /root/agent-offline-install.sh "$SHA256" "$PACKAGE"' : command)} disabled={!offline && !command}>
+            <Copy className="size-4" /> {offline ? "复制命令模板" : "复制"}
+          </Button>}
         </DialogFooter>
       </DialogContent>
       {confirmRotate && (
@@ -821,6 +823,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
             </div>
             <Addresses node={n} />
             {n.network_interfaces?.length ? <p className="text-xs text-muted-foreground">统计网卡：{n.network_interfaces.join(", ")}</p> : null}
+            {n.offline_only && <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground"><span>仅离线升级</span><OfflineUpgradeButton node={n} /></div>}
             <p className="text-xs text-muted-foreground">本期流量 {n.traffic_incomplete ? "≥ " : ""}{bytes(monthUsage(n))}{n.traffic_incomplete && "（历史不完整）"} · {n.price>0 ? money(n.price,n.currency) : "免费"}</p>
           </div>
         })}
@@ -890,6 +893,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                       </Badge>
                     )}
                   </div>
+                  {n.offline_only && <div className="ml-8 mt-1"><OfflineUpgradeButton node={n} /></div>}
                 </TableCell>
                 {/* Addresses live only here, never on the public page. */}
                 <TableCell>
