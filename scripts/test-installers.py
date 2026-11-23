@@ -47,6 +47,8 @@ class Installers(unittest.TestCase):
 
     def stub(self, name, script):
         p = self.tools / name
+        # Fixtures may link to a platform tool, e.g. flock on the Linux runner.
+        p.unlink(missing_ok=True)
         p.write_text('#!/bin/sh\n' + script + '\n')
         p.chmod(0o755)
 
