@@ -9,6 +9,7 @@ import hashlib
 import http.client
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import secrets
@@ -194,7 +195,9 @@ def main():
                 output += frame.get("params", {}).get("data", "")
                 found = re.search(r"__UID=0 PID=(\d+)__", output)
                 if found:
-                    return channel, int(found[1])
+                    pid = int(found[1])
+                    assert Path(f"/proc/{pid}/cwd").samefile(pwd.getpwuid(0).pw_dir), "Web Terminal opened outside the account home"
+                    return channel, pid
 
         def shell_gone(pid):
             for _ in range(80):

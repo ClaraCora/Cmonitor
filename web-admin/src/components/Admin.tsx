@@ -1027,39 +1027,40 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   )
 }
 
-const exactTime = (ts: number) =>
-  new Date(ts * 1000).toLocaleString("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  })
-
-// ipinfo's org is "AS4760 HKT Limited"; the list wants those as two columns.
-function splitOrg(org?: string): [string, string] {
-  if (!org) return ["—", "—"]
-  const m = org.match(/^AS(\d+)\s*([\s\S]*)$/)
-  return m ? [`AS${m[1]}`, m[2].trim() || "—"] : ["—", org]
-}
+const VisitorOverview = lazy(() => import("./VisitorOverview"))
 
 function Visitors() {
   const [rows, setRows] = useState<VisitorRow[] | null>(null)
   const [confirmClear, setConfirmClear] = useState(false)
   const [clearing, setClearing] = useState(false)
+  const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
-  const load = () => { setError(""); return api<{ visits: VisitorRow[] }>("/visitor-log").then((d) => setRows(d.visits)).catch((e: Error) => setError(e.message || "网络错误")) }
+  const currentRequest = useRef(0)
+  const load = async () => {
+    const request = ++currentRequest.current
+    setLoading(true)
+    setError("")
+    try {
+      const data = await api<{ visits: VisitorRow[] }>("/visitor-log")
+      if (request === currentRequest.current) setRows(data.visits)
+    } catch (e) {
+      if (request === currentRequest.current) setError((e as Error).message || "网络错误")
+    } finally {
+      if (request === currentRequest.current) setLoading(false)
+    }
+  }
   useEffect(() => { queueMicrotask(load) }, [])
 
   const clear = async () => {
     setClearing(true)
     try {
       await api("/visitor-log", { method: "DELETE" })
-      toast.success("已清空访客记录")
-      setConfirmClear(false)
+      currentRequest.current++
       setRows([])
+      setLoading(false)
+      setError("")
+      setConfirmClear(false)
+      toast.success("已清空访客记录")
     } catch (e) {
       toast.error((e as Error).toString())
     } finally {
@@ -1068,69 +1069,27 @@ function Visitors() {
   }
 
   return (
-    <Card className="gap-0 overflow-x-auto p-0">
-      <div className="flex items-center justify-between gap-3 border-b px-4 py-3">
-        <div className="text-sm text-muted-foreground">状态页最近 100 次访问</div>
+    <section className="min-w-0 space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">访客记录</h1>
+          <p className="mt-1 text-sm text-muted-foreground">状态页最近 100 次访问</p>
+        </div>
         <div className="flex items-center gap-1">
-          <Button variant="ghost" size="icon" onClick={load} title="刷新" aria-label="刷新">
-            <RefreshCw />
+          <Button variant="outline" size="sm" disabled={loading || clearing} onClick={load} title="刷新" aria-label="刷新">
+            <RefreshCw aria-hidden="true" />刷新
           </Button>
-          <Button variant="ghost" size="icon" onClick={() => setConfirmClear(true)} title="清空访客记录" aria-label="清空访客记录">
-            <Trash2 className="text-destructive" />
+          <Button variant="ghost" size="icon" disabled={!rows?.length || clearing} onClick={() => setConfirmClear(true)} title="清空访客记录" aria-label="清空访客记录">
+            <Trash2 aria-hidden="true" className="text-destructive" />
           </Button>
         </div>
       </div>
       {(error || rows === null) && <LoadState error={error} retry={load} />}
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead className="w-44">时间</TableHead>
-            <TableHead className="w-36">IP</TableHead>
-            <TableHead className="w-40">归属地</TableHead>
-            <TableHead className="w-24">ASN</TableHead>
-            <TableHead className="w-48">服务商</TableHead>
-            <TableHead>UA</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {(rows ?? []).map((v) => {
-            const [asn, isp] = splitOrg(v.org)
-            const place = [v.city, v.region, v.country].filter((x, i, a) => x && a.indexOf(x) === i).join(", ")
-            return (
-              <TableRow key={v.id}>
-                <TableCell className="tnum text-sm">{exactTime(v.ts)}</TableCell>
-                <TableCell className="tnum text-sm">{v.ip}</TableCell>
-                <TableCell className="text-sm">{place || "—"}</TableCell>
-                <TableCell className="tnum text-sm">{asn}</TableCell>
-                <TableCell className="text-sm">
-                  <span className="block max-w-56 truncate" title={isp}>{isp}</span>
-                </TableCell>
-                <TableCell className="text-xs text-muted-foreground">
-                  <span className="block max-w-md truncate" title={v.ua}>{v.ua}</span>
-                </TableCell>
-              </TableRow>
-            )
-          })}
-          {rows !== null && rows.length === 0 && (
-            <TableRow>
-              <TableCell colSpan={6} className="py-10 text-center text-sm text-muted-foreground">
-                还没有访客记录
-              </TableCell>
-            </TableRow>
-          )}
-        </TableBody>
-      </Table>
-      {confirmClear && (
-        <ConfirmDialog
-          title="清空访客记录？"
-          description="全部访客记录将被删除，不可恢复。"
-          confirmLabel="清空"
-          busy={clearing}
-          onClose={() => setConfirmClear(false)}
-          onConfirm={clear}
-        />
-      )}
-    </Card>
+      {rows && <Suspense fallback={<p role="status" className="text-sm text-muted-foreground">正在加载访客分布…</p>}>
+        <VisitorOverview rows={rows} />
+      </Suspense>}
+      {confirmClear && <ConfirmDialog title="清空访客记录？" description="全部访客记录将被删除，不可恢复。" confirmLabel="清空" busy={clearing} onClose={() => setConfirmClear(false)} onConfirm={clear} />}
+    </section>
   )
 }
 
