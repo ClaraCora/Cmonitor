@@ -534,8 +534,26 @@ pub async fn poll(State(app): State<Shared>, headers: HeaderMap, Json(input): Js
             return StatusCode::FORBIDDEN.into_response();
         }
         let Some(token) = bearer(&headers) else { return StatusCode::UNAUTHORIZED.into_response() };
-        if !token.starts_with("cmu_") || token.len() != 68 {
+        if !token.strip_prefix("cmu_").is_some_and(crate::pairing::hex_digest) {
             return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if input.protocol == Some(2) && input.action == "identity" {
+            // An interrupted pairing may need to confirm its locally persisted key.
+            // Looking up the identity must not announce a worker or claim a rollout.
+            return app
+                .db
+                .conn()
+                .query_row(
+                    "SELECT node FROM node_maintenance WHERE key_hash=? AND offline_only=0",
+                    [crate::auth::sha256(token)],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .map(|n| match n {
+                    Some(node) => Json(json!({"node":node})).into_response(),
+                    None => StatusCode::UNAUTHORIZED.into_response(),
+                })
+                .unwrap_or_else(db_error);
         }
         if input.protocol != Some(2)
             || !matches!(

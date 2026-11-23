@@ -3,6 +3,7 @@ import { Download } from 'lucide-react'
 import { api, ApiError, provisioningSite, type Node } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { OfflineUpgradeButton } from './OfflineUpgradeButton'
+import { PairCommand } from './PairCommand'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 
 type BatchItem = { node: number; status: string; reason?: string; deadline?: number; updated_at?: number }
@@ -29,13 +30,22 @@ function WorkerInfo({ heartbeat }: { heartbeat?: WorkerHeartbeat }) {
   </span>
 }
 
-function MaintenanceSettings({ nodes, policies, refresh }: {
-  nodes: Node[]; policies: Record<number, Policy>; refresh: () => void
+function MaintenanceSettings({ nodes, policies, states, workers, allowPair, refresh }: {
+  nodes: Node[]; policies: Record<number, Policy>; states: Record<number, string>
+  workers?: Record<number, WorkerHeartbeat>; allowPair: boolean; refresh: () => void
 }) {
   const [id, setId] = useState('')
   const [message, setMessage] = useState('')
   const [pending, setPending] = useState(false)
+  const [expanded, setExpanded] = useState(false)
+  const selected = nodes.find(node => node.id === Number(id))
   const policy = policies[Number(id)]
+  const state = states[Number(id)]
+  // The Hub reports these eligibility reasons only after confirming a TLS session.
+  const canPair = allowPair && selected?.online && policy === 'unpaired' && !selected.offline_only
+    && ['current', 'unenrolled', 'ready', 'unknown', 'no_report'].includes(state)
+  const heartbeat = workers?.[Number(id)]
+  const recentV2 = heartbeat?.protocol === 2 && heartbeat.last_seen >= Date.now() / 1000 - 120
   async function change(action: 'grant' | 'revoke' | 'offline') {
     if (!id || pending || !policy) return
     const node = nodes.find(n => n.id === Number(id))
@@ -68,7 +78,7 @@ function MaintenanceSettings({ nodes, policies, refresh }: {
       refresh()
     }
   }
-  return <details className="text-sm">
+  return <details className="text-sm" onToggle={event => setExpanded(event.currentTarget.open)}>
     <summary className="cursor-pointer font-medium">管理节点维护凭据</summary>
     <div className="mt-2 space-y-2">
       <select aria-label="维护凭据所属节点" value={id} disabled={pending} onChange={event => { setId(event.target.value); setMessage('') }}
@@ -76,6 +86,11 @@ function MaintenanceSettings({ nodes, policies, refresh }: {
         <option value="">选择节点</option>
         {nodes.map(node => <option key={node.id} value={node.id}>{node.name} · {policyLabel[policies[node.id]] ?? '未知'}</option>)}
       </select>
+      {expanded && canPair && <PairCommand key={selected.id} nodeId={selected.id} name={selected.name} />}
+      {policy === 'paired' && <div role="status" className="space-y-1 text-sm">
+        <p>{recentV2 ? '已收到升级器 v2 心跳' : '已配对，等待升级器 v2 的新心跳'}</p>
+        <WorkerInfo heartbeat={heartbeat} />
+      </div>}
       {policy && policy !== 'offline_only' && <div className="flex flex-wrap gap-2">
         {policy === 'unpaired' && <Button type="button" size="sm" variant="outline" disabled={pending} onClick={() => change('grant')}>下载本节点维护凭据</Button>}
         {policy === 'paired' && <Button type="button" size="sm" variant="outline" disabled={pending} onClick={() => change('revoke')}>撤销凭据</Button>}
@@ -256,7 +271,8 @@ export function AgentRollout({ nodes, site }: { nodes: Node[]; site: string }) {
           </div>
         </fieldset>}
         {updaterSite && canChoose && fresh && state.maintenance && <MaintenanceSettings
-          nodes={nodes} policies={state.maintenance} refresh={() => setRevision(value => value + 1)} />}
+          nodes={nodes} policies={state.maintenance} states={state.nodes} workers={state.workers}
+          allowPair={provisioningSite(location.origin) === updaterSite} refresh={() => setRevision(value => value + 1)} />}
         {updaterSite && state && <details className="text-sm">
           <summary className="cursor-pointer">在已有 HTTPS 节点上启用或修复升级器</summary>
           <p className="mt-2 text-muted-foreground">先通过 SSH 或 SFTP 将本节点的维护凭据放到位，再以 root 执行。完成后核对升级器的最近心跳。</p>

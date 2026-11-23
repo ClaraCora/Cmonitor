@@ -205,6 +205,7 @@ pub async fn browser_guard(
         && path.starts_with("/api/")
         && path != "/api/agent/register"
         && path != "/api/agent/upgrade"
+        && !crate::pairing::redeem_path(path)
         && !same_origin(&app, request.headers(), false)
     {
         (StatusCode::FORBIDDEN, "请求来源不匹配，请从 Hub 后台重试").into_response()

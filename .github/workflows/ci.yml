@@ -74,6 +74,8 @@ jobs:
         run: python3 scripts/test-installers.py
       - name: Test authenticated rollout worker and rollback
         run: python3 scripts/test-rollout-worker.py
+      - name: Verify one-time pairing and interrupted enrollment recovery
+        run: python3 scripts/test-agent-pair.py
       - name: Verify backups with the real Hub and isolated databases
         run: python3 scripts/test-backup.py
       - name: Build isolated Agent with a temporary test CA

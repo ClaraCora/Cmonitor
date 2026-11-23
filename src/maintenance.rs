@@ -19,6 +19,7 @@ pub fn offline(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
 }
 
 pub fn revoke(tx: &Transaction, node: i64, offline_only: bool) -> rusqlite::Result<()> {
+    crate::pairing::clear_ticket(tx, node)?;
     if offline_only {
         tx.execute(
             "INSERT INTO node_maintenance(node,offline_only) SELECT id,1 FROM node WHERE id=?
@@ -97,6 +98,7 @@ fn change_node(tx: &Transaction, node: i64, action: Action, server: &str) -> rus
         return Ok(Decision::Refused(StatusCode::CONFLICT, "请先结束该节点的升级批次"));
     }
     let credential = format!("cmu_{}", auth::random_token());
+    crate::pairing::clear_ticket(tx, node)?;
     tx.execute("INSERT INTO node_maintenance(node,key_hash) VALUES(?,?) ON CONFLICT(node) DO UPDATE SET key_hash=excluded.key_hash", (node,auth::sha256(&credential)))?;
     tx.execute("DELETE FROM upgrade_worker WHERE node=?", [node])?;
     Ok(Decision::Issued(grant_file(server, node, &report, &credential)))

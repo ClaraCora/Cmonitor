@@ -68,6 +68,8 @@ async fn canary_then_nineteen_workers() {
         .route("/api/agent-upgrades", get(rollout::status).post(rollout::start))
         .route("/api/nodes", get(api::nodes).post(api::create_node))
         .route("/api/nodes/{id}/maintenance", post(maintenance::policy))
+        .route("/api/nodes/{id}/maintenance/pair-command", post(pairing::issue))
+        .route("/api/nodes/{id}/maintenance/redeem", post(pairing::redeem))
         .route("/agent/{arch}", get(agent_binary))
         .layer(from_fn(move |mut req: Request, next: Next| {
             let count = count.clone();

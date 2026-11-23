@@ -8,14 +8,21 @@ async function run() {
   const browser = await chromium.launch({ headless: true, ...(process.env.UX_BROWSER_CHANNEL ? { channel: process.env.UX_BROWSER_CHANNEL } : {}) })
   try {
     const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' })
-    const origin = 'http://127.0.0.1:4173'
+    const origin = 'https://hub.example.test'
     const nodes = Array.from({ length: 7 }, (_, index) => ({
       id: index + 1, name: `节点 ${index + 1}`, sort: index, agent_version: '1.0.0', online: false,
       country: '', metrics: null, public: true, total_rx: 0, total_tx: 0, month_rx: 0, month_tx: 0,
       price: 0, billing_cycle: '', traffic_limit: 0, ip: '', ipv4: '', ipv6: '', os: '', tags: '',
     }))
     const states = { 1: 'current', 2: 'ready', 3: 'plaintext', 4: 'ready', 5: 'ready', 6: 'ready', 7: 'ready' }
+    nodes[0].online = true
+    nodes[1].online = true
     nodes[2].offline_only = true
+    nodes[3].online = true
+    const pairing = { 1: 'unpaired', 2: 'paired', 3: 'offline_only', 4: 'unpaired', 7: 'unpaired' }
+    const pairingWrites = []
+    const ticket = n => 'fixture-only-pair-command-' + n
+    let pairError = false
     const command = "sh /root/agent-offline-install.sh '" + 'a'.repeat(64) + "' 'http://fixture.test/agent-v1.2.2.tar.gz'"
     const commandReads = []
     let commandAvailable = true
@@ -29,6 +36,15 @@ async function run() {
       const url = new URL(route.request().url())
       if (url.origin !== origin) return route.abort()
       const pathname = url.pathname
+      if (pathname.endsWith('/maintenance/pair-command')) {
+        assert.equal(route.request().method(), 'POST')
+        assert.equal(pathname, '/api/nodes/1/maintenance/pair-command')
+        pairingWrites.push(pathname)
+        const expires_at = await page.evaluate(() => Math.floor(Date.now() / 1000) + 600)
+        return pairError
+          ? route.fulfill({ status: 403, body: 'reauthenticate' })
+          : route.fulfill({ json: { command: ticket(pairingWrites.length), expires_at } })
+      }
       if (pathname.endsWith('/offline-upgrade-command')) {
         commandReads.push([route.request().method(), pathname])
         assert.equal(pathname, '/api/nodes/3/offline-upgrade-command')
@@ -45,7 +61,7 @@ async function run() {
           // The Hub accepted the write but its HTTP response was lost.
           return route.abort('connectionreset')
         }
-        return failRead ? route.fulfill({ status: 503, body: '模拟暂时中断' }) : route.fulfill({ json: { target: '1.2.1', nodes: states, batch, workers, maintenance: workers ? { 3: 'offline_only' } : undefined } })
+        return failRead ? route.fulfill({ status: 503, body: '模拟暂时中断' }) : route.fulfill({ json: { target: '1.2.1', nodes: states, batch, workers, maintenance: workers ? pairing : undefined } })
       }
       if (pathname === '/api/me') return route.fulfill({ json: { authed: true, site_name: 'Cmonitor' } })
       if (pathname === '/api/nodes') return route.fulfill({ json: { nodes, admin: true } })
@@ -143,6 +159,67 @@ async function run() {
     assert.equal(await offlineChoice.isChecked(), false)
     assert.deepEqual(commandReads, Array(4).fill(['GET', '/api/nodes/3/offline-upgrade-command']))
     assert.deepEqual(writes, [])
+    const maint = dialog.getByText('管理节点维护凭据', { exact: true })
+    const picker = dialog.getByRole('combobox', { name: '维护凭据所属节点' })
+    const issue = dialog.getByRole('button', { name: '复制一次性配对命令', exact: true })
+    const reissue = dialog.getByRole('button', { name: '重新生成并复制', exact: true })
+    const secret = dialog.getByRole('textbox', { name: '节点 1 的一次性配对命令' })
+    await maint.click()
+    for (const id of ['2', '3', '7']) {
+      await picker.selectOption(id)
+      assert.equal(await issue.count(), 0, 'paired, offline-only and disconnected nodes do not offer pairing')
+    }
+    await picker.selectOption('1')
+    await issue.waitFor()
+    await page.clock.fastForward(3500)
+    assert.equal(pairingWrites.length, 0, 'selection and refreshing do not issue tickets')
+    await issue.click()
+    await secret.waitFor()
+    assert.equal(await secret.inputValue(), ticket(1))
+    await dialog.getByRole('button', { name: '全选配对命令' }).click()
+    assert.deepEqual(await secret.evaluate(el => [el.selectionStart, el.selectionEnd]), [0, ticket(1).length])
+    assert.equal(pairingWrites.length, 1, 'permission denial and manual selection reuse the issued command')
+    await dialog.getByRole('button', { name: '隐藏并清除命令' }).click()
+    assert.equal(await secret.count(), 0)
+    await reissue.click()
+    await secret.waitFor()
+    assert.equal(await secret.inputValue(), ticket(2))
+    await maint.click()
+    await maint.click()
+    await issue.waitFor()
+    assert.equal(await secret.count(), 0, 'collapsing unmounts any rendered ticket')
+    await issue.click()
+    await secret.waitFor()
+    await picker.selectOption('4')
+    await picker.selectOption('1')
+    assert.equal(await secret.count(), 0, 'changing nodes discards the first ticket')
+    await issue.click()
+    await secret.waitFor()
+    await page.clock.fastForward(601_000)
+    await dialog.getByText('配对命令已过期，可以重新生成。').waitFor()
+    assert.equal(await secret.count(), 0, 'an expired ticket is removed')
+    pairError = true
+    await issue.click()
+    await dialog.getByText(/当前会话无法生成配对命令/).waitFor()
+    assert.equal(await secret.count(), 0)
+    pairError = false
+    await page.evaluate(() => {
+      delete navigator.clipboard.writeText
+      delete navigator.clipboard.write
+    })
+    await issue.click()
+    await dialog.getByText(/已复制。失效时间/).waitFor()
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), ticket(6))
+    assert.equal(await secret.count(), 0, 'successful copying does not display the credential')
+    pairing[1] = 'paired'
+    await page.clock.fastForward(3500)
+    await dialog.getByText('已配对，等待升级器 v2 的新心跳').waitFor()
+    workers[1] = { protocol: 2, last_seen: await page.evaluate(() => Math.floor(Date.now() / 1000)) }
+    await page.clock.fastForward(3500)
+    await dialog.getByText('已收到升级器 v2 心跳').waitFor()
+    assert.equal(await issue.count() + await reissue.count(), 0)
+    assert.equal(pairingWrites.length, 6)
+    await maint.click()
     const retry = dialog.getByRole('button', { name: '选择可重试节点（3 台）' })
     await retry.click()
     await dialog.getByText('首台验证：节点 2').waitFor()

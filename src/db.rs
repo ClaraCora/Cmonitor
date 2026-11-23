@@ -998,6 +998,7 @@ impl Db {
     /// False when no node has this id.
     pub fn delete_node(&self, id: i64) -> Result<bool> {
         let conn = self.conn();
+        crate::pairing::clear_ticket(&conn, id)?;
         // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
         // for the chart query -- so it is cleared explicitly. SQLite reassigns a
         // deleted node's id to the next node created, which would otherwise
@@ -1919,6 +1920,7 @@ impl Db {
         tx.execute("DELETE FROM session", [])?;
         tx.execute("DELETE FROM upgrade_worker", [])?;
         tx.execute("UPDATE node_maintenance SET key_hash=NULL", [])?;
+        tx.execute("DELETE FROM setting WHERE key GLOB 'maintenance-pair:*'", [])?;
         tx.execute("DELETE FROM setting WHERE key IN ('register_key','register_until')", [])?;
         // An older backup must not undo an offline policy observed since it was made.
         let mut offline = conn.prepare("SELECT node FROM node_maintenance WHERE offline_only=1")?;

@@ -13,6 +13,7 @@ mod frontend;
 mod maintenance;
 mod notify;
 mod offline_upgrade;
+mod pairing;
 mod rollout;
 #[cfg(test)]
 mod rollout_e2e;
@@ -139,6 +140,7 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 /// implies a fork, which rebuilds this line anyway.
 const AGENT_REPO: &str = "ClaraCora/Cagent";
 const AGENT_UPDATER: &str = include_str!("../deploy/agent-updater.py");
+const AGENT_PAIR: &str = include_str!("../deploy/agent-pair.py");
 
 #[derive(serde::Deserialize)]
 struct AgentPin {
@@ -529,6 +531,10 @@ async fn main() -> Result<()> {
             get(|| async { ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], AGENT_UPDATER) }),
         )
         .route("/agent-updater.py/sha256", get(|| async { auth::sha256(AGENT_UPDATER) }))
+        .route(
+            "/agent-pair.py",
+            get(|| async { ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], AGENT_PAIR) }),
+        )
         .route("/api/agent/upgrade", post(rollout::poll))
         .route("/api/agent-upgrades", get(rollout::status).post(rollout::start))
         .route("/agent/{arch}", get(agent_binary))
@@ -557,6 +563,11 @@ async fn main() -> Result<()> {
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
         .route("/api/nodes/{id}/token", post(api::reset_token))
         .route("/api/nodes/{id}/maintenance", post(maintenance::policy))
+        .route("/api/nodes/{id}/maintenance/pair-command", post(pairing::issue))
+        .route(
+            "/api/nodes/{id}/maintenance/redeem",
+            post(pairing::redeem).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
         .route("/api/nodes/{id}/offline-upgrade-command", get(offline_upgrade::command))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))

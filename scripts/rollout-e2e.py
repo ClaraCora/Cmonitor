@@ -2,11 +2,13 @@
 """Invoked by the ignored Rust rollout E2E test. Network and files stay local."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+import hashlib
 import http.client
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import sys
 import tempfile
@@ -59,9 +61,11 @@ class FixtureNode:
         self.binary.chmod(0o755)
         self.env = self.root / 'agent.env'
         self.env.write_text(f'MONITOR_SERVER={PUBLIC}\nMONITOR_TOKEN={self.token}\n')
-        grant = self.root / 'agent-maintenance.json'
-        grant.write_text(json.dumps(admin(f'/api/nodes/{self.id}/maintenance', {'action': 'grant'})))
-        grant.chmod(0o600)
+        self.env.chmod(0o600)
+        if not canary:
+            grant = self.root / 'agent-maintenance.json'
+            grant.write_text(json.dumps(admin(f'/api/nodes/{self.id}/maintenance', {'action': 'grant'})))
+            grant.chmod(0o600)
         self.arch = 'x86_64' if canary else 'aarch64'
         self.channel = None
         self.restarts = 0
@@ -70,6 +74,35 @@ class FixtureNode:
         self.restart_barrier = None
         self.worker = self.load_worker()
         self.report()
+
+    def pair_from_command(self):
+        helper = SCRIPTS.parent / 'deploy/agent-pair.py'
+        issued = admin(f'/api/nodes/{self.id}/maintenance/pair-command', {})
+        command = issued['command']
+        tickets = re.findall(r'^cmp_[a-f0-9]{64}$', command, re.MULTILINE)
+        assert len(tickets) == 1 and issued['expires_at'] > time.time()
+        assert hashlib.sha256(helper.read_bytes()).hexdigest() in command
+        assert f"--server '{PUBLIC}' --node {self.id} " in command
+        spec = importlib.util.spec_from_file_location('fixture_pair', helper)
+        pair = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pair)
+        pair.ROOT = self.root
+        network_fetch, check_file = pair.fetch, pair.check_file
+
+        def loopback_fetch(url, *args):
+            assert url.startswith(PUBLIC + '/'), 'unexpected pairing origin'
+            return network_fetch(LOCAL + url[len(PUBLIC):], *args)
+
+        def fixture_owner(info, private):
+            assert info.st_uid == os.geteuid(), 'unexpected fixture file owner'
+            check_file(SimpleNamespace(st_uid=0, st_mode=info.st_mode, st_nlink=info.st_nlink), private)
+
+        pair.fetch, pair.check_file = loopback_fetch, fixture_owner
+        report = pair.local_identity(PUBLIC)
+        pair.pair(PUBLIC, self.id, report, tickets[0])
+        grant = json.loads((self.root / 'agent-maintenance.json').read_text())
+        assert grant['node'] == self.id and grant['credential'] != report
+        assert grant['report_identity'] == hashlib.sha256(report.encode()).hexdigest()
 
     def load_worker(self):
         spec = importlib.util.spec_from_file_location('fixture_worker', SCRIPTS.parent / 'deploy/agent-updater.py')
@@ -132,8 +165,15 @@ def run():
             fleet.append(node)
         first, *followers = fleet
         wait(lambda: all(n['metrics'] for n in admin('/api/nodes')['nodes']), 'all original WebSocket reports')
+        original = str(first.id)
+        before = overview()
+        assert before['maintenance'][original] == 'unpaired' and original not in before['workers']
+        first.pair_from_command()
         list(group.map(lambda n: n.worker.once(), fleet))
-        assert all(overview()['nodes'][str(n)] == 'ready' for n in ids)
+        paired = overview()
+        assert paired['maintenance'][original] == 'paired'
+        assert paired['workers'][original]['protocol'] == 2 and paired['workers'][original]['last_seen'] > 0
+        assert all(paired['nodes'][str(n)] == 'ready' for n in ids)
         admin('/api/agent-upgrades', {'nodes': ids})
         list(group.map(lambda n: n.worker.once(), followers))
         assert [i['status'] for i in overview()['batch']['items']] == ['ready'] + ['queued'] * 19
@@ -175,7 +215,7 @@ def run():
         list(group.map(lambda n: n.worker.once(), fleet))
         assert len(faulty.attempts) == 2 and faulty.attempts[0] == faulty.attempts[1]
         assert all(n.restarts == 1 and not (n.root / '.agent-updater.state').exists() for n in fleet)
-        print('Verified 1 canary + 19 parallel workers, separate report and maintenance credentials, one HTTP 503 and a replayed receipt.')
+        print('Verified one-time pairing on the original canary, its authenticated v2 heartbeat, 19 parallel followers, one HTTP 503 and a replayed receipt.')
 
 
 if __name__ == '__main__':
