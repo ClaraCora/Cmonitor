@@ -158,12 +158,24 @@ fn default_rows() -> u32 {
 }
 
 pub(crate) fn recent_session(app: &App, hash: &str) -> bool {
-    app.db.session_actor(hash).is_some_and(|(actor, time)| {
-        !actor.starts_with("legacy:") && (0..=600).contains(&(Utc::now().timestamp() - time))
+    app.db
+        .session_identity(hash)
+        .is_some_and(|s| matches!(s.kind.as_str(), "github" | "password") && recently_issued(s.issued_at))
+}
+
+fn recently_issued(issued_at: i64) -> bool {
+    (0..=600).contains(&(Utc::now().timestamp() - issued_at))
+}
+
+fn may_open_terminal(app: &App, hash: &str) -> bool {
+    app.db.session_identity(hash).is_some_and(|s| match s.kind.as_str() {
+        "github" => true,
+        "password" => recently_issued(s.issued_at),
+        _ => false,
     })
 }
 pub async fn access(_: crate::api::Admin, State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
-    let allowed = current_session(&headers).is_some_and(|h| recent_session(&app, &h));
+    let allowed = current_session(&headers).is_some_and(|h| may_open_terminal(&app, &h));
     let config = app.db.auth_config(&app.site).ok();
     Json(
         json!({"allowed": allowed, "github": config.as_ref().is_some_and(|c| c.github_ready()), "password_login": config.as_ref().is_some_and(|c| c.password_enabled)}),
@@ -186,8 +198,10 @@ pub async fn policy(
     if policy.enabled && crate::maintenance::offline(&app.db.conn(), node).unwrap_or(true) {
         return (StatusCode::CONFLICT, "该节点固定为离线维护").into_response();
     }
-    let actor =
-        current_session(&headers).and_then(|h| app.db.session_actor(&h)).map(|v| v.0).unwrap_or_default();
+    let actor = current_session(&headers)
+        .and_then(|h| app.db.session_identity(&h))
+        .map(|s| s.actor())
+        .unwrap_or_default();
     if let Err(e) = app.db.set(&format!("terminal_node_{node}"), if policy.enabled { "on" } else { "off" }) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
@@ -221,8 +235,8 @@ pub async fn handler(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
     let Some(session) = current_session(&headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    if !recent_session(&app, &session) {
-        return (StatusCode::FORBIDDEN, "请在打开终端前重新登录，认证有效期为 10 分钟").into_response();
+    if !may_open_terminal(&app, &session) {
+        return (StatusCode::FORBIDDEN, "请重新登录后打开终端").into_response();
     }
     info!("browser terminal websocket accepted");
     upgrade
@@ -248,7 +262,7 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
         send_error(&mut socket, "终端窗口大小无效").await;
         return;
     }
-    if !recent_session(&app, &session) {
+    if !may_open_terminal(&app, &session) {
         send_error(&mut socket, "请重新登录后打开终端").await;
         return;
     }
@@ -283,7 +297,7 @@ async fn run(app: Shared, mut socket: WebSocket, session: String) {
         return;
     };
     let terminal_id = random_token();
-    let actor = app.db.session_actor(&session).map(|v| v.0).unwrap_or_default();
+    let actor = app.db.session_identity(&session).map(|s| s.actor()).unwrap_or_default();
     if app.db.terminal_audit(&actor, node_id, "open_requested", &terminal_id[..16]).is_err() {
         send_error(&mut socket, "无法写入终端审计，请检查数据库").await;
         return;
@@ -473,16 +487,30 @@ mod tests {
         assert!(to_agent("server-id", r#"{"type":"connect","node_id":1}"#).is_none());
     }
     #[test]
-    fn terminal_access_requires_a_recent_identified_login() {
+    fn terminal_and_maintenance_use_distinct_login_windows() {
         let app = App::for_test(Db::open(":memory:").unwrap());
         app.db.set("admin_password_hash", "hash").unwrap();
         let now = Utc::now().timestamp();
         app.db.create_session("legacy", crate::auth::session_expiry()).unwrap();
         assert!(!recent_session(&app, "legacy"));
+        assert!(!may_open_terminal(&app, "legacy"));
         app.db.password_session("fresh", crate::auth::session_expiry(), "hash").unwrap();
         assert!(recent_session(&app, "fresh"));
-        app.db.password_session("old", now + 14 * 86400 - 601, "hash").unwrap();
+        assert!(may_open_terminal(&app, "fresh"));
+        app.db.password_session("old", crate::auth::session_expiry() - 601, "hash").unwrap();
         assert!(!recent_session(&app, "old"));
+        assert!(!may_open_terminal(&app, "old"));
+        app.db
+            .conn()
+            .execute("UPDATE session SET kind='github', identity='operator' WHERE token_hash='old'", [])
+            .unwrap();
+        assert!(may_open_terminal(&app, "old"));
+        assert!(
+            !recent_session(&app, "old"),
+            "issuing maintenance credentials still requires recent authentication"
+        );
+        app.db.conn().execute("UPDATE session SET expires_at=? WHERE token_hash='old'", [now - 1]).unwrap();
+        assert!(!may_open_terminal(&app, "old"));
         app.db.terminal_audit("password:local", 7, "ready", "public-correlation").unwrap();
         assert_eq!(app.db.terminal_history().unwrap()[0]["node_id"], 7);
     }

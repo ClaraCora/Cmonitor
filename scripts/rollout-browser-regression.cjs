@@ -16,6 +16,8 @@ async function run() {
     }))
     const states = { 1: 'current', 2: 'ready', 3: 'plaintext', 4: 'ready', 5: 'ready', 6: 'ready', 7: 'ready' }
     nodes[0].online = true
+    nodes[0].agent_version = '1.2.2'
+    nodes[0].terminal_reason = 'available'
     nodes[1].online = true
     nodes[2].offline_only = true
     nodes[3].online = true
@@ -29,6 +31,9 @@ async function run() {
     let workers
     let batch = { id: 42, target: '1.2.1', status: 'running', reason: '', items: [{ node: 1, status: 'observing' }] }
     let failRead = true
+    let terminalAllowed = false
+    let terminalConnections = 0
+    let passwordChecks = 0
     const writes = []
     const errors = []
     page.on('pageerror', error => errors.push(error.message))
@@ -36,6 +41,15 @@ async function run() {
       const url = new URL(route.request().url())
       if (url.origin !== origin) return route.abort()
       const pathname = url.pathname
+      if (pathname === '/api/terminal/access') {
+        return route.fulfill({ json: { allowed: terminalAllowed, github: true, password_login: true } })
+      }
+      if (pathname === '/api/auth/login') {
+        assert.equal(route.request().method(), 'POST')
+        passwordChecks++
+        terminalAllowed = true
+        return route.fulfill({ json: {} })
+      }
       if (pathname.endsWith('/maintenance/pair-command')) {
         assert.equal(route.request().method(), 'POST')
         assert.equal(pathname, '/api/nodes/1/maintenance/pair-command')
@@ -70,8 +84,35 @@ async function run() {
       return route.fulfill({ path: path.join(dist, asset) })
     })
     await page.routeWebSocket('**/api/ws', ws => ws.send(JSON.stringify({ nodes, admin: true })))
+    await page.routeWebSocket('**/api/terminal/ws', ws => {
+      terminalConnections++
+      ws.onMessage(message => {
+        if (JSON.parse(message.toString()).type === 'connect') ws.send(JSON.stringify({ method: 'terminal.ready' }))
+      })
+    })
     await page.clock.install()
     await page.goto(origin + '/clara/nodes')
+    await page.setViewportSize({ width: 1280, height: 900 })
+    const openTerminal = page.getByRole('button', { name: /打开 Web Terminal/ }).first()
+    await openTerminal.click()
+    const gate = page.getByRole('dialog', { name: '确认终端访问身份' })
+    await gate.getByText(/最近 10 分钟/).waitFor()
+    assert.equal(terminalConnections, 0, 'an enabled GitHub provider alone does not authorize the socket')
+    await gate.getByLabel('应急密码').fill('fixture-only')
+    await gate.getByRole('button', { name: '认证并打开终端' }).click()
+    const live = page.getByRole('dialog', { name: '节点 1 · Web Terminal' })
+    await live.getByText('已连接', { exact: true }).waitFor()
+    assert.equal(passwordChecks, 1)
+    await page.keyboard.press('Escape')
+    await live.waitFor({ state: 'hidden' })
+    // An eligible session is approved on opening; no intermediate sign-in or POST.
+    await openTerminal.click()
+    await live.getByText('已连接', { exact: true }).waitFor()
+    assert.equal(terminalConnections, 2)
+    assert.equal(passwordChecks, 1)
+    await page.keyboard.press('Escape')
+    await live.waitFor({ state: 'hidden' })
+    await page.setViewportSize({ width: 390, height: 844 })
     await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin })
     const copy = page.getByRole('button', { name: '复制升级命令', exact: true })
     assert.equal(commandReads.length, 0, 'rendering and receiving node data do not fetch a command')

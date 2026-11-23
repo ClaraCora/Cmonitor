@@ -275,15 +275,30 @@ def main():
             agent, _ = start(agent_binary, [], dict(os.environ, MONITOR_SERVER=secure_origin, MONITOR_TOKEN=token))
             agent_online(cookie, node)
             assert api("/api/terminal/access", cookie=cookie)[1]["allowed"] is True
+            # Model the session left by a completed GitHub callback without contacting GitHub.
+            # Give it the same age and expiry as the password login to isolate the terminal policy.
+            cookie_name, password_token = cookie.split("=", 1)
+            password_hash = hashlib.sha256(password_token.encode()).hexdigest()
+            github_token = secrets.token_hex(32)
+            github_hash = hashlib.sha256(github_token.encode()).hexdigest()
+            github_cookie = f"{cookie_name}={github_token}"
             with sqlite3.connect(database) as db:
-                db.execute("UPDATE session SET expires_at=expires_at-601")
+                db.execute("UPDATE session SET expires_at=expires_at-601 WHERE token_hash=?", (password_hash,))
+                db.execute("INSERT INTO session(token_hash,expires_at,kind,identity) "
+                           "SELECT ?,expires_at,'github','fixture-admin' FROM session WHERE token_hash=?",
+                           (github_hash, password_hash))
             assert api("/api/terminal/access", cookie=cookie)[1]["allowed"] is False
             ws(cookie, expected=403)
+            assert api("/api/terminal/access", cookie=github_cookie)[1]["allowed"] is True
+            channel, pid = terminal(github_cookie, node)
             cookie = login(password)
-            channel, pid = terminal(cookie, node)
             assert api(f"/api/nodes/{node}/terminal", {"enabled": False}, cookie, method="PUT")[0] == 200
             channel.closed()
             shell_gone(pid)
+            with sqlite3.connect(database) as db:
+                db.execute("UPDATE session SET expires_at=? WHERE token_hash=?", (int(time.time()) - 1, github_hash))
+            assert api("/api/terminal/access", cookie=github_cookie)[0] == 401
+            ws(github_cookie, expected=401)
             blocked = ws(cookie)
             blocked.send({"type": "connect", "node_id": node, "cols": 80, "rows": 24})
             assert blocked.receive().get("type") == "error"
@@ -309,6 +324,7 @@ def main():
             channel.closed()
             shell_gone(pid)
             ws(cookie, expected=401)
+            assert api("/api/terminal/access", cookie=cookie)[0] == 401
             cookie = login(password)
             stop(agent)
             agent, _ = start(agent_binary, ["--disable-terminal"], dict(os.environ, MONITOR_SERVER=secure_origin, MONITOR_TOKEN=token))

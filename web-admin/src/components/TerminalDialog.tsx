@@ -186,21 +186,27 @@ export function TerminalDialog({ node, onClose }: { node: Node; onClose: () => v
   const [error, setError] = useState("")
   const [password, setPassword] = useState("")
   const [busy, setBusy] = useState(false)
-  const load = () => api<Access>("/terminal/access").then(setAccess).catch((e: Error) => setError(e.message))
+  const load = () => api<Access>("/terminal/access", { cache: "no-store" }).then(setAccess).catch((e: Error) => setError(e.message))
   useEffect(() => { void load() }, [])
-  if (access?.allowed) return <LiveTerminalDialog node={node} onClose={onClose} />
+  if (access?.allowed === true) return <LiveTerminalDialog node={node} onClose={onClose} />
   return <Dialog open onOpenChange={open => { if (!open) onClose() }}><DialogContent>
-    <DialogHeader><DialogTitle>确认终端访问身份</DialogTitle><DialogDescription>终端以 root 权限运行。请在最近 10 分钟内重新认证后打开。</DialogDescription></DialogHeader>
-    {!access && !error && <p role="status">正在检查认证状态…</p>}
+    <DialogHeader>
+      <DialogTitle>{access ? "确认终端访问身份" : `${node.name} · Web Terminal`}</DialogTitle>
+      <DialogDescription>终端命令在目标节点上以 root 权限执行。</DialogDescription>
+    </DialogHeader>
+    {!access && !error && <p role="status">正在检查终端访问权限…</p>}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-    {access?.github && <Button asChild variant="outline"><a href="/api/auth/github">使用 GitHub 重新认证</a></Button>}
+    {access?.github && <Button asChild variant="outline"><a href="/api/auth/github">使用 GitHub 管理员账号登录</a></Button>}
     {access?.password_login && <form className="space-y-3" onSubmit={async e => {
       e.preventDefault(); setBusy(true); setError("")
       try { await api("/auth/login", { method: "POST", body: JSON.stringify({ password }) }); setPassword(""); await load() }
       catch (e) { setError((e as Error).message) } finally { setBusy(false) }
     }}>
-      <label htmlFor="terminal-reauth-password" className="text-sm">应急密码</label>
-      <Input id="terminal-reauth-password" type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} />
+      <div className="space-y-1">
+        <label htmlFor="terminal-reauth-password" className="text-sm">应急密码</label>
+        <p id="terminal-password-hint" className="text-xs text-muted-foreground">使用密码打开终端，需要在最近 10 分钟内验证过密码。</p>
+      </div>
+      <Input id="terminal-reauth-password" type="password" aria-describedby="terminal-password-hint" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} />
       <Button disabled={busy || !password} type="submit">{busy ? "认证中…" : "认证并打开终端"}</Button>
     </form>}
     {!access && error && <Button onClick={() => { setError(""); void load() }}>重试</Button>}

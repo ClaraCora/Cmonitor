@@ -42,6 +42,7 @@ sudo /opt/monitor/monitor-hub --db /opt/monitor/data/monitor.db --reset-password
 ## 通信与安装安全
 
 - 浏览器 WebSocket 和后台修改请求校验来源；反向代理须保留 Host，并正确设置 Hub 的 `--site`。
+- 使用 GitHub 登录后台后，会话有效期间可直接打开节点终端。使用应急密码登录时，打开终端需要最近 10 分钟内的密码认证。
 - Agent 默认使用 WSS 和证书校验。Cagent `v1.1.3` 包含 TLS 握手漏洞 RUSTSEC-2026-0285 的修复。
 - 重置节点 Token、删除节点、替换 Agent 连接或撤销登录会话，会断开对应终端并清理交互 shell。
 - 每个节点最多 4 个终端，Hub 最多 32 个；连接建立与数据发送都有超时限制。

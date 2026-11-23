@@ -14,6 +14,18 @@ use tracing::info;
 
 pub struct Db(Mutex<Connection>);
 
+pub struct SessionIdentity {
+    pub kind: String,
+    identity: String,
+    pub issued_at: i64,
+}
+
+impl SessionIdentity {
+    pub fn actor(&self) -> String {
+        format!("{}:{}", self.kind, if self.identity.is_empty() { "local" } else { &self.identity })
+    }
+}
+
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -1952,19 +1964,17 @@ impl Db {
         Ok(())
     }
 
-    pub fn session_actor(&self, hash: &str) -> Option<(String, i64)> {
+    pub fn session_identity(&self, hash: &str) -> Option<SessionIdentity> {
         self.conn()
             .query_row(
                 "SELECT kind,identity,expires_at FROM session WHERE token_hash=?1 AND expires_at>?2",
                 params![hash, Utc::now().timestamp()],
                 |r| {
-                    let kind: String = r.get(0)?;
-                    let identity: String = r.get(1)?;
-                    let expiry: i64 = r.get(2)?;
-                    Ok((
-                        format!("{kind}:{}", if identity.is_empty() { "local" } else { &identity }),
-                        crate::auth::issued_at(expiry),
-                    ))
+                    Ok(SessionIdentity {
+                        kind: r.get(0)?,
+                        identity: r.get(1)?,
+                        issued_at: crate::auth::issued_at(r.get(2)?),
+                    })
                 },
             )
             .ok()
