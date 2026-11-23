@@ -12,6 +12,8 @@ mod db;
 mod frontend;
 mod notify;
 mod rollout;
+#[cfg(test)]
+mod rollout_e2e;
 mod security;
 mod terminal;
 
@@ -55,6 +57,12 @@ pub struct App {
     /// Browser terminal sessions waiting for output from an agent.
     pub terminals: terminal::Registry,
     pub http: reqwest::Client,
+    // The release pin is embedded in the Hub. Each immutable, verified image is
+    // shared by all downloads for this process and disappears on a Hub upgrade.
+    agent_images: [tokio::sync::OnceCell<axum::body::Bytes>; 2],
+    #[cfg(test)]
+    agent_fixture_sha256: Option<String>,
+    relay_slots: Arc<tokio::sync::Semaphore>,
     /// Public base URL when `--site` was given, empty otherwise. In the default
     /// case the hub is reached at whatever ip:port the browser used and the
     /// panel falls back to its own origin. Behind a reverse proxy it must be
@@ -76,6 +84,10 @@ impl App {
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
             terminals: terminal::Registry::default(),
+            agent_images: Default::default(),
+            #[cfg(test)]
+            agent_fixture_sha256: None,
+            relay_slots: Arc::new(tokio::sync::Semaphore::new(RELAY_SLOTS)),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
@@ -146,8 +158,7 @@ async fn install_script() -> Response {
 /// answer is the same for all of them.
 ///
 /// This URL is fetched on an anonymous request, so setting it redirects that
-/// path. It remains within the bounds `agent_binary` already enforces: four
-/// concurrent transfers, a 120-second timeout, and a streamed body.
+/// path. The relay bounds concurrent responses and verifies a cache miss before use.
 fn release_url(app: &App, arch: &str) -> String {
     let tag = agent_pin().tag;
     proxied(
@@ -168,18 +179,9 @@ pub fn proxied(app: &App, url: String) -> String {
     }
 }
 
-/// How many release downloads the hub relays concurrently.
-///
-/// This route takes no credentials, and one request costs an outbound fetch from
-/// GitHub plus 1.8 MB of egress -- the most expensive operation an anonymous
-/// caller can request. Streaming bounds the memory each transfer holds; this
-/// bounds how many may run, closing the same gap as the password gate in `auth`.
-///
-/// Four, because a node installs once: a handful of machines set up together is
-/// the expected load, not a sustained workload. Refused rather than queued, for
-/// the same reason.
-const RELAY_SLOTS: usize = 4;
-static RELAY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RELAY_SLOTS);
+/// Bound anonymous egress while allowing a normal 1 + 19 rollout. A successful
+/// download populates one verified image per architecture for the life of the Hub.
+const RELAY_SLOTS: usize = 32;
 
 /// Longest a relay may hold its permit.
 ///
@@ -208,7 +210,7 @@ struct Metered<S> {
 
 /// Wraps `inner` and parks `permit` on a task that releases it when the body is
 /// dropped or [`RELAY_DEADLINE`] elapses, whichever comes first.
-fn metered<S>(inner: S, permit: tokio::sync::SemaphorePermit<'static>) -> Metered<S> {
+fn metered<S>(inner: S, permit: tokio::sync::OwnedSemaphorePermit) -> Metered<S> {
     let (_done, body_gone) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         // Either arm ends the task, which drops the permit. `body_gone` resolves
@@ -236,6 +238,8 @@ async fn verified_agent(app: &App, arch: &str) -> Result<Vec<u8>> {
     use sha2::Digest;
     let pin = agent_pin();
     let expected = pin.sha256.get(arch).ok_or_else(|| anyhow::anyhow!("unknown architecture"))?;
+    #[cfg(test)]
+    let expected = app.agent_fixture_sha256.as_ref().unwrap_or(expected);
     let mut response = app
         .http
         .get(release_url(app, arch))
@@ -268,16 +272,24 @@ async fn agent_checksum(Path(arch): Path<String>) -> Response {
 }
 
 async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
-    if !matches!(arch.as_str(), "x86_64" | "aarch64") {
-        return (StatusCode::NOT_FOUND, "unknown architecture").into_response();
-    }
-    let Ok(permit) = RELAY_GATE.try_acquire() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again").into_response();
+    let index = match arch.as_str() {
+        "x86_64" => 0,
+        "aarch64" => 1,
+        _ => return (StatusCode::NOT_FOUND, "unknown architecture").into_response(),
     };
-    match tokio::time::timeout(std::time::Duration::from_secs(120), verified_agent(&app, &arch)).await {
+    let Ok(permit) = app.relay_slots.clone().try_acquire_owned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "3")], "download busy")
+            .into_response();
+    };
+    let image = app.agent_images[index]
+        .get_or_try_init(|| async { verified_agent(&app, &arch).await.map(axum::body::Bytes::from) });
+    match tokio::time::timeout(std::time::Duration::from_secs(120), image).await {
         Ok(Ok(bytes)) => (
             [(header::CONTENT_TYPE, "application/octet-stream"), (header::CACHE_CONTROL, "no-store")],
-            axum::body::Body::from_stream(metered(axum::body::Body::from(bytes).into_data_stream(), permit)),
+            axum::body::Body::from_stream(metered(
+                axum::body::Body::from(bytes.clone()).into_data_stream(),
+                permit,
+            )),
         )
             .into_response(),
         Ok(Err(e)) => (StatusCode::BAD_GATEWAY, format!("agent download refused: {e}")).into_response(),
@@ -917,28 +929,32 @@ mod tests {
     /// byte" is the client's decision -- no longer than RELAY_DEADLINE.
     #[tokio::test(start_paused = true)]
     async fn a_relay_permit_follows_the_body_but_not_past_the_deadline() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(RELAY_SLOTS));
         let queued: Vec<_> =
-            (1..RELAY_SLOTS).map(|_| RELAY_GATE.try_acquire().expect("up to the limit")).collect();
-        let body = metered(Nothing, RELAY_GATE.try_acquire().expect("the last slot"));
+            (1..RELAY_SLOTS).map(|_| gate.clone().try_acquire_owned().expect("up to the limit")).collect();
+        let body = metered(Nothing, gate.clone().try_acquire_owned().expect("the last slot"));
         tokio::task::yield_now().await;
-        assert!(RELAY_GATE.try_acquire().is_err(), "the request past the limit must be refused");
+        assert!(gate.clone().try_acquire_owned().is_err(), "the request past the limit must be refused");
 
         // A body that ends, or a connection that dies, returns the slot
         // immediately rather than waiting out the deadline.
         drop(body);
         tokio::task::yield_now().await;
-        let finished = RELAY_GATE.try_acquire().expect("a finished download gives its slot back");
+        let finished = gate.clone().try_acquire_owned().expect("a finished download gives its slot back");
         drop(finished);
 
         // A client that accepts the response and then reads nothing never polls
         // the body, so the body cannot time itself out. Only an independent timer
         // can, which is why the permit does not travel with it.
-        let stalled = metered(Nothing, RELAY_GATE.try_acquire().expect("the last slot"));
+        let stalled = metered(Nothing, gate.clone().try_acquire_owned().expect("the last slot"));
         tokio::task::yield_now().await;
-        assert!(RELAY_GATE.try_acquire().is_err());
+        assert!(gate.clone().try_acquire_owned().is_err());
         tokio::time::advance(RELAY_DEADLINE + std::time::Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
-        assert!(RELAY_GATE.try_acquire().is_ok(), "a transfer that never finishes still gives its slot back");
+        assert!(
+            gate.clone().try_acquire_owned().is_ok(),
+            "a transfer that never finishes still gives its slot back"
+        );
         drop((stalled, queued));
     }
 

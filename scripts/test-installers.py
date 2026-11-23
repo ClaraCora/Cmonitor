@@ -39,26 +39,35 @@ class Installers(unittest.TestCase):
             s = s.replace(old, str(new))
         return subprocess.run(['sh', '-s', '--', *args], input=s, text=True, env=self.env, capture_output=True)
 
-    def offline(self, openrc=False, fail=False):
+    def offline(self, openrc=False, fail=False, downgrade=False, allow=False):
         self.stub('curl', f'touch {self.base}/network; exit 1')
         self.stub('rc-update', ':')
         self.stub('systemctl', f'''case "$1" in restart) ! grep -q bad '{self.root}/monitor-agent';; *) exit 0;; esac''')
         self.stub('rc-service', f'''case "$2" in restart) ! grep -q bad '{self.root}/monitor-agent';; *) exit 0;; esac''')
         config = 'MONITOR_SERVER=http://198.51.100.1:1234\nMONITOR_TOKEN=fixture\nMONITOR_DISABLE_TERMINAL=true\nMONITOR_NET_INCLUDE=eth0\n'
         env = self.root / 'agent.env'; env.write_text(config); env.chmod(0o600)
-        binary = self.root / 'monitor-agent'; binary.write_text('old')
+        old = '#!/bin/sh\necho monitor-agent 1.2.0\n'
+        binary = self.root / 'monitor-agent'; binary.write_text(old); binary.chmod(0o755)
         unit = self.openrc if openrc else self.unit
         unit.write_text('command_args="--interval 11 --insecure"\n' if openrc else 'ExecStart=/opt/monitor/monitor-agent --interval 11 --insecure\n')
         before = unit.read_bytes()
-        candidate = self.base / 'monitor-agent-x86_64-unknown-linux-musl'; candidate.write_text('bad' if fail else 'new')
+        new = '#!/bin/sh\necho monitor-agent {}\n# {}\n'.format('1.1.9' if downgrade else '1.2.1', 'bad' if fail else 'good')
+        candidate = self.base / 'monitor-agent-x86_64-unknown-linux-musl'; candidate.write_text(new)
         (self.base/'sha256sums.txt').write_text(f'{hashlib.sha256(candidate.read_bytes()).hexdigest()}  {candidate.name}\n')
         edits = [('/opt/monitor', self.root), ('/etc/systemd/system/monitor-agent.service',self.unit),('/etc/init.d/monitor-agent', self.openrc)]
         if openrc:
             edits += [('if command -v systemctl >/dev/null; then','if false; then')]
-        result = self.installer('install.sh', edits, ['--offline-dir',str(self.base)])
-        self.assertEqual(result.returncode, int(fail), result.stderr)
+        args = ['--offline-dir', str(self.base)] + (['--allow-downgrade'] if allow else [])
+        result = self.installer('install.sh', edits, args)
+        rejected = fail or (downgrade and not allow)
+        self.assertEqual(result.returncode, int(rejected), result.stderr)
         self.assertEqual(env.read_text(), config); self.assertEqual(unit.read_bytes(), before)
-        self.assertEqual(binary.read_text(), 'old' if fail else 'new')
+        self.assertEqual(binary.read_text(), old if rejected else new)
+        if not rejected:
+            previous = self.root / '.agent-offline.previous'
+            self.assertEqual(previous.read_text(), old)
+            self.assertEqual(self.installer('install.sh', edits, args).returncode, 0)
+            self.assertEqual(previous.read_text(), old, 'identical reinstall preserves rollback point')
         self.assertFalse((self.base/'network').exists())
 
     def hub_failure(self, old_healthy):
@@ -96,6 +105,8 @@ exit 0''')
     def test_openrc_offline(self): self.offline(openrc=True)
     def test_systemd_rollback(self): self.offline(fail=True)
     def test_openrc_rollback(self): self.offline(openrc=True, fail=True)
+    def test_offline_downgrade_requires_explicit_choice(self): self.offline(downgrade=True)
+    def test_offline_downgrade_opt_in(self): self.offline(downgrade=True, allow=True)
 
 
 if __name__ == '__main__':

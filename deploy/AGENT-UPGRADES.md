@@ -1,21 +1,40 @@
-# 从后台分批升级 Agent
+# 从 Hub 批量升级 Agent
 
-在「后台 → 节点 → 升级 Agent」中，先勾选要验证的第一台，再点「全选可升级节点」或手动勾选其余节点，每批最多 100 台。首台验证通过后，其余节点同时获得领取资格，在各自下一次轮询时开始升级。点击开始后，关闭窗口不影响任务。重新打开可以看到最近一批的结果。目标版本取自当前 Hub 随包发布的 `agent.pin`。相同版本、更高版本、离线节点和 HTTP 节点均不可选。
+在「后台 → 节点 → 升级 Agent」可以一次选择最多 100 台。Hub 先升级第一台。只有原节点 ID 以目标版本建立新的 HTTPS/WSS 会话并提交完整指标后，其余已选节点才会同时获得领取资格，各自在下一次轮询时开始升级。目标版本由当前 Hub 随附的 `agent.pin` 决定。
 
-## 首次启用
+## 部署新版升级器
 
-旧版 Agent 可以沿用，无需改 Token 或重装。在每台要加入的 HTTPS 节点上以 root 执行下列命令，把域名换成当前 Hub 的 HTTPS 域名。需要 Python 3.8 或以上、系统 CA 和 systemd 或 OpenRC。升级器复用 `/opt/monitor/agent.env` 中现有的 HTTPS 地址及 Token。公网反代要向 Hub 传递真实的 `Host` 和 `X-Forwarded-Proto`，包括 Agent 的 WebSocket 路径。
+1. 在没有运行中批次时升级 Hub。Hub 重启或恢复数据库会停止原批次，已经获准安装但还没有验证的节点显示「结果待核实」。
+2. 在要参与批量升级的 HTTPS 节点上安装或更新升级器。升级 Agent 二进制不会更新升级器。已启用旧升级器的节点也要重新执行下方命令，才能使用 v2 的回执重发和回滚授权。
+3. 节点通常每 30 秒轮询一次。更新后，打开「后台 → 节点 → 升级 Agent」，核对该节点显示「升级器 v2」，并检查最近心跳是否晚于本次更新。已达到目标 Agent 版本的节点也会显示升级器信息。有批次正在运行时，展开「查看各节点升级器」。显示「升级器协议未记录」时，Hub 还没有可用的协议记录。管理员也可从 `GET /api/agent-upgrades` 的 `workers` 按节点 ID 核对 `protocol` 和 `last_seen`。
+
+在已有 Agent 的 Linux 节点上以 root 执行下面的命令，把示例域名替换为该节点使用的 Hub HTTPS 域名。节点需要 Python 3.8 或以上、系统 CA、systemd 或 OpenRC。升级器沿用 `/opt/monitor/agent.env` 中的原地址及 Token。公网反代需要向 Hub 传递真实的 `Host` 和 `X-Forwarded-Proto`，包括 Agent 的 WebSocket 路径。
 
 ```sh
-install -d -m 0700 /root/cmonitor-maintenance
-cd /root/cmonitor-maintenance
-curl --proto '=https' -fsS https://hub.example.com/agent-updater.py -o agent-updater.py && python3 -I agent-updater.py enable
+install -d -m 0700 /root/cmonitor-maintenance &&
+  cd /root/cmonitor-maintenance &&
+  curl --proto '=https' -fsS https://hub.example.com/agent-updater.py -o agent-updater.py &&
+  python3 -I agent-updater.py enable
 ```
 
-通常约半分钟后就能勾选版本低于目标的节点。已启用的节点会定期领取任务。节点从原 Hub 下载固定版本二进制，并通过 HTTPS 从 `ClaraCora/Cagent` 官方 GitHub Release 取得独立的校验清单。节点无法访问 GitHub Release、架构不支持或校验失败时，Hub 会停止批准新的安装，并继续核实已获准安装的节点。无法使用 HTTPS 的机器继续按[离线升级说明](../OFFLINE_DEPLOY.md)维护。
+**只能通过 HTTP 上报的节点继续离线升级。** 从与当前 Hub 对应的发布版本取得并校验离线包，搬到目标机，在解压后的目录运行 `sh ./install.sh --offline-dir .`。该命令沿用原 HTTP 地址、Token 和服务的 `--insecure` 参数。联网后在原节点核对版本和指标。[离线包获取、校验与回退](../OFFLINE_DEPLOY.md#已安装节点离线升级)
 
-## 确认与恢复
+## 发起和核实批次
 
-升级器在原目录保存旧文件、原子替换 Agent 并重启现有服务。服务启动失败时尝试恢复旧文件。Hub 要同时看到本机重启成功回执，以及同一节点 ID 在新连接上以目标版本提交完整指标，才将该节点记为成功。每台领取或执行超时为十分钟。若有节点失败或超时，尚未获准安装的节点会跳过，已获准的节点继续报告结果。Hub 重启会停止批次，已获准但未验证的节点标记为「结果待核实」。排除故障后，可重新勾选仍低于目标的节点。
+1. 打开「升级 Agent」，先勾选用于验证的节点，再点击「全选可升级节点」或手动勾选其余节点。检查底部「首台验证」显示的名称和节点数。已达到目标版本、离线、使用明文连接或尚未就绪的节点不能勾选。
+2. 点击「开始升级」。关闭窗口后，Hub 仍会处理批次。若提交时连接中断，先重新读取最近批次并核对节点，避免重复提交。
+3. 最近批次显示各节点的状态和原因。「已恢复上报」表示 Hub 已核实原节点的新会话、目标版本和完整指标。安装回执丢失时，v2 升级器会重发同一次安装的回执，Hub 也可以根据已经收到的新版指标确认成功。
+4. 有节点失败或超时时，Hub 会跳过尚未获准安装的节点，并继续核实已获准安装的节点。排除故障后，可用「选择可重试节点」选取仍然符合条件的节点发起新批次。
 
-systemd 节点用 `journalctl -u monitor-agent-updater.service` 查看升级日志。关闭本机任务领取可执行 `systemctl disable --now monitor-agent-updater.timer`。OpenRC 上运行 `rc-service monitor-agent-updater stop` 和 `rc-update del monitor-agent-updater default`。关闭领取后，原有 Agent 继续上报。
+## 处理异常
+
+| 最近批次的表现 | 核查和处理 |
+| --- | --- |
+| 下载失败或校验失败 | 节点从原 Hub 下载二进制，并从 Cagent 官方 GitHub Release 独立取得 SHA-256 清单。暂时断网、限流和部分服务器错误会退避重试。持续下载失败时检查两条 HTTPS 路径。摘要或版本不符时检查 Hub 固定版本与官方 Release，原程序仍保留。 |
+| 新服务启动失败 | 升级器保存旧程序后原子替换二进制并重启原服务。本机重启或运行状态检查失败时，升级器尝试装回旧程序并重启。检查服务日志和原节点的上报情况。 |
+| 等候回滚或正在恢复旧版 | v2 的观察阶段超时，且 Hub 在新版会话上持续收到不完整指标时，Hub 才会发出限时回滚许可。升级器核对本机当前程序和旧副本，收到有效许可后执行回滚。成功启动旧版后的回执可重发。 |
+| 结果待核实 | 断网、Hub 重启或超时都可能使结果无法确认。升级器保存未完成的状态，通信恢复后查询或重发回执。仅凭失联不会触发回滚。核对原节点版本、指标、Agent 和升级器日志，再决定是否重试。 |
+
+领取、下载校验、安装和观察各有 10 分钟的期限。Hub 对持续收到不完整指标的节点保留 2 分钟领取回滚的时间，获准后有 3 分钟完成并回报。节点的旧程序保存在 `/opt/monitor/.agent-updater.previous`，当前尝试的恢复记录保存在 `/opt/monitor/.agent-updater.state`。
+
+systemd 节点用 `journalctl -u monitor-agent-updater.service` 查看升级器日志，用 `journalctl -u monitor-agent` 查看 Agent 日志。若要停止领取任务，执行 `systemctl disable --now monitor-agent-updater.timer`。OpenRC 节点执行 `rc-service monitor-agent-updater stop` 和 `rc-update del monitor-agent-updater default`。原有 Agent 服务可继续上报。

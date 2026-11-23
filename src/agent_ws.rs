@@ -364,7 +364,7 @@ fn dispatch_session(app: &App, node_id: i64, ip: &str, text: &str, session: Opti
             {
                 agent.rollout.version =
                     rpc.params["agent_version"].as_str().filter(|s| s.len() < 40).unwrap_or("").to_owned();
-                agent.rollout.reported = false;
+                agent.rollout.reset_report();
                 if rpc.params["terminal_reason"] == "plaintext" {
                     agent.rollout.tls = false;
                 }
@@ -574,8 +574,9 @@ fn report_session(
     let Some(entry) = agents.get_mut(&node_id).filter(|a| session.is_none_or(|s| s == a.session)) else {
         return Ok(());
     };
-    entry.rollout.reported = !entry.rollout.version.is_empty()
+    let complete = !entry.rollout.version.is_empty()
         && report_fields().all(|key| metrics.get(key).is_some_and(|v| !v.is_null()));
+    entry.rollout.record_report(complete, now);
     let first = entry.last_seen == 0;
     if first {
         check_contract(node_id, &metrics);

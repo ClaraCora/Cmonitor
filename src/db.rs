@@ -155,7 +155,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_running_upgrade ON upgrade_batch(status) W
 CREATE TABLE IF NOT EXISTS upgrade_item (
  batch INTEGER NOT NULL REFERENCES upgrade_batch(id) ON DELETE CASCADE, pos INTEGER NOT NULL, node INTEGER NOT NULL,
  status TEXT NOT NULL DEFAULT 'queued', previous_session TEXT NOT NULL DEFAULT '', deadline INTEGER NOT NULL DEFAULT 0,
+ attempt TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(batch,pos), UNIQUE(batch,node)
+);
+CREATE TABLE IF NOT EXISTS upgrade_worker (
+ node INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+ protocol INTEGER NOT NULL, last_seen INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS traffic_daily (
  node_id INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
@@ -185,7 +190,10 @@ CREATE TABLE IF NOT EXISTS alert_state (
  key TEXT PRIMARY KEY, value INTEGER NOT NULL
 );
 "#;
-const EXTRA_TABLES: [&str; 6] = [
+const EXTRA_TABLES: [&str; 9] = [
+    "upgrade_worker",
+    "upgrade_batch",
+    "upgrade_item",
     "traffic_daily",
     "renewal_history",
     "notification_event",
@@ -197,7 +205,7 @@ const EXTRA_TABLES: [&str; 6] = [
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -339,6 +347,16 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
         )?;
     }
     conn.execute_batch(EXTRA_SCHEMA)?;
+    if from < 11 {
+        for column in [
+            "attempt TEXT NOT NULL DEFAULT ''",
+            "reason TEXT NOT NULL DEFAULT ''",
+            "updated_at INTEGER NOT NULL DEFAULT 0",
+        ] {
+            add_column(conn, "upgrade_item", column)?;
+        }
+        conn.execute("UPDATE upgrade_item SET deadline=0 WHERE status IN ('verified','skipped','failed','unconfirmed')", [])?;
+    }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
 }
@@ -1842,11 +1860,33 @@ impl Db {
     /// fail. Like the other two, this reads and writes the whole file and belongs
     /// off the runtime.
     pub fn restore_from(&self, src: &str) -> Result<()> {
-        let candidate = Connection::open(src)?;
-        candidate.execute("DELETE FROM session", [])?;
+        // Keep legacy numeric batch IDs from being reused when a backup rewinds
+        // sqlite_sequence. The live connection remains locked through the copy.
+        let mut conn = self.conn();
+        let sequence: i64 = conn.query_row(
+            "SELECT coalesce(max(seq),0) FROM sqlite_sequence WHERE name='upgrade_batch'",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut candidate = Connection::open(src)?;
+        let tx = candidate.transaction()?;
+        tx.execute("DELETE FROM session", [])?;
+        tx.execute("DELETE FROM upgrade_worker", [])?;
+        crate::rollout::invalidate_running(
+            &tx,
+            "数据库已恢复，请核对节点版本后重试",
+            chrono::Utc::now().timestamp(),
+        )?;
+        if sequence > 0
+            && tx
+                .execute("UPDATE sqlite_sequence SET seq=max(seq,?) WHERE name='upgrade_batch'", [sequence])?
+                == 0
+        {
+            tx.execute("INSERT INTO sqlite_sequence(name,seq) VALUES('upgrade_batch',?)", [sequence])?;
+        }
+        tx.commit()?;
         candidate.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         drop(candidate);
-        let mut conn = self.conn();
         conn.restore(rusqlite::MAIN_DB, src, None::<fn(rusqlite::backup::Progress)>)?;
         Ok(())
     }
@@ -2080,6 +2120,35 @@ mod tests {
 
     fn db() -> Db {
         Db::open(":memory:").unwrap()
+    }
+
+    #[test]
+    fn version_ten_upgrade_rows_keep_history_and_clear_finished_deadlines() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch("CREATE TABLE upgrade_item (
+            batch INTEGER NOT NULL,pos INTEGER NOT NULL,node INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',
+            previous_session TEXT NOT NULL DEFAULT '',deadline INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(batch,pos),UNIQUE(batch,node));
+            INSERT INTO upgrade_item(batch,pos,node,status,deadline) VALUES(3,0,2,'verified',12345);").unwrap();
+        migrate(&conn, 10).unwrap();
+        let row = conn
+            .query_row(
+                "SELECT node,status,deadline,reason,updated_at,attempt FROM upgrade_item WHERE batch=3",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row, (2, "verified".into(), 0, String::new(), 0, String::new()));
     }
 
     #[test]

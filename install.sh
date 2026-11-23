@@ -18,6 +18,7 @@ REGISTER=""
 INTERVAL=""
 INSECURE=""
 OFFLINE=""
+ALLOW_DOWNGRADE=""
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
@@ -32,10 +33,12 @@ while [ $# -gt 0 ]; do
 	--register) REGISTER="$2"; shift 2 ;;
 	--interval) INTERVAL="$2"; shift 2 ;;
 	--offline-dir) OFFLINE="$2"; shift 2 ;;
+	--allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
 	--insecure) INSECURE=1; shift ;;
 	*) echo "unknown option: $1" >&2; exit 2 ;;
 	esac
 done
+[ -z "$ALLOW_DOWNGRADE" ] || [ -n "$OFFLINE" ] || { echo "--allow-downgrade requires --offline-dir" >&2; exit 2; }
 
 # An offline update with no connection arguments only replaces the executable.
 # In particular a hand-written HTTP/OpenRC service is kept byte for byte.
@@ -207,6 +210,25 @@ fi
 # policy such as network include/exclude rules and terminal restrictions.
 install -d -m 0755 "$ROOT"
 UPGRADE_BACKUP=$(mktemp -d "$ROOT/.agent-upgrade.XXXXXX")
+trap 'rm -f "$TMP"; rm -rf "$UPGRADE_BACKUP"' EXIT
+install -m 0755 "$TMP" "$UPGRADE_BACKUP/new-bin"
+if [ -n "$OFFLINE" ]; then
+	# A genuine older release also passes its package checksum. Check the
+	# executable on the destination mount before stopping a working service.
+	agent_version() { "$1" --help 2>&1 | sed -nE '1s/^monitor-agent ([0-9]+\.[0-9]+\.[0-9]+)$/\1/p'; }
+	candidate_version=$(agent_version "$UPGRADE_BACKUP/new-bin")
+	[ -n "$candidate_version" ] || { echo "cannot identify the offline Agent version" >&2; exit 1; }
+	if [ -f "$BIN" ] && [ -z "$ALLOW_DOWNGRADE" ]; then
+		installed_version=$(agent_version "$BIN")
+		[ -n "$installed_version" ] || { echo "cannot identify installed Agent; inspect it before using --allow-downgrade" >&2; exit 1; }
+		if ! awk -v old="$installed_version" -v new="$candidate_version" 'BEGIN {
+			split(old, a, "[.]"); split(new, b, "[.]");
+			for (i=1; i<=3; i++) if (a[i]+0 != b[i]+0) exit (b[i]+0 < a[i]+0);
+		}'; then
+			echo "offline Agent $candidate_version is older than $installed_version; intentional downgrades require --allow-downgrade" >&2; exit 1
+		fi
+	fi
+fi
 if [ "$INIT" = openrc ]; then UNIT=$OPENRC_UNIT; else UNIT=$SYSTEM_UNIT; fi
 for file in "$BIN" "$ENV_FILE"; do
 	if [ -f "$file" ]; then cp -p "$file" "$UPGRADE_BACKUP/"; fi
@@ -237,10 +259,18 @@ finish_agent() {
 }
 trap finish_agent EXIT; trap 'exit 1' HUP INT TERM
 if [ -f "$UNIT" ] && service_active >/dev/null 2>&1; then service_stop; fi
-install -m 0755 "$TMP" "$UPGRADE_BACKUP/new-bin"
 mv -f "$UPGRADE_BACKUP/new-bin" "$BIN"
+save_offline_previous() {
+	# Keep only the last different executable. A same-version rerun with the
+	# identical image must not overwrite the previous rollback point.
+	if [ -n "$OFFLINE" ] && [ -f "$UPGRADE_BACKUP/monitor-agent" ] && ! cmp -s "$UPGRADE_BACKUP/monitor-agent" "$BIN"; then
+		cp -p "$UPGRADE_BACKUP/monitor-agent" "$UPGRADE_BACKUP/keep-previous" &&
+			mv -f "$UPGRADE_BACKUP/keep-previous" "$ROOT/.agent-offline.previous"
+	fi
+}
 if [ -n "$keep_unit" ]; then
 	service_start && sleep 2 && service_active || exit 1
+	save_offline_previous
 	echo "updated binary; kept the existing service, credentials and reporting settings"; exit 0
 fi
 
@@ -261,6 +291,7 @@ mv -f "$ENV_TMP" "$ENV_FILE"
 
 if [ -n "$preserve_definition" ]; then
 	service_start && sleep 2 && service_active || exit 1
+	save_offline_previous
 	echo "updated agent and connection settings; existing service options retained"; exit 0
 fi
 
@@ -293,6 +324,7 @@ RC
 		echo "agent upgrade failed; starting recovery" >&2
 		exit 1
 	fi
+	save_offline_previous
 	echo "monitor-agent installed; follow it with: tail -f /var/log/monitor-agent.log"
 	exit 0
 fi
@@ -331,4 +363,5 @@ if ! systemctl is-active --quiet monitor-agent; then
 	echo "agent did not remain active; starting recovery" >&2
 	exit 1
 fi
+save_offline_previous
 echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"

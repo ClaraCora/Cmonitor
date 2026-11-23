@@ -2,16 +2,20 @@
 """Opt-in maintenance for the packaged Linux monitor-agent. Python >= 3.8."""
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import platform
+import random
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -56,7 +60,7 @@ class Redirect(urllib.request.HTTPRedirectHandler):
 
 
 def fetch(url, limit, data=None, token=None):
-    headers = {'User-Agent': 'Cmonitor-updater/1'}
+    headers = {'User-Agent': 'Cmonitor-updater/2'}
     if token:
         headers.update({'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
     req = urllib.request.Request(url, data=data, headers=headers)
@@ -82,15 +86,36 @@ def validate_target(current, target):
         raise ValueError('target must be newer')
 
 
+NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, http.client.IncompleteRead)
+
+
+def release_bytes(url, limit):
+    # Many nodes become eligible together. Only retry transport errors and
+    # transient HTTP statuses; never retry away a checksum mismatch.
+    for attempt in range(4):
+        try:
+            return fetch(url, limit)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (408, 425, 429, 500, 502, 503, 504) or attempt == 3:
+                raise
+            retry_after = (exc.headers.get('Retry-After') or '') if exc.headers else ''
+            delay = min(int(retry_after), 20) if retry_after.isdecimal() else 0
+        except NETWORK_ERRORS:
+            if attempt == 3:
+                raise
+            delay = 0
+        time.sleep(max(delay, random.uniform(0.5, 1.5) * 2 ** attempt))
+
+
 def checked_binary(server, target, current):
     validate_target(current, target)
     arch = platform.machine()
     if arch not in ('x86_64', 'aarch64'):
         raise ValueError('unsupported architecture')
     asset = 'monitor-agent-' + arch + '-unknown-linux-musl'
-    sums = fetch(OFFICIAL + 'v' + target + '/sha256sums.txt', 8192).decode('ascii')
+    sums = release_bytes(OFFICIAL + 'v' + target + '/sha256sums.txt', 8192).decode('ascii')
     hashes = re.findall(r'^([0-9a-f]{64}) [ *]' + re.escape(asset) + r'$', sums, re.M)
-    image = fetch(server + '/agent/' + arch, 32 * 1024 * 1024)
+    image = release_bytes(server + '/agent/' + arch, 32 * 1024 * 1024)
     if hashes != [hashlib.sha256(image).hexdigest()]:
         raise ValueError('release checksum mismatch')
     return image
@@ -110,58 +135,209 @@ def restart_healthy():
     service('status')
 
 
-def restore():
-    # Keep the prior executable until its service is healthy, even if power is
-    # lost between rename and restart.
+def sync_dir():
+    fd = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_file(path, data, mode):
     with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
-        old = Path(tmp) / 'old'
-        os.link(PREVIOUS, old)
-        os.replace(old, BIN)
+        staging = Path(tmp) / 'new'
+        with staging.open('wb') as out:
+            out.write(data)
+            out.flush()
+            os.fchmod(out.fileno(), mode)
+            os.fsync(out.fileno())
+        os.replace(staging, path)
+        sync_dir()
+
+
+def link_replace(source, dest):
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        link = Path(tmp) / 'link'
+        os.link(source, link)
+        os.replace(link, dest)
+        sync_dir()
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def checkpoint(state, **changes):
+    state.update(changes)
+    write_file(ROOT / '.agent-updater.state', json.dumps(state).encode(), 0o600)
+
+
+def complete(state, status):
+    print('monitor-agent batch {}: {}'.format(state['job']['batch'], status), flush=True)
+    (ROOT / '.agent-updater.candidate').unlink(missing_ok=True)
+    (ROOT / '.agent-updater.state').unlink()
+    sync_dir()
+
+
+def valid_job(job):
+    return (isinstance(job, dict) and job.get('protocol') == 2 and
+            type(job.get('batch')) is int and job['batch'] > 0 and
+            isinstance(job.get('attempt'), str) and re.fullmatch(r'[a-f0-9]{32}', job['attempt']) and
+            isinstance(job.get('target'), str) and re.fullmatch(VERSION, job['target']))
+
+
+TERMINAL = {'verified', 'failed', 'skipped', 'rolled_back', 'unconfirmed', 'unknown', 'rollback_failed'}
+
+
+def decision(reply):
+    if not isinstance(reply, dict) or not isinstance(reply.get('status'), str):
+        raise ValueError('missing Hub upgrade decision')
+    return reply['status']
+
+
+def restore_image(state, deadline=None):
+    # An operator may already have replaced either file. Never undo that change.
+    if digest(PREVIOUS) != state['old'] or digest(BIN) not in (state['new'], state['old']):
+        raise ValueError('installed or previous image no longer matches this attempt')
+    if deadline is not None and time.time() >= deadline:
+        return False
+    link_replace(PREVIOUS, BIN)
     restart_healthy()
-    PENDING.unlink()
+    return True
+
+
+def record_restore(state, success, deadline=None):
+    try:
+        if not restore_image(state, deadline):
+            return
+    except (OSError, ValueError, subprocess.SubprocessError):
+        success = 'rollback_failed'
+    checkpoint(state, phase='failed', error=success)
+
+
+def prepare(state, server):
+    # Keep files from the same filesystem, in order, before asking for permission
+    # to replace the live executable. A lost apply response is safe to replay.
+    candidate = ROOT / '.agent-updater.candidate'
+    try:
+        image = checked_binary(server, state['job']['target'], version(BIN))
+        write_file(candidate, image, 0o755)
+        if version(candidate) != state['job']['target']:
+            raise ValueError('unexpected release version')
+        link_replace(BIN, PREVIOUS)
+        checkpoint(state, phase='prepared', old=digest(PREVIOUS), new=digest(candidate))
+    except NETWORK_ERRORS as exc:
+        print('Agent release download failed: ' + type(exc).__name__, file=sys.stderr, flush=True)
+        checkpoint(state, phase='failed', error='download')
+    except (ValueError, OSError, IndexError, subprocess.SubprocessError) as exc:
+        print('Agent release verification failed: ' + type(exc).__name__, file=sys.stderr, flush=True)
+        checkpoint(state, phase='failed', error='verify')
+
+
+def resume(state, server, request):
+    job = state['job']
+    def call(action, **extra):
+        return request(action, batch=job['batch'], attempt=job['attempt'], **extra)
+
+    if state['phase'] == 'download':
+        prepare(state, server)
+    if state['phase'] in ('prepared', 'swapping'):
+        current = digest(BIN)
+        if current == state['old']:
+            candidate = ROOT / '.agent-updater.candidate'
+            if digest(candidate) != state['new'] or digest(PREVIOUS) != state['old']:
+                checkpoint(state, phase='failed', error='verify')
+            elif call('apply') != job:
+                status = decision(call('status'))
+                if status in TERMINAL:
+                    complete(state, status)
+                return
+            else:
+                checkpoint(state, phase='swapping')
+                os.replace(candidate, BIN)
+                sync_dir()
+        elif current != state['new'] or state['phase'] != 'swapping':
+            checkpoint(state, phase='failed', error='verify')
+        if state['phase'] == 'swapping':
+            try:
+                restart_healthy()
+            except (OSError, subprocess.SubprocessError):
+                checkpoint(state, phase='restore_local')
+            else:
+                checkpoint(state, phase='receipt')
+    if state['phase'] == 'restore_local':
+        record_restore(state, 'restart')
+    if state['phase'] == 'receipt':
+        status = decision(call('installed'))
+        if status in TERMINAL:
+            complete(state, status)
+            return
+        if status == 'observing':
+            checkpoint(state, phase='observe')
+            return
+        if status not in ('rolling_back', 'rollback_pending'):
+            return
+        checkpoint(state, phase='observe')
+    if state['phase'] == 'restore_authorized' and digest(BIN) == state['old']:
+        # An interruption after the authorized rename but before recording the
+        # restart. Only finish starting the already-restored image, even if the
+        # Hub is now unreachable. No replacement with an expired grant.
+        try:
+            restart_healthy()
+        except (OSError, subprocess.SubprocessError):
+            checkpoint(state, phase='failed', error='rollback_failed')
+        else:
+            checkpoint(state, phase='failed', error='rolled_back')
+    if state['phase'] in ('observe', 'restore_authorized'):
+        status = decision(call('status'))
+        if status in TERMINAL:
+            complete(state, status)
+            return
+        if status in ('rolling_back', 'rollback_pending'):
+            grant = call('rollback')
+            # A Hub restart or interrupted response cannot authorize a local
+            # rollback. Repeat the grant request on recovery, also checking its
+            # expiry and both on-disk image digests before touching the service.
+            if (decision(grant) != 'rollback' or type(grant.get('deadline')) is not int
+                    or time.time() >= grant['deadline']):
+                return
+            checkpoint(state, phase='restore_authorized')
+            record_restore(state, 'rolled_back', grant['deadline'])
+    if state['phase'] == 'failed':
+        status = decision(call('failed', error=state['error']))
+        if status in TERMINAL:
+            complete(state, status)
 
 
 def once():
     server, token = connection()
+    # An empty marker was written by the old worker only while replacing the
+    # binary; an interrupted v1 transaction keeps its original recovery rule.
     if PENDING.exists():
-        restore()
+        link_replace(PREVIOUS, BIN)
+        restart_healthy()
+        PENDING.unlink()
+        sync_dir()
 
     def request(action, **fields):
         return json.loads(fetch(server + '/api/agent/upgrade', 2048,
-                                json.dumps(dict(action=action, **fields)).encode(), token))
+                                json.dumps(dict(action=action, protocol=2, **fields)).encode(), token))
 
-    job = request('poll')
-    if job is None:
-        return
-    batch, target = job['batch'], job['target']
-    phase = 'verify'
-    try:
-        image = checked_binary(server, target, version(BIN))
-        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
-            new = Path(tmp) / 'new'
-            new.write_bytes(image)
-            new.chmod(0o755)
-            if version(new) != target:
-                raise ValueError('unexpected release version')
-            if request('apply', batch=batch) != job:
-                return
-            old = Path(tmp) / 'old'
-            os.link(BIN, old)
-            os.replace(old, PREVIOUS)
-            phase = 'restart'
-            PENDING.touch(mode=0o600, exist_ok=False)
-            os.replace(new, BIN)
-            restart_healthy()
-            PENDING.unlink()
-        request('installed', batch=batch)
-        print('installed monitor-agent ' + target, flush=True)
-    except Exception:
-        try:
-            if PENDING.exists():
-                restore()
-        finally:
-            request('failed', batch=batch, error=phase)
-        raise
+    journal = ROOT / '.agent-updater.state'
+    identity = hashlib.sha256((server + '\0' + token).encode()).hexdigest()
+    if journal.exists():
+        state = json.loads(journal.read_text())
+        if state.get('identity') != identity or not valid_job(state.get('job')):
+            raise ValueError('upgrade journal belongs to a different identity or is damaged')
+    else:
+        job = request('poll')
+        if job is None:
+            return
+        if not valid_job(job):
+            raise ValueError('Hub must support the recoverable upgrade protocol')
+        state = dict(identity=identity, job=job)
+        checkpoint(state, phase='download')
+    resume(state, server, request)
 
 
 def enable():

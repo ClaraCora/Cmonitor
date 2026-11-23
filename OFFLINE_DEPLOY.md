@@ -88,6 +88,18 @@ sh ./install.sh --offline-dir .
 
 此命令保留原服务定义和环境文件，只替换二进制。现有 HTTP 地址、`--insecure`、采样间隔、节点身份、网卡与终端策略均沿用。升级不发起下载或重新注册。检查原节点 ID 持续上报及版本即可。首次安装见下文。
 
+安装器会在停止服务前检查本机和候选版本。如果确实需要降到旧版本，使用已校验的旧包并在命令后添加 `--allow-downgrade`。成功替换后，上一份不同的程序保存在 `/opt/monitor/.agent-offline.previous`，重复安装相同程序会保留这份副本。
+
+若本地服务已经启动，但联网后原节点仍无法上报，可在目标机以 root 执行以下命令恢复上一份程序，并按第 8 节核实上报。OpenRC 机器将最后一行换为 `rc-service monitor-agent restart`。
+
+```bash
+cd /opt/monitor &&
+  restore_tmp=$(mktemp .agent-restore.XXXXXX) &&
+  install -m 0755 .agent-offline.previous "$restore_tmp" &&
+  mv -f "$restore_tmp" monitor-agent &&
+  systemctl restart monitor-agent
+```
+
 ## 3. 把文件复制到目标机器
 
 通过 U 盘、SFTP、SCP 或内网文件服务器，把以下文件放到目标机器 `/tmp/`：
