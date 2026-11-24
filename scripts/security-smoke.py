@@ -51,7 +51,8 @@ class WebSocket:
         else:
             self.close()
 
-    def send(self, value, opcode=1):
+    @staticmethod
+    def encode(value, opcode=1):
         payload = json.dumps(value).encode() if not isinstance(value, bytes) else value
         size = len(payload)
         header = bytes([0x80 | opcode])
@@ -62,7 +63,10 @@ class WebSocket:
         else:
             header += bytes([0x80 | 127]) + struct.pack("!Q", size)
         mask = secrets.token_bytes(4)
-        self.sock.sendall(header + mask + bytes(v ^ mask[i % 4] for i, v in enumerate(payload)))
+        return header + mask + bytes(v ^ mask[i % 4] for i, v in enumerate(payload))
+
+    def send(self, value, opcode=1):
+        self.sock.sendall(self.encode(value, opcode))
 
     def receive(self):
         while True:

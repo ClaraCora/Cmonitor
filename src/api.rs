@@ -10,13 +10,14 @@ use axum::Json;
 use chrono::{Local, Months, NaiveDate, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use tracing::debug;
 
 use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
-use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
+use crate::db::{Node, NodePatch, PingHistory, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
 
 /// Where the visitor card's geo answers are kept between page loads. Fetching
@@ -89,8 +90,10 @@ fn node_view(
     node: &Node,
     current: Option<&Agent>,
     traffic: &Traffic,
-    tasks: &[PingTask],
+    tasks: &[&PingTask],
     full: bool,
+    now: i64,
+    timezone: &str,
 ) -> Value {
     // The three capacities arrive twice: once in `Facts`, sent at the handshake
     // and stored, and again in every `Metrics`. A machine that gains a disk while
@@ -106,27 +109,27 @@ fn node_view(
     let live = |key: &str, stored: i64| {
         current.and_then(|a| a.metrics.get(key).and_then(serde_json::Value::as_i64)).unwrap_or(stored)
     };
-    let pings = tasks.iter().filter(|task| task.nodes.contains(&node.id)).map(|task| {
+    let pings = tasks.iter().map(|task| {
             let reading = current.and_then(|agent| agent.pings.get(&task.id));
-            json!({
+            let fresh = reading.filter(|v| now - v.updated_at <= task.interval * 2 + 30);
+            let mut ping = json!({
                 "id": task.id,
                 "name": task.name,
-                "latency": reading.filter(|v| Utc::now().timestamp() - v.updated_at <= task.interval * 2 + 30).map(|value| value.latency),
+                "latency": fresh.map(|v| v.latency),
                 "last_latency": reading.map(|v| v.latency),
                 "interval_sec": task.interval,
                 "status": match reading {
-                    Some(v) if current.is_none() || Utc::now().timestamp() - v.updated_at > task.interval * 2 + 30 => "stale",
+                    Some(_) if fresh.is_none() => "stale",
                     Some(v) if v.latency >= 0 => "ok",
                     Some(_) => "failed",
-                    None if current.is_some_and(|a| Utc::now().timestamp() - a.probe_started_at > task.interval * 2 + 30) => "stale",
+                    None if current.is_some_and(|a| now - a.probe_started_at > task.interval * 2 + 30) => "stale",
                     None => "pending",
                 },
                 "reason": reading.and_then(|v| match v.latency { -2 => Some("dns_timeout"), -3 => Some("dns_error"), -1 => Some("tcp_timeout"), _ => None }),
                 "updated_at": reading.map(|value| value.updated_at),
-                "samples": reading
-                    .map(|value| value.samples.iter().copied().collect::<Vec<_>>())
-                    .unwrap_or_default(),
-            })
+            });
+            ping["samples"] = Value::Array(reading.into_iter().flat_map(|r| r.samples.iter().copied()).map(Value::from).collect());
+            ping
         }).collect::<Vec<_>>();
     let mut view = json!({
         "id": node.id,
@@ -142,7 +145,6 @@ fn node_view(
         // connected but not yet reporting, which is not a timestamp, so it falls
         // back to the stored value and "offline since" survives the gap.
         "last_seen": current.map(|a| a.last_seen).filter(|t| *t > 0).unwrap_or(node.last_seen),
-        "metrics": current.map(|a| a.metrics.clone()).unwrap_or(Value::Null),
         "os": node.os,
         "kernel": node.kernel,
         "arch": node.arch,
@@ -157,8 +159,8 @@ fn node_view(
         "currency": node.currency,
         "billing_cycle": node.billing_cycle,
         "expires_at": node.expires_at,
-        "valuation_at": Utc::now().timestamp(),
-        "billing_timezone": Local::now().offset().to_string(),
+        "valuation_at": now,
+        "billing_timezone": timezone,
         "expires_at_epoch": billing_boundary(node.expires_at.as_deref(), 0),
         "billing_period_start_epoch": billing_boundary(node.expires_at.as_deref(), billing_months(&node.billing_cycle)),
         "tags": node.tags,
@@ -174,21 +176,25 @@ fn node_view(
         // the public page already shows, so this one is public as well.
         "day_rx": traffic.day_rx,
         "day_tx": traffic.day_tx,
-        // Every assigned task is present before its first answer, so the card
-        // does not jump when a probe starts. Results are session-live: after a
-        // hub restart they refill on the task's next interval.
-        "pings": pings,
     });
+    // Move the probe windows into the object. Passing an existing JSON tree as
+    // an expression to json! would serialize it to a second owned tree.
+    view["pings"] = Value::Array(pings);
     // An allowlist rather than a denylist: the agent ships from its own
     // repository, so a field added there would otherwise reach anonymous visitors
     // the day it is released. No address, hostname or note may ever do so.
     view["permanent"] = json!(node.permanent);
     view["traffic_incomplete"] = json!(traffic.traffic_incomplete);
-    if !full {
-        if let Some(m) = view["metrics"].as_object_mut() {
-            m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()));
-        }
-    }
+    view["metrics"] = match current.map(|a| &a.metrics) {
+        Some(Value::Object(m)) if !full => Value::Object(
+            m.iter()
+                .filter(|(k, _)| PUBLIC_METRICS.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        Some(v) => v.clone(),
+        None => Value::Null,
+    };
     // Address, private notes and the token never leave the panel. The token is
     // included so the install command can be displayed without reissuing it.
     if full {
@@ -228,35 +234,57 @@ fn billing_boundary(date: Option<&str>, months: u32) -> Option<i64> {
 }
 
 fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
-    // One traffic query and one lock for the whole list, since this is what every
-    // visitor to the public page loads.
     let nodes = app.db.nodes()?;
     let traffic = app.db.all_traffic();
     let tasks = app.db.ping_tasks()?;
-    let offline = if full {
+    let mut by_node: HashMap<i64, Vec<&PingTask>> = HashMap::new();
+    for task in &tasks {
+        for id in &task.nodes {
+            by_node.entry(*id).or_default().push(task);
+        }
+    }
+    // Only exceptions are needed. An absent entry uses the default policy.
+    // Fetch them before reading live agents so a database wait never holds up
+    // an agent updating its metrics.
+    let disabled = if full {
         let conn = app.db.conn();
-        let mut query = conn.prepare("SELECT node FROM node_maintenance WHERE offline_only=1")?;
-        let ids = query
-            .query_map([], |r| r.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
-        ids
+        let mut query = conn.prepare_cached(
+            "SELECT n.id, COALESCE(m.offline_only, 0) FROM node n
+             LEFT JOIN node_maintenance m ON m.node = n.id
+             LEFT JOIN setting s ON s.key = ('terminal_node_' || n.id)
+             WHERE m.offline_only = 1 OR s.value = 'off'",
+        )?;
+        let rows = query.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, bool>(1)?)))?;
+        rows.collect::<rusqlite::Result<HashMap<_, _>>>()?
     } else {
-        std::collections::HashSet::new()
+        HashMap::new()
     };
-    let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
+    let time = Local::now();
+    let timezone = time.offset().to_string();
     let none = Traffic::default();
     Ok(nodes
         .iter()
         .filter(|n| full || n.public)
         .map(|n| {
-            let mut view = node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), &tasks, full);
+            // Release the lock between nodes so new agent reports can progress
+            // even while a large fleet's snapshot is being assembled.
+            let mut view = {
+                let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
+                node_view(
+                    n,
+                    agents.get(&n.id),
+                    traffic.get(&n.id).unwrap_or(&none),
+                    by_node.get(&n.id).map(Vec::as_slice).unwrap_or_default(),
+                    full,
+                    time.timestamp(),
+                    &timezone,
+                )
+            };
             if full {
-                view["offline_only"] = json!(offline.contains(&n.id));
-                view["terminal_enabled"] = json!(
-                    !offline.contains(&n.id)
-                        && app.db.get(&format!("terminal_node_{}", n.id)).as_deref() != Some("off")
-                );
-                if offline.contains(&n.id) {
+                let offline = disabled.get(&n.id) == Some(&true);
+                view["offline_only"] = json!(offline);
+                view["terminal_enabled"] = json!(!disabled.contains_key(&n.id));
+                if offline {
                     view["terminal_capable"] = json!(false);
                     view["terminal_reason"] = json!("plaintext");
                 }
@@ -274,7 +302,7 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
     // The same rendered frame the browser streams receive, for the same reason:
     // otherwise every visitor would rebuild every node's row against the
     // connection the agents write through.
-    ([(axum::http::header::CONTENT_TYPE, "application/json")], live_snapshot(&app, full).as_str().to_owned())
+    ([(header::CONTENT_TYPE, "application/json")], axum::body::Bytes::from(live_snapshot(&app, full)))
         .into_response()
 }
 
@@ -294,35 +322,9 @@ fn default_hours() -> i64 {
     6
 }
 
-/// How many history windows are built concurrently.
-///
-/// `PUBLIC_HOURS` bounds what one request costs; this bounds how many may run,
-/// closing the same gap `main::RELAY_GATE` and `auth::PASSWORD_GATE` close on
-/// the other two paths an anonymous caller can make expensive. This is the most
-/// expensive of the three: every request holds the single connection the agents
-/// report through for its entire scan, measured at 118 ms for a week of four
-/// probes and growing with `retention_days`. Without a gate, 120 requests from
-/// one machine took the panel's own node list from 1 ms to 2.8 s.
-///
-/// Four, because the requests serialise on that one connection regardless: a
-/// fifth in flight buys no throughput and merely places another scan ahead of
-/// the next agent report. What the number actually sets is how long that wait
-/// can become -- four at roughly 120 ms is half a second -- while leaving room
-/// for several people opening charts simultaneously.
-///
-/// Refused rather than queued, as in `auth`: a queue admits the same flood,
-/// merely later.
-///
-/// **This gate is ineffective without the `spawn_blocking` below.** The body of
-/// this handler never awaits, so a permit taken and dropped within it is held
-/// only while a worker thread is actually running the handler -- at most one per
-/// worker, three on this hub. Measured at eight: 120 concurrent requests, zero
-/// refusals, the panel still at 14 s. This is the same constraint
-/// `PASSWORD_CHECKS` is sized against, approached from the other side: not a
-/// value too high for the machine, but a handler that cannot hold more permits
-/// than the machine has threads. Moving the scan off the runtime is what makes
-/// "in flight" meaningful, and is what every other heavy query here already
-/// does.
+/// One disk reader serializes scans while each request also holds original
+/// samples for percentiles and builds its response. Bound that work and refuse
+/// excess requests rather than building an unbounded queue on popular nodes.
 const HISTORY_SLOTS: usize = 4;
 static HISTORY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(HISTORY_SLOTS);
 
@@ -338,7 +340,7 @@ pub async fn metrics(
     }
     // After the two point lookups above, so an unauthorised caller is told so
     // rather than asked to retry later.
-    let Ok(_permit) = HISTORY_GATE.try_acquire() else {
+    let Ok(permit) = HISTORY_GATE.try_acquire() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many history queries in flight, try again")
             .into_response();
     };
@@ -347,15 +349,10 @@ pub async fn metrics(
     let step = sample_step(hours, w.points);
     let wants = |name: &str| w.series.as_deref().is_none_or(|s| s == name);
     let (want_metrics, want_ping) = (wants("metrics"), wants("ping"));
-    // Off the runtime, for the reason given in `db_stats` below: this reads every
-    // probe result the node has retained within the window and holds the
-    // connection the agents report through throughout. That route is behind
-    // `Admin` and cheaper than this one, which anyone can reach.
-    //
-    // It is also what makes the gate above effective: the permit is held across
-    // an await, so exactly four callers are inside it at once rather than however
-    // many worker threads happen to exist.
     let built = tokio::task::spawn_blocking(move || {
+        // Dropping a disconnected request cannot cancel this blocking job.
+        // Keep its permit until the scan and response encoding actually finish.
+        let _permit = permit;
         // Probe names accompany the samples they label, so the page needs no
         // second request. Names only: targets and assignments remain behind
         // `Admin`. Skipped when probes were not requested, since the resources tab
@@ -363,20 +360,19 @@ pub async fn metrics(
         let probes =
             if want_ping { app.db.ping_task_names(id).unwrap_or_else(|_| json!({})) } else { json!({}) };
         let metrics = if want_metrics { app.db.metrics(id, since, step)? } else { vec![] };
-        // `loss` is per probe across the whole window, alongside the per-bucket
-        // `loss` on the rows. Both are required and neither replaces the other:
-        // the row figure is what a tooltip reads, while the window figure is the
-        // only one that can be accurate, since the denominators it divides by are
-        // gone by the time the rows are built. Additive, so a theme unaware of it
-        // continues to work.
-        let (ping, loss) =
-            if want_ping { app.db.ping_records(id, since, step)? } else { (vec![], json!({})) };
-        let stats = if want_ping { app.db.ping_window_stats(id, since)? } else { json!({}) };
-        anyhow::Ok(json!({"metrics": metrics, "ping": ping, "probes": probes, "loss": loss, "stats": stats}))
+        let history = if want_ping { app.db.ping_records(id, since, step)? } else { PingHistory::default() };
+        #[derive(serde::Serialize)]
+        struct HistoryResponse {
+            metrics: Vec<Value>,
+            probes: Value,
+            #[serde(flatten)]
+            history: PingHistory,
+        }
+        anyhow::Ok(Json(HistoryResponse { metrics, probes, history }).into_response())
     })
     .await;
     match built.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
-        Ok(body) => Json(body).into_response(),
+        Ok(response) => response,
         Err(e) => fail(e),
     }
 }
@@ -384,9 +380,7 @@ pub async fn metrics(
 /// Widest history window each audience may request.
 ///
 /// The thinning below bounds the response, not the scan behind it: `hours=2160`
-/// returns 320 rows after reading every probe result the node has retained. At a
-/// month of retention that is 224 ms holding the single write connection the
-/// agents report through, growing with `retention_days`.
+/// returns a bounded chart after reading every probe result the node has retained.
 ///
 /// The public ceiling is a week because that is the widest chart the themes
 /// draw, so nothing in use is lost. The panel retains the quarter year, being
@@ -457,7 +451,9 @@ fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
     let nodes = visible_nodes(app, full).unwrap_or_default();
     // `admin` is included so the panel's first fetch and its stream share one
     // cached frame.
-    let payload = Utf8Bytes::from(json!({"nodes": nodes, "admin": full}).to_string());
+    let mut frame = json!({"admin": full});
+    frame["nodes"] = Value::Array(nodes);
+    let payload = Utf8Bytes::from(frame.to_string());
     cache[slot] = (now, payload.clone());
     payload
 }
@@ -1399,11 +1395,8 @@ fn scratch_path(app: &App, kind: &str) -> String {
 
 /// The data page's figures.
 ///
-/// Off the runtime, like the three routes below: `stats` counts every row of
-/// `metric` and `ping_record` -- both WITHOUT ROWID, so each count is a full
-/// index scan -- holding the connection the agents report through throughout. At
-/// 2.2M rows that is 127 ms during which the public page and every agent report
-/// also wait, growing with `retention_days`.
+/// Counting large history tables can still take time. Keep the scan off the
+/// runtime and on the separate WAL reader used by historical charts.
 pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
     match tokio::task::spawn_blocking(move || {
         let mut stats = app.db.stats()?;
@@ -2111,6 +2104,8 @@ pub async fn save_settings(
 
 #[cfg(test)]
 mod tests {
+    mod snapshot_bench;
+
     use super::*;
     // Sessions remain hashed; only node tokens are stored in the clear.
     use crate::auth::sha256;
@@ -2486,7 +2481,7 @@ mod tests {
             let step = sample_step(hours, None);
             let since = now - hours * 3_600;
             let metrics = app.db.metrics(id, since, step).unwrap();
-            let (ping, _) = app.db.ping_records(id, since, step).unwrap();
+            let ping = app.db.ping_records(id, since, step).unwrap().ping;
             // Against the budget itself rather than whatever the step produced:
             // derived from the step, this would only demonstrate that division
             // works. One bucket of slack, as the window rarely divides evenly.
@@ -2559,7 +2554,7 @@ mod tests {
 
         // Keyed by task rather than index: the rows share a timestamp, so
         // `ORDER BY ts` leaves their order to SQLite.
-        let (rows, window_loss) = app.db.ping_records(id, base, 120).unwrap();
+        let PingHistory { ping: rows, loss: window_loss, .. } = app.db.ping_records(id, base, 120).unwrap();
         let probe = |task: i64| {
             rows.iter().find(|r| r["task_id"] == task).unwrap_or_else(|| panic!("no probe {task}"))
         };
@@ -2587,7 +2582,7 @@ mod tests {
         for i in 0..180 {
             app.db.insert_ping(wide, wide_probe, wide_base + i, if i == 0 { -1 } else { 20 }).unwrap();
         }
-        let (rows, _) = app.db.ping_records(wide, wide_base, 180).unwrap();
+        let rows = app.db.ping_records(wide, wide_base, 180).unwrap().ping;
         assert_eq!(rows.len(), 1, "the fixture has to be one bucket for this to mean anything");
         let row = &rows[0];
         assert_eq!(row["loss"], 1, "a bucket that lost one of 180 has not lost none");
@@ -2600,7 +2595,7 @@ mod tests {
         for (i, latency) in [10, 20, 50, 20, 20].into_iter().enumerate() {
             app.db.insert_ping(jitter, jitter_probe, wide_base + i as i64, latency).unwrap();
         }
-        let row = &app.db.ping_records(jitter, wide_base, 180).unwrap().0[0];
+        let row = &app.db.ping_records(jitter, wide_base, 180).unwrap().ping[0];
         assert_eq!(row["latency"], 20, "the middle answer, not the mean of 24");
         assert_eq!(row["band"], json!([10, 50]));
 
@@ -2612,7 +2607,7 @@ mod tests {
         for (i, latency) in [40, 10, 30, 20].into_iter().enumerate() {
             app.db.insert_ping(even, even_probe, wide_base + i as i64, latency).unwrap();
         }
-        assert_eq!(app.db.ping_records(even, wide_base, 180).unwrap().0[0]["latency"], 25);
+        assert_eq!(app.db.ping_records(even, wide_base, 180).unwrap().ping[0]["latency"], 25);
     }
 
     /// What a window lost is the proportion of its samples lost, and only the hub
@@ -2636,14 +2631,51 @@ mod tests {
         }
         app.db.insert_ping(id, probe, base + 60, -1).unwrap();
 
-        let (rows, loss) = app.db.ping_records(id, base, 60).unwrap();
+        let PingHistory { ping: rows, loss, .. } = app.db.ping_records(id, base, 60).unwrap();
         let per_bucket: Vec<i64> = rows.iter().map(|r| r["loss"].as_i64().unwrap_or(0)).collect();
         assert_eq!(per_bucket, vec![0, 100], "the buckets are right about themselves");
 
         // Their mean is 50%, while one round of thirteen did not answer.
-        let window = loss.get(probe.to_string()).and_then(|v| v.as_f64()).expect("this probe lost one");
+        let window = loss.get(&probe.to_string()).and_then(|v| v.as_f64()).expect("this probe lost one");
         assert!((window - 100.0 / 13.0).abs() < 1e-9, "{window}");
         assert!(window < 8.0, "the window lost {window}%, not the 50% its buckets average to");
+    }
+
+    #[test]
+    fn bulk_snapshot_preserves_terminal_policy_and_per_node_probe_order() {
+        let app = app();
+        let normal = node(&app, "default", true);
+        let disabled = node(&app, "disabled", true);
+        let offline = node(&app, "offline-only", true);
+        app.db.set(&format!("terminal_node_{disabled}"), "off").unwrap();
+        app.db.set(&format!("terminal_node_{offline}"), "on").unwrap();
+        crate::maintenance::observe_http(&app.db, offline).unwrap();
+        let _held = connect(&app, offline, Value::Null);
+        app.agents.write().unwrap().get_mut(&offline).unwrap().terminal_enabled = true;
+        let shared = task(&app, vec![disabled, normal]);
+        let only_normal = task(&app, vec![normal]);
+        let unassigned = task(&app, vec![]);
+        assert!(app.db.ping_tasks().unwrap().iter().any(|t| t.id == unassigned && t.nodes.is_empty()));
+
+        let views = visible_nodes(&app, true).unwrap();
+        assert_eq!(views[0]["terminal_enabled"], true);
+        assert_eq!(views[1]["terminal_enabled"], false);
+        assert_eq!(views[1]["offline_only"], false);
+        assert_eq!(views[2]["offline_only"], true);
+        assert_eq!(views[2]["terminal_enabled"], false);
+        assert_eq!(views[2]["terminal_capable"], false);
+        assert_eq!(views[2]["terminal_reason"], "plaintext");
+        let tasks = |v: &Value| -> Vec<i64> {
+            v["pings"].as_array().unwrap().iter().map(|p| p["id"].as_i64().unwrap()).collect()
+        };
+        assert_eq!(tasks(&views[0]), vec![shared, only_normal]);
+        assert_eq!(tasks(&views[1]), vec![shared]);
+        assert!(tasks(&views[2]).is_empty());
+        for view in visible_nodes(&app, false).unwrap() {
+            for field in ["offline_only", "terminal_enabled", "terminal_capable", "terminal_reason"] {
+                assert!(view.get(field).is_none());
+            }
+        }
     }
 
     #[test]
@@ -3476,20 +3508,36 @@ mod tests {
         let app = app();
         let id = node(&app, "stats", true);
         let probe = task(&app, vec![id]);
-        let now = Utc::now().timestamp() - 200;
-        for (i, v) in [10, 10, 10, 100, -2, -3, -1].into_iter().enumerate() {
+        let now = Utc::now().timestamp() - 400;
+        for (i, v) in [10, 10, 10, 100, -2, -3, 80, -1, 10].into_iter().enumerate() {
             app.db.insert_ping(id, probe, now + i as i64 * 20, v).unwrap();
         }
-        let stats = app.db.ping_window_stats(id, now).unwrap();
-        let s = &stats[probe.to_string()];
-        assert_eq!(s["avg_ms"], 32.5);
-        assert_eq!(s["p95_ms"], 100);
-        assert_eq!(s["success_count"], 4);
-        assert_eq!(s["error_count"], 2);
-        assert_eq!(s["loss_pct"], 20.0);
+        let errors = task(&app, vec![id]);
+        app.db.insert_ping(id, errors, now, -2).unwrap();
+        let lost = task(&app, vec![id]);
+        app.db.insert_ping(id, lost, now, -1).unwrap();
+
         for step in [1, 60, 120] {
-            let (_, loss) = app.db.ping_records(id, now, step).unwrap();
-            assert_eq!(loss[probe.to_string()], 20.0);
+            let history = app.db.ping_records(id, now, step).unwrap();
+            let s = &history.stats[&probe.to_string()];
+            assert_eq!(s["avg_ms"], 220.0 / 6.0);
+            assert_eq!(s["p50_ms"], 10);
+            assert_eq!(s["p95_ms"], 100);
+            assert_eq!(s["jitter_ms"], 30.0, "errors and lost samples break adjacent pairs");
+            assert_eq!(s["success_count"], 6);
+            assert_eq!(s["loss_count"], 1);
+            assert_eq!(s["error_count"], 2);
+            assert_eq!(s["loss_pct"], 100.0 / 7.0);
+            assert_eq!(history.loss[&probe.to_string()], s["loss_pct"]);
+            let err = &history.stats[&errors.to_string()];
+            assert_eq!(err["error_count"], 1);
+            assert!(err["p95_ms"].is_null() && err["jitter_ms"].is_null() && err["loss_pct"].is_null());
+            assert!(!history.loss.contains_key(&errors.to_string()));
+            assert!(history.ping.iter().all(|row| row["task_id"] != errors));
+            assert_eq!(history.loss[&lost.to_string()], 100.0);
+            assert!(history.stats[&lost.to_string()]["avg_ms"].is_null());
         }
+        let empty = app.db.ping_records(id, now + 200, 60).unwrap();
+        assert!(empty.ping.is_empty() && empty.stats.is_empty() && empty.loss.is_empty());
     }
 }

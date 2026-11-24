@@ -1,18 +1,89 @@
-//! SQLite storage. A single writer connection behind a mutex: at a handful of
-//! nodes reporting every few seconds, every statement here is sub-millisecond.
-// ponytail: single global connection; move to a read pool if the dashboard ever
-// blocks behind ingest.
+//! SQLite storage. Short operations share one writer. Long history scans use a
+//! separate WAL reader on file-backed databases so reports can keep committing.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, Local, NaiveDate, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-pub struct Db(Mutex<Connection>);
+pub struct Db {
+    writer: Mutex<Connection>,
+    history: Option<Mutex<Connection>>,
+}
+
+#[derive(Default, Serialize)]
+pub struct PingHistory {
+    pub ping: Vec<serde_json::Value>,
+    pub loss: serde_json::Map<String, serde_json::Value>,
+    pub stats: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Default)]
+struct ProbeWindow {
+    answered: Vec<i64>,
+    lost: usize,
+    errors: usize,
+    sum: f64,
+    previous: Option<i64>,
+    delta: f64,
+    pairs: usize,
+}
+
+impl ProbeWindow {
+    fn record(&mut self, latency: i64) {
+        match latency {
+            value if value >= 0 => {
+                if let Some(previous) = self.previous {
+                    self.delta += (value - previous).abs() as f64;
+                    self.pairs += 1;
+                }
+                self.previous = Some(value);
+                self.sum += value as f64;
+                self.answered.push(value);
+            }
+            value => {
+                if value == -1 {
+                    self.lost += 1;
+                } else {
+                    self.errors += 1;
+                }
+                self.previous = None;
+            }
+        }
+    }
+
+    fn finish(mut self, task: i64, history: &mut PingHistory) {
+        let n = self.answered.len();
+        let total = n + self.lost;
+        let loss = (total > 0).then(|| 100.0 * self.lost as f64 / total as f64);
+        let task = task.to_string();
+        if self.lost > 0 {
+            history.loss.insert(task.clone(), serde_json::json!(loss));
+        }
+        let percentiles = (n > 0).then(|| {
+            // Only these two nearest ranks are exposed. Partitioning the lower
+            // slice again leaves p95 intact and avoids sorting a whole window.
+            let mid = n.div_ceil(2) - 1;
+            let high = (n as f64 * 0.95).ceil() as usize - 1;
+            let (lower, p95, _) = self.answered.select_nth_unstable(high);
+            let p50 = if mid == high { *p95 } else { *lower.select_nth_unstable(mid).1 };
+            (p50, *p95)
+        });
+        history.stats.insert(
+            task,
+            serde_json::json!({
+                "avg_ms": (n > 0).then(|| self.sum / n as f64),
+                "p50_ms": percentiles.map(|p| p.0), "p95_ms": percentiles.map(|p| p.1),
+                "success_count": n, "loss_count": self.lost, "error_count": self.errors,
+                "loss_pct": loss, "jitter_ms": (self.pairs > 0).then(|| self.delta / self.pairs as f64)
+            }),
+        );
+    }
+}
 
 pub struct SessionIdentity {
     pub kind: String,
@@ -597,6 +668,21 @@ fn main_file(conn: &Connection) -> String {
     conn.query_row("PRAGMA database_list", [], |r| r.get(2)).unwrap_or_default()
 }
 
+// Both history tables are ordered by (node_id, ts, ...). Seek directly to the
+// next populated node prefix, including records left by deleted probes. Then
+// a node's oldest timestamp or its expired range is another primary-key seek.
+// Only called with the two fixed table names below.
+fn history_nodes(table: &str) -> String {
+    format!(
+        "WITH RECURSIVE nodes(id) AS (
+             SELECT MIN(node_id) FROM {table}
+             UNION ALL
+             SELECT (SELECT MIN(node_id) FROM {table} WHERE node_id > nodes.id)
+             FROM nodes WHERE id IS NOT NULL
+         )"
+    )
+}
+
 fn bytes_of(file: &str) -> i64 {
     std::fs::metadata(file).map(|m| m.len() as i64).unwrap_or(0)
 }
@@ -639,21 +725,35 @@ impl Db {
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         migrate(&conn, if fresh { SCHEMA_VERSION } else { version })?;
-        Ok(Self(Mutex::new(conn)))
+        // Ask SQLite for the backing file. Anonymous temporary databases and
+        // memory URIs also report an empty name and must keep their one handle.
+        let file = main_file(&conn);
+        let history = if file.is_empty() {
+            None
+        } else {
+            let reader = Connection::open_with_flags(file, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            reader.busy_timeout(std::time::Duration::from_secs(5))?;
+            Some(Mutex::new(reader))
+        };
+        Ok(Self { writer: Mutex::new(conn), history })
     }
 
     pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.writer.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn history_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.history.as_ref().unwrap_or(&self.writer).lock().unwrap_or_else(|e| e.into_inner())
     }
 
     // ---- settings ----
 
     pub fn get(&self, key: &str) -> Option<String> {
         self.conn()
-            .query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0))
-            .optional()
+            .prepare_cached("SELECT value FROM setting WHERE key = ?1")
+            .ok()?
+            .query_row([key], |r| r.get(0))
             .ok()
-            .flatten()
     }
 
     pub fn set(&self, key: &str, value: &str) -> Result<()> {
@@ -804,7 +904,11 @@ impl Db {
     /// Records that the node reported. Written on the same cadence as the metric
     /// row, so it costs one update per minute rather than one per report.
     pub fn touch_seen(&self, id: i64, ts: i64) -> Result<()> {
-        self.conn().execute("UPDATE node SET last_seen=?2 WHERE id=?1", params![id, ts])?;
+        Self::write_seen(&self.conn(), id, ts)
+    }
+
+    fn write_seen(conn: &Connection, id: i64, ts: i64) -> Result<()> {
+        conn.prepare_cached("UPDATE node SET last_seen=?2 WHERE id=?1")?.execute(params![id, ts])?;
         Ok(())
     }
 
@@ -1258,14 +1362,15 @@ impl Db {
         // Both boundaries are calendar dates -- the day a provider resets an
         // allowance, the day a person means by "today" -- so both follow the
         // hub's local timezone rather than UTC.
-        let period = period_start(Local::now().date_naive(), reset_day).to_string();
+        let date = Local::now().date_naive();
+        let period = period_start(date, reset_day).to_string();
         if month_start != period {
             // A new billing period restarts the month counter but not the total.
             traffic_incomplete = history_since.is_empty() || history_since > period;
             month_rx = d_rx;
             month_tx = d_tx;
         }
-        let today = Local::now().date_naive().to_string();
+        let today = date.to_string();
         if day_start != today {
             day_rx = d_rx;
             day_tx = d_tx;
@@ -1293,8 +1398,13 @@ impl Db {
                 traffic_incomplete
             ])?;
             // A missing reading must not turn an unobserved day into a measured zero.
-            conn.execute("INSERT INTO traffic_daily(node_id,day,rx,tx) VALUES(?1,?2,?3,?4)
-                ON CONFLICT(node_id,day) DO UPDATE SET rx=MIN(9223372036854775807,rx+excluded.rx), tx=MIN(9223372036854775807,tx+excluded.tx)", params![node_id,today,d_rx,d_tx])?;
+            conn.prepare_cached(
+                "INSERT INTO traffic_daily(node_id,day,rx,tx) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(node_id,day) DO UPDATE SET
+                    rx=MIN(9223372036854775807,rx+excluded.rx),
+                    tx=MIN(9223372036854775807,tx+excluded.tx)",
+            )?
+            .execute(params![node_id, today, d_rx, d_tx])?;
         }
         conn.commit()?;
         Ok(Traffic {
@@ -1328,28 +1438,42 @@ impl Db {
 
     // ---- metrics ----
 
+    /// The history row and the corresponding offline timestamp describe one report.
+    pub fn record_minute(&self, node_id: i64, seen: i64, m: &serde_json::Value) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        Self::write_metric(&tx, node_id, seen / 60 * 60, m)?;
+        Self::write_seen(&tx, node_id, seen)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn insert_metric(&self, node_id: i64, ts: i64, m: &serde_json::Value) -> Result<()> {
+        Self::write_metric(&self.conn(), node_id, ts, m)
+    }
+
+    fn write_metric(conn: &Connection, node_id: i64, ts: i64, m: &serde_json::Value) -> Result<()> {
         let f = |k: &str| m.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
         let n = |k: &str| m.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
-        self.conn()
-            .prepare_cached(
-                "INSERT OR REPLACE INTO metric
+        conn.prepare_cached(
+            "INSERT OR REPLACE INTO metric
                (node_id, ts, cpu, mem_used, swap_used, disk_used, net_rx, net_tx, tcp, udp, procs)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            )?
-            .execute(params![
-                node_id,
-                ts,
-                f("cpu"),
-                n("mem_used"),
-                n("swap_used"),
-                n("disk_used"),
-                n("net_rx"),
-                n("net_tx"),
-                n("tcp"),
-                n("udp"),
-                n("procs")
-            ])?;
+        )?
+        .execute(params![
+            node_id,
+            ts,
+            f("cpu"),
+            n("mem_used"),
+            n("swap_used"),
+            n("disk_used"),
+            n("net_rx"),
+            n("net_tx"),
+            n("tcp"),
+            n("udp"),
+            n("procs")
+        ])?;
         Ok(())
     }
 
@@ -1371,7 +1495,7 @@ impl Db {
     /// The stamp is the bucket's start rather than a row inside it, so every
     /// series lands on one grid and the probe rows below can be shared.
     pub fn metrics(&self, node_id: i64, since: i64, step: i64) -> Result<Vec<serde_json::Value>> {
-        let conn = self.conn();
+        let conn = self.history_conn();
         let mut stmt = conn.prepare_cached(
             "SELECT (MIN(ts)/?3)*?3, AVG(cpu), CAST(AVG(mem_used) AS INTEGER),
                     CAST(AVG(disk_used) AS INTEGER),
@@ -1393,41 +1517,49 @@ impl Db {
     pub fn prune(&self, keep_days: i64) -> Result<usize> {
         let cutoff = Utc::now().timestamp() - keep_days * 86_400;
         let conn = self.conn();
-        let a = conn.execute("DELETE FROM metric WHERE ts < ?1", [cutoff])?;
-        let b = conn.execute("DELETE FROM ping_record WHERE ts < ?1", [cutoff])?;
+        let mut removed = 0;
+        for table in ["metric", "ping_record"] {
+            let query = format!(
+                "{} DELETE FROM {table} WHERE node_id IN (SELECT id FROM nodes) AND ts < ?1",
+                history_nodes(table)
+            );
+            removed += conn.execute(&query, [cutoff])?;
+        }
         conn.execute(
             "DELETE FROM traffic_daily WHERE day < ?1",
             [(Local::now().date_naive() - chrono::Days::new(400)).to_string()],
         )?;
         conn.execute("DELETE FROM notification_event WHERE created_at < ?1 AND NOT EXISTS(SELECT 1 FROM notification_delivery d WHERE d.event_id=notification_event.id AND d.status!='delivered')", [Utc::now().timestamp()-30*86400])?;
-        Ok(a + b)
+        Ok(removed)
     }
 
     // ---- ping ----
 
     pub fn ping_tasks(&self) -> Result<Vec<PingTask>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT id, name, target, interval FROM ping_task ORDER BY id")?;
-        let tasks: Vec<PingTask> = stmt
-            .query_map([], |r| {
-                Ok(PingTask {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    target: r.get(2)?,
-                    interval: r.get(3)?,
+        let mut stmt = conn.prepare_cached(
+            "SELECT t.id, t.name, t.target, t.interval, a.node_id
+             FROM ping_task t LEFT JOIN ping_node a ON a.task_id=t.id
+             ORDER BY t.id, a.node_id",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut tasks: Vec<PingTask> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id = row.get(0)?;
+            if tasks.last().is_none_or(|t| t.id != id) {
+                tasks.push(PingTask {
+                    id,
+                    name: row.get(1)?,
+                    target: row.get(2)?,
+                    interval: row.get(3)?,
                     nodes: Vec::new(),
-                })
-            })?
-            .collect::<Result<_, _>>()?;
-        drop(stmt);
-        let mut stmt = conn.prepare("SELECT node_id FROM ping_node WHERE task_id=?1")?;
-        tasks
-            .into_iter()
-            .map(|mut t| {
-                t.nodes = stmt.query_map([t.id], |r| r.get(0))?.collect::<Result<_, _>>()?;
-                Ok(t)
-            })
-            .collect()
+                });
+            }
+            if let Some(node) = row.get::<_, Option<i64>>(4)? {
+                tasks.last_mut().expect("task just read").nodes.push(node);
+            }
+        }
+        Ok(tasks)
     }
 
     /// The maximum number of probes one node may be assigned.
@@ -1574,12 +1706,14 @@ impl Db {
     /// The chart's `task_id IN (assignments)` filter hides both afterwards, but
     /// does not prevent the write, its storage, or the id being reused.
     pub fn insert_ping(&self, node_id: i64, task_id: i64, ts: i64, latency: i64) -> Result<bool> {
-        let inserted = self.conn().execute(
-            "INSERT OR REPLACE INTO ping_record (node_id, task_id, ts, latency)
+        let inserted = self
+            .conn()
+            .prepare_cached(
+                "INSERT OR REPLACE INTO ping_record (node_id, task_id, ts, latency)
              SELECT ?1, ?2, ?3, ?4
              WHERE EXISTS (SELECT 1 FROM ping_node WHERE task_id = ?2 AND node_id = ?1)",
-            params![node_id, task_id, ts, latency],
-        )?;
+            )?
+            .execute(params![node_id, task_id, ts, latency])?;
         Ok(inserted > 0)
     }
 
@@ -1595,126 +1729,48 @@ impl Db {
     /// moment the next opens and only one is held at a time -- at most the probes
     /// assigned to the node times the results one bucket spans.
     ///
-    /// Returns the buckets and, alongside them, the proportion of the whole
-    /// window each probe lost. The latter cannot be recovered from the former:
-    /// [`close_bucket`] divides within each bucket and keeps only the quotient,
-    /// so averaging those percentages would weight a bucket holding one sample
-    /// equally with one holding twelve. The buckets are necessarily unequal --
-    /// the window's first and last are partial by construction, and a probe that
-    /// starts, stops, loses its node or skips a round produces more. The
-    /// denominators are available only here, in the pass that already reads every
-    /// row. Probes that lost nothing are omitted, as `loss` is per bucket.
-    pub fn ping_records(
-        &self,
-        node_id: i64,
-        since: i64,
-        step: i64,
-    ) -> Result<(Vec<serde_json::Value>, serde_json::Value)> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare_cached(PING_ROWS)?;
-        let mut rows = stmt.query(params![node_id, since, step])?;
-        let mut out = Vec::new();
-        // Per probe in the bucket being filled: what answered, and how many did
-        // not.
+    /// The same scan also feeds each probe's window loss, percentiles and
+    /// jitter. Local probe errors break a jitter sequence but do not count as
+    /// packet loss. Bucketing never changes the window statistics.
+    pub fn ping_records(&self, node_id: i64, since: i64, step: i64) -> Result<PingHistory> {
+        let mut history = PingHistory::default();
+        let mut probes: HashMap<i64, ProbeWindow> = HashMap::new();
         let mut open: Vec<(i64, Vec<i64>, i64)> = Vec::new();
-        // Per probe across the whole window: how many were lost, out of how many.
-        // Folded in the same pass rather than queried from SQLite a second time,
-        // for the same reason the bucket fold itself is in Rust.
-        let mut totals: HashMap<i64, (i64, i64)> = HashMap::new();
         let mut bucket = 0;
-        while let Some(row) = rows.next()? {
-            let (b, task, latency) = (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?);
-            if b != bucket {
-                close_bucket(&mut out, &mut open, bucket * step);
-                bucket = b;
-            }
-            if latency < -1 {
-                continue;
-            }
-            let seen = totals.entry(task).or_insert((0, 0));
-            seen.1 += 1;
-            let probe = match open.iter().position(|(id, ..)| *id == task) {
-                Some(at) => &mut open[at],
-                None => {
-                    open.push((task, Vec::new(), 0));
-                    open.last_mut().expect("just pushed")
+        {
+            let conn = self.history_conn();
+            let mut stmt = conn.prepare_cached(PING_ROWS)?;
+            let mut rows = stmt.query(params![node_id, since, step])?;
+            while let Some(row) = rows.next()? {
+                let (b, task, latency) =
+                    (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?);
+                if b != bucket {
+                    close_bucket(&mut history.ping, &mut open, bucket * step);
+                    bucket = b;
                 }
-            };
-            // A timeout is stored as -1: excluded from the median and counted
-            // instead.
-            if latency < 0 {
-                probe.2 += 1;
-                seen.0 += 1;
-            } else {
-                probe.1.push(latency);
-            }
-        }
-        close_bucket(&mut out, &mut open, bucket * step);
-        // Unrounded: the caller decides how to render it, and rounding here would
-        // turn 0.14% into the 0% that denotes no loss at all.
-        let loss: serde_json::Map<String, serde_json::Value> = totals
-            .into_iter()
-            .filter(|(_, (lost, _))| *lost > 0)
-            .map(|(task, (lost, samples))| {
-                (task.to_string(), serde_json::json!(100.0 * lost as f64 / samples as f64))
-            })
-            .collect();
-        Ok((out, serde_json::Value::Object(loss)))
-    }
-
-    /// Statistics of original samples, independent of chart bucket resolution.
-    pub fn ping_window_stats(&self, node_id: i64, since: i64) -> Result<serde_json::Value> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare_cached(PING_ROWS)?;
-        let mut rows = stmt.query(params![node_id, since, 1])?;
-        #[derive(Default)]
-        struct Samples {
-            ok: Vec<i64>,
-            lost: usize,
-            errors: usize,
-            previous: Option<i64>,
-            delta: f64,
-            pairs: usize,
-        }
-        let mut probes: HashMap<i64, Samples> = HashMap::new();
-        while let Some(row) = rows.next()? {
-            let (task, value) = (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?);
-            let s = probes.entry(task).or_default();
-            if value < 0 {
-                if value == -1 {
-                    s.lost += 1;
+                probes.entry(task).or_default().record(latency);
+                if latency < -1 {
+                    continue;
+                }
+                let probe = match open.iter().position(|(id, ..)| *id == task) {
+                    Some(at) => &mut open[at],
+                    None => {
+                        open.push((task, Vec::new(), 0));
+                        open.last_mut().expect("just pushed")
+                    }
+                };
+                if latency == -1 {
+                    probe.2 += 1;
                 } else {
-                    s.errors += 1;
+                    probe.1.push(latency);
                 }
-                s.previous = None;
-            } else {
-                if let Some(previous) = s.previous {
-                    s.delta += (value - previous).abs() as f64;
-                    s.pairs += 1;
-                }
-                s.previous = Some(value);
-                s.ok.push(value);
             }
+        } // Release the snapshot and the reader before calculating the percentiles.
+        close_bucket(&mut history.ping, &mut open, bucket * step);
+        for (task, window) in probes {
+            window.finish(task, &mut history);
         }
-        let out: serde_json::Map<String, serde_json::Value> = probes
-            .into_iter()
-            .map(|(id, mut s)| {
-                let n = s.ok.len();
-                let avg = (n > 0).then(|| s.ok.iter().map(|v| *v as f64).sum::<f64>() / n as f64);
-                s.ok.sort_unstable();
-                let percentile =
-                    |p: f64| (n > 0).then(|| s.ok[((n as f64 * p).ceil() as usize).saturating_sub(1)]);
-                let total = n + s.lost;
-                (
-                    id.to_string(),
-                    serde_json::json!({ "avg_ms": avg, "p50_ms": percentile(0.5), "p95_ms": percentile(0.95),
-                "success_count": n, "loss_count": s.lost, "error_count": s.errors,
-                "loss_pct": (total > 0).then(|| 100.0 * s.lost as f64 / total as f64),
-                "jitter_ms": (s.pairs > 0).then(|| s.delta / s.pairs as f64) }),
-                )
-            })
-            .collect();
-        Ok(serde_json::Value::Object(out))
+        Ok(history)
     }
 
     // ---- the database file itself ----
@@ -1743,23 +1799,28 @@ impl Db {
         let retention = self.retention_days();
         let backup_success = self.get("backup_last_success");
         let backup_error = self.get("backup_last_error");
-        let conn = self.conn();
+        let mut reader = self.history_conn();
+        let conn = reader.transaction()?;
         let file = main_file(&conn);
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
         let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
-        // Both are pruned at the same cutoff, so the earlier of the two marks
-        // where history begins. A full scan of each, which the counts below
-        // already incur.
-        let oldest: Option<i64> = conn.query_row(
-            "SELECT MIN(ts) FROM (SELECT MIN(ts) AS ts FROM metric UNION ALL SELECT MIN(ts) FROM ping_record)",
-            [],
-            |r| r.get(0),
-        )?;
+        let mut oldest: Option<i64> = None;
+        for table in ["metric", "ping_record"] {
+            let query = format!(
+                "{} SELECT MIN((SELECT MIN(ts) FROM {table} WHERE node_id=nodes.id)) FROM nodes",
+                history_nodes(table)
+            );
+            if let Some(ts) = conn.query_row(&query, [], |r| r.get::<_, Option<i64>>(0))? {
+                oldest = Some(oldest.map_or(ts, |prior| prior.min(ts)));
+            }
+        }
         let mut rows = serde_json::Map::new();
         for table in TABLES {
             let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
             rows.insert(table.to_owned(), serde_json::json!(n));
         }
+        conn.commit()?;
+        drop(reader);
         Ok(serde_json::json!({
             "path": file,
             "size": bytes_of(&file),
@@ -1922,6 +1983,9 @@ impl Db {
     pub fn restore_from(&self, src: &str) -> Result<()> {
         // Keep legacy numeric batch IDs from being reused when a backup rewinds
         // sqlite_sequence. The live connection remains locked through the copy.
+        // If there is a separate reader, let its snapshot finish first. No
+        // ordinary read needs the writer while it owns this guard.
+        let _reader = self.history.as_ref().map(|reader| reader.lock().unwrap_or_else(|e| e.into_inner()));
         let mut conn = self.conn();
         let sequence: i64 = conn.query_row(
             "SELECT coalesce(max(seq),0) FROM sqlite_sequence WHERE name='upgrade_batch'",
@@ -2012,16 +2076,14 @@ impl Db {
     }
 
     pub fn session_valid(&self, token_hash: &str) -> bool {
-        self.conn()
-            .query_row(
-                "SELECT 1 FROM session WHERE token_hash=?1 AND expires_at > ?2",
-                params![token_hash, Utc::now().timestamp()],
-                |_| Ok(()),
-            )
-            .optional()
-            .ok()
-            .flatten()
-            .is_some()
+        // Cache only the compiled statement. Check expiry and revocation on every live tick.
+        let conn = self.conn();
+        let Ok(mut stmt) =
+            conn.prepare_cached("SELECT 1 FROM session WHERE token_hash=?1 AND expires_at > ?2")
+        else {
+            return false;
+        };
+        stmt.exists(params![token_hash, Utc::now().timestamp()]).unwrap_or(false)
     }
 
     /// Live sessions, newest first. Expired rows are filtered here rather than
@@ -2188,6 +2250,7 @@ pub fn period_start(today: NaiveDate, reset_day: u32) -> NaiveDate {
 
 #[cfg(test)]
 mod tests {
+    mod maintenance_bench;
     use super::*;
 
     fn db() -> Db {
@@ -2355,6 +2418,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_open_history_snapshot_allows_reports_and_then_sees_the_commit() {
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let id = node(&db, 1);
+        let mut reader = db.history_conn();
+        assert!(reader.is_readonly(rusqlite::MAIN_DB).unwrap());
+        let tx = reader.transaction().unwrap();
+        let count = || tx.query_row("SELECT count(*) FROM metric", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(count(), 0);
+        db.insert_metric(id, 120, &serde_json::json!({"cpu": 1.0})).unwrap();
+        assert_eq!(count(), 0, "the chart should keep a consistent snapshot");
+        tx.commit().unwrap();
+        drop(reader);
+        assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 1, "the next read sees the report");
+
+        let memory = Db::open("file:history-fallback?mode=memory&cache=shared").unwrap();
+        assert!(memory.history.is_none());
+        let id = node(&memory, 1);
+        memory.insert_metric(id, 120, &serde_json::json!({"cpu": 1.0})).unwrap();
+        assert_eq!(memory.metrics(id, 0, 60).unwrap().len(), 1);
+    }
+
     /// Backup and restore are the two operations that can lose every row in the
     /// database, so this exercises the whole path: take a copy, modify the live
     /// database, restore the copy, and confirm the change is gone.
@@ -2365,6 +2451,7 @@ mod tests {
         let db = Db::open(&scratch.0).unwrap();
         let kept =
             db.create_node(&Node { name: "backed-up".into(), ..Default::default() }, "token-kept").unwrap();
+        db.insert_metric(kept, 120, &serde_json::json!({"cpu": 7.0})).unwrap();
         db.backup_into(&copy).unwrap();
 
         // Everything after the copy must disappear on restore, including a node
@@ -2372,8 +2459,10 @@ mod tests {
         db.delete_node(kept).unwrap();
         db.create_node(&Node { name: "after".into(), ..Default::default() }, "token-after").unwrap();
 
+        assert!(db.metrics(kept, 0, 60).unwrap().is_empty());
         db.check_backup(&copy).unwrap();
         db.restore_from(&copy).unwrap();
+        assert_eq!(db.metrics(kept, 0, 60).unwrap()[0]["cpu"], 7.0, "the reader sees the restored file");
         let back = db.nodes().unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!((back[0].name.as_str(), back[0].token.as_str()), ("backed-up", "token-kept"));
@@ -2482,6 +2571,16 @@ mod tests {
             .unwrap();
         db.insert_ping(id, task, now - 9 * 86_400, 12).unwrap();
         assert_eq!(db.stats().unwrap()["oldest"], now - 9 * 86_400);
+
+        // Legacy ping records can lack a corresponding node. Their keys may
+        // be sparse and must still participate in oldest and in retention.
+        db.conn().execute("INSERT INTO ping_record VALUES(9001,1,?1,42)", [now - 10 * 86_400]).unwrap();
+        assert_eq!(db.stats().unwrap()["oldest"], now - 10 * 86_400);
+        assert_eq!(db.prune(7).unwrap(), 2);
+        let after = db.stats().unwrap();
+        assert_eq!(after["oldest"], now - 3 * 86_400);
+        assert_eq!(after["rows"]["ping_record"], 0);
+        assert_eq!(after["rows"]["metric"], 1);
 
         db.set("retention_days", "9999").unwrap();
         assert_eq!(db.stats().unwrap()["retention"], 3_650, "a stored window is still clamped");
@@ -2710,7 +2809,7 @@ mod tests {
         let fresh = node(&db, 1);
         assert_eq!(fresh, id, "the id is reused, which is what makes this reachable");
         db.save_ping_task(&PingTask { id: task, nodes: vec![fresh], ..probe(vec![]) }).unwrap();
-        assert!(db.ping_records(fresh, 0, 60).unwrap().0.is_empty(), "and it starts with no history");
+        assert!(db.ping_records(fresh, 0, 60).unwrap().ping.is_empty(), "and it starts with no history");
     }
 
     /// The mirror of the sweep above, on the other key of the same table. SQLite
@@ -2734,7 +2833,7 @@ mod tests {
 
         let fresh = db.save_ping_task(&probe("singapore")).unwrap();
         assert_eq!(fresh, old, "the id is reused, which is what makes this reachable");
-        assert!(db.ping_records(id, 0, 60).unwrap().0.is_empty(), "and it starts with no history");
+        assert!(db.ping_records(id, 0, 60).unwrap().ping.is_empty(), "and it starts with no history");
     }
 
     /// Counted directly from the table rather than read back through
@@ -3118,15 +3217,16 @@ mod tests {
         };
         let task = probe(vec![id], 0);
         db.insert_ping(id, task, 100, 42).unwrap();
-        assert_eq!(db.ping_records(id, 0, 60).unwrap().0.len(), 1, "an assigned probe draws");
+        assert_eq!(db.ping_records(id, 0, 60).unwrap().ping.len(), 1, "an assigned probe draws");
 
         probe(vec![], task);
-        assert!(db.ping_records(id, 0, 60).unwrap().0.is_empty(), "an unassigned one does not");
+        let hidden = db.ping_records(id, 0, 60).unwrap();
+        assert!(hidden.ping.is_empty() && hidden.stats.is_empty() && hidden.loss.is_empty());
 
         // The rows remain: reassigning restores the history rather than starting
         // over.
         probe(vec![id], task);
-        assert_eq!(db.ping_records(id, 0, 60).unwrap().0.len(), 1, "and it comes back with its history");
+        assert_eq!(db.ping_records(id, 0, 60).unwrap().ping.len(), 1, "and it comes back with its history");
 
         // The names accompany those samples and follow the same filter: a probe
         // name is operator-supplied text that routinely carries a hostname or a

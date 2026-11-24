@@ -1,5 +1,6 @@
 //! Built-in admin UI plus a replaceable public theme.
 
+use std::borrow::Cow;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -113,13 +114,13 @@ fn is_asset(path: &str) -> bool {
 fn embedded<T: RustEmbed>(requested: &str, remedy: &str, known: Option<&str>) -> Response {
     let path = if requested.is_empty() { "index.html" } else { requested };
     if let Some(file) = T::get(path) {
-        return asset(path, file.data.into_owned(), known);
+        return asset(path, file.data, Some(file.metadata.sha256_hash()), known);
     }
     if is_asset(path) {
         return (StatusCode::NOT_FOUND, format!("no such asset: /{path}")).into_response();
     }
     match T::get("index.html") {
-        Some(index) => asset("index.html", index.data.into_owned(), known),
+        Some(index) => asset("index.html", index.data, Some(index.metadata.sha256_hash()), known),
         None => (StatusCode::NOT_FOUND, remedy.to_owned()).into_response(),
     }
 }
@@ -127,14 +128,14 @@ fn embedded<T: RustEmbed>(requested: &str, remedy: &str, known: Option<&str>) ->
 fn disk(root: &Path, requested: &str, known: Option<&str>) -> Option<Response> {
     let path = if requested.is_empty() { "index.html" } else { requested };
     if let Some(data) = read_inside(root, path) {
-        return Some(asset(path, data, known));
+        return Some(asset(path, data.into(), None, known));
     }
     // None rather than a 404: an external theme lacking the file defers to the
     // built-in one, which issues the refusal.
     if is_asset(path) {
         return None;
     }
-    read_inside(root, "index.html").map(|data| asset("index.html", data, known))
+    read_inside(root, "index.html").map(|data| asset("index.html", data.into(), None, known))
 }
 
 /// Serves one file with the caching policy its path warrants.
@@ -148,7 +149,7 @@ fn disk(root: &Path, requested: &str, known: Option<&str>) -> Option<Response> {
 /// shell, which invites a timed `s-maxage` at the CDN and makes a theme switch
 /// take a minute to appear. With one, revalidation costs a 304 and the switch
 /// lands on the next request.
-fn asset(path: &str, data: Vec<u8>, known: Option<&str>) -> Response {
+fn asset(path: &str, data: Cow<'static, [u8]>, digest: Option<[u8; 32]>, known: Option<&str>) -> Response {
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     if is_asset(path) {
         let cache = "public, max-age=31536000, immutable";
@@ -157,7 +158,9 @@ fn asset(path: &str, data: Vec<u8>, known: Option<&str>) -> Response {
     }
     // Half a SHA-256 of the body, and therefore a strong validator: equal
     // digests mean identical shells.
-    let etag = format!("\"{}\"", &hex::encode(Sha256::digest(&data))[..32]);
+    // Release builds already carry the digest and can serve the borrowed bytes directly.
+    let digest = digest.unwrap_or_else(|| Sha256::digest(&data).into());
+    let etag = format!("\"{}\"", hex::encode(&digest[..16]));
     let headers = [
         (header::CONTENT_TYPE, mime.as_ref()),
         (header::CACHE_CONTROL, "no-cache"),
@@ -611,23 +614,29 @@ mod tests {
     fn the_spa_shell_revalidates_by_etag_and_a_hashed_asset_carries_none() {
         let etag = |r: &Response| r.headers().get(header::ETAG).map(|v| v.to_str().unwrap().to_owned());
 
-        let first = asset("index.html", b"<html>default</html>".to_vec(), None);
+        let first = asset("index.html", b"<html>default</html>".to_vec().into(), None, None);
         assert_eq!(first.status(), StatusCode::OK);
         let tag = etag(&first).expect("the shell must carry a validator");
 
+        // A disk copy of the exact embedded file must validate against the same ETag.
+        let index = DefaultThemeAssets::get("index.html").expect("built-in shell");
+        let disk_tag = etag(&asset("index.html", index.data, None, None)).unwrap();
+        let builtin = embedded::<DefaultThemeAssets>("", "missing shell", Some(&disk_tag));
+        assert_eq!(builtin.status(), StatusCode::NOT_MODIFIED);
+
         // The same shell, and the browser states which it holds: nothing to send.
-        let again = asset("index.html", b"<html>default</html>".to_vec(), Some(&tag));
+        let again = asset("index.html", b"<html>default</html>".to_vec().into(), None, Some(&tag));
         assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
 
         // A switched theme: same URL, same request header, different bytes, so
         // the tag moved with them and the response is the new shell.
-        let switched = asset("index.html", b"<html>demo</html>".to_vec(), Some(&tag));
+        let switched = asset("index.html", b"<html>demo</html>".to_vec().into(), None, Some(&tag));
         assert_eq!(switched.status(), StatusCode::OK);
         assert_ne!(etag(&switched), Some(tag));
 
         // A hashed name is immutable for a year: the browser never revalidates,
         // so computing a digest for it would serve no purpose.
-        let hashed = asset("assets/index-CSjcYfL9.js", b"console.log(1)".to_vec(), None);
+        let hashed = asset("assets/index-CSjcYfL9.js", b"console.log(1)".to_vec().into(), None, None);
         assert_eq!(hashed.status(), StatusCode::OK);
         assert_eq!(etag(&hashed), None);
     }

@@ -419,15 +419,8 @@ async fn send(socket: &mut WebSocket, message: Message) -> bool {
 }
 
 /// Routes an agent's terminal notification to the browser that opened it.
-pub fn from_agent(app: &App, node_id: i64, agent_session: u64, text: &str) {
-    let Ok(frame) = serde_json::from_str::<Value>(text) else { return };
-    if !matches!(
-        frame.get("method").and_then(Value::as_str),
-        Some("terminal.ready" | "terminal.output" | "terminal.error" | "terminal.exit")
-    ) {
-        return;
-    }
-    let Some(id) = frame.get("params").and_then(|p| p.get("terminal_id")).and_then(Value::as_str) else {
+pub fn from_agent(app: &App, node_id: i64, agent_session: u64, params: &Value, text: &str) {
+    let Some(id) = params.get("terminal_id").and_then(Value::as_str) else {
         return;
     };
     if id.len() > MAX_TERMINAL_ID {

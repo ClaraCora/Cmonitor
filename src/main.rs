@@ -753,9 +753,11 @@ async fn housekeeping(app: Shared) {
         if let Err(e) = api::cleanup_restore_uploads(&app) {
             warn!("staged upload cleanup failed: {e:#}");
         }
-        let keep = app.db.retention_days();
-        if let Err(e) = app.db.prune(keep) {
-            warn!("pruning history failed: {e:#}");
+        let prune_app = app.clone();
+        match tokio::task::spawn_blocking(move || prune_app.db.prune(prune_app.db.retention_days())).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!("pruning history failed: {e:#}"),
+            Err(e) => warn!("pruning task failed: {e}"),
         }
         if let Err(e) = app.db.expire_sessions() {
             warn!("expiring sessions failed: {e:#}");

@@ -285,15 +285,7 @@ async fn serve(
                 // of the runtime -- the panel, the public page, the shutdown
                 // signal.
                 Some(Ok(Message::Text(text))) =>
-                    match tokio::task::block_in_place(|| {
-                        anyhow::ensure!(app.agents.read().unwrap_or_else(|e| e.into_inner()).get(&node_id).is_some_and(|a| a.session == session), "agent session replaced");
-                        if serde_json::from_str::<Rpc>(&text).is_ok_and(|rpc| rpc.method.starts_with("terminal.")) {
-                            crate::terminal::from_agent(&app, node_id, session, &text);
-                            Ok(false)
-                        } else {
-                            dispatch_session(&app, node_id, &ip, &text, Some(session))
-                        }
-                    }) {
+                    match tokio::task::block_in_place(|| dispatch_session(&app, node_id, &ip, &text, Some(session))) {
                     Ok(true) => locate(app.clone(), node_id, ip.clone()),
                     Ok(false) => {}
                     Err(e) => warn!("node {node_id} sent an unusable message: {e:#}"),
@@ -356,8 +348,23 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
     dispatch_session(app, node_id, ip, text, None)
 }
 fn dispatch_session(app: &App, node_id: i64, ip: &str, text: &str, session: Option<u64>) -> Result<bool> {
+    if let Some(session) = session {
+        anyhow::ensure!(
+            app.agents
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&node_id)
+                .is_some_and(|a| a.session == session),
+            "agent session replaced"
+        );
+    }
     let rpc: Rpc = serde_json::from_str(text)?;
     match rpc.method.as_str() {
+        "terminal.ready" | "terminal.output" | "terminal.error" | "terminal.exit" => {
+            if let Some(session) = session {
+                crate::terminal::from_agent(app, node_id, session, &rpc.params, text);
+            }
+        }
         "hello" => {
             if let Some(agent) = app
                 .agents
@@ -589,7 +596,6 @@ fn report_session(
     }
     // History holds one row per minute; the live view receives every report.
     let store = entry.last_minute != minute;
-    entry.metrics = metrics.clone();
     entry.last_seen = now;
     entry.minute.add(&metrics);
 
@@ -606,23 +612,31 @@ fn report_session(
             obj.insert("net_rx".into(), json!((traffic.total_rx - rx0).max(0) / elapsed));
             obj.insert("net_tx".into(), json!((traffic.total_tx - tx0).max(0) / elapsed));
         }
-        entry.last_minute = minute;
-        entry.mark = Some((tick, traffic.total_rx, traffic.total_tx));
-        entry.minute = Minute::default();
         row
     });
     // A session that has just started measures the next row's rate from its own
     // first report; without a mark the row would carry the agent's instantaneous
     // reading rather than the average over the interval.
     entry.mark.get_or_insert((tick, traffic.total_rx, traffic.total_tx));
+    let report_session = entry.session;
+    let previous = std::mem::replace(&mut entry.metrics, metrics);
     drop(agents);
+    drop(previous);
 
-    if let Some(row) = &row {
-        app.db.insert_metric(node_id, minute * 60, row)?;
-    }
     // "Offline since" is read from this column, so a session ending before its
     // first minute boundary must still leave a mark.
-    if row.is_some() || first {
+    if let Some(row) = &row {
+        app.db.record_minute(node_id, now, row)?;
+        // This socket processes frames serially. Keep the current sums until the
+        // commit succeeds so its next report can retry. A reconnect has its own
+        // sums and mark, and must not be reset by the old socket's completion.
+        let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = agents.get_mut(&node_id).filter(|a| a.session == report_session) {
+            entry.last_minute = minute;
+            entry.mark = Some((tick, traffic.total_rx, traffic.total_tx));
+            entry.minute = Minute::default();
+        }
+    } else if first {
         app.db.touch_seen(node_id, now)?;
     }
     Ok(())
@@ -809,6 +823,31 @@ mod tests {
         assert!(app.db.node(id).unwrap().unwrap().last_seen >= minute, "last_seen is written too");
     }
 
+    #[test]
+    fn a_failed_minute_commit_is_retried_with_its_samples_intact() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        app.agents.write().unwrap().get_mut(&id).unwrap().last_minute -= 1;
+        app.db
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_seen BEFORE UPDATE OF last_seen ON node
+             BEGIN SELECT RAISE(ABORT, 'unavailable'); END;",
+            )
+            .unwrap();
+        assert!(report(&app, id, json!({"cpu": 100})).is_err());
+        assert!(app.db.metrics(id, 0, 60).unwrap().is_empty());
+        assert_eq!(app.db.node(id).unwrap().unwrap().last_seen, 0);
+        app.db.conn().execute_batch("DROP TRIGGER fail_seen").unwrap();
+        report(&app, id, json!({"cpu": 0})).unwrap();
+        let rows = app.db.metrics(id, 0, 60).unwrap();
+        let seen = app.db.node(id).unwrap().unwrap().last_seen;
+        assert_eq!(rows.len(), 1);
+        assert!(seen > 0);
+        assert_eq!(rows[0]["ts"], seen / 60 * 60);
+        assert_eq!(rows[0]["cpu"], 50.0);
+    }
+
     /// A history row describes the minute preceding it rather than the instant it
     /// is stamped with: the network rate from the totals the hub observed climb,
     /// everything else from the mean of the reports in between.
@@ -972,7 +1011,7 @@ mod tests {
             .db
             .ping_records(id, 0, 60)
             .unwrap()
-            .0
+            .ping
             .iter()
             .map(|r| (r["task_id"].as_i64().unwrap(), r["latency"].as_i64().unwrap()))
             .collect();
@@ -1038,6 +1077,12 @@ mod tests {
         connect(2);
         assert!(!release(&app, id, 1), "a stale session must release nothing");
         assert!(live(), "the reconnected agent stays online");
+        let frame =
+            |session, bytes| dispatch_session(&app, id, "ip", &report_json("boot", bytes, 0), Some(session));
+        frame(2, 100).unwrap();
+        assert!(frame(1, 10_000).is_err(), "a retired socket must not write traffic");
+        frame(2, 200).unwrap();
+        assert_eq!(app.db.all_traffic()[&id].total_rx, 100);
         assert!(app.agents.read().unwrap().contains_key(&id), "and keeps receiving probe pushes");
     }
 
