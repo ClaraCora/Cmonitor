@@ -1,5 +1,5 @@
 import { readPreference, savePreference } from "@/lib/storage"
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { ExternalLink, LogOut, Moon, Sun } from "lucide-react"
 import { toast, Toaster } from "sonner"
 
@@ -8,7 +8,7 @@ import { Login } from "@/components/Login"
 import { RestoreStatus } from "@/components/RestoreStatus"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
-import { api, provisioningSite, useNodes } from "@/lib/api"
+import { api, ApiError, needsInventory, provisioningSite, useNodes } from "@/lib/api"
 
 type Me = { authed: boolean; github: boolean; password_login: boolean; hub_version: string | null; embedded_theme_version?: string; active_theme_version?: string; site_name: string; public_page: boolean; site: string; can_provision: boolean }
 
@@ -63,7 +63,9 @@ function AdminApp() {
   const [me, setMe] = useState<Me | null>(null)
   const [meError, setMeError] = useState("")
   const meRequest = useRef(0)
-  const { nodes, admin, error, refresh, stale, lastUpdatedAt, connection } = useNodes()
+  const subscribed = !!me?.authed && needsInventory(path)
+  const { nodes, error, refresh, stale, lastUpdatedAt, connection } = useNodes(subscribed)
+  const sorted = useMemo(() => nodes && [...nodes].sort((a, b) => a.sort - b.sort || a.id - b.id), [nodes])
 
   const loadMe = useCallback(() => {
     // `|| "..."` because an empty message reads as no error: api() falls back to
@@ -96,15 +98,26 @@ function AdminApp() {
     return () => removeEventListener("cmonitor:restore-complete", restored)
   }, [loadMe, refresh])
 
-  // Every frame declares its audience. The hub closes the stream when the session
-  // behind it is revoked -- signed out from another device, a password change, a
-  // restore -- and the reconnect returns as anonymous: the public list, with
-  // private nodes absent and every admin field empty, rendered inside a panel that
-  // still appears signed in. `authed` is read only at mount and after signing in,
-  // so nothing else detects this. /api/me already handles signing out.
+  // Pages without a live stream still need to notice a revoked session.
   useEffect(() => {
-    if (me?.authed && admin === false) loadMe()
-  }, [admin, me?.authed, loadMe])
+    if (!me?.authed || subscribed) return
+    let pending: AbortController | null = null
+    async function check() {
+      if (document.hidden || pending) return
+      const request = new AbortController()
+      pending = request
+      try {
+        await api("/auth/session", {signal: request.signal, cache: "no-store"})
+      } catch (e) {
+        if (request.signal.aborted || !(e instanceof ApiError)) return
+        if (e.status === 401) dispatchEvent(new Event("cmonitor:reauth-required"))
+        else if (e.status === 404) void loadMe() // While an older Hub is still serving this tab.
+      } finally { if (pending === request) pending = null }
+    }
+    const timer = setInterval(check, 15_000)
+    document.addEventListener("visibilitychange", check)
+    return () => { pending?.abort(); clearInterval(timer); document.removeEventListener("visibilitychange", check) }
+  }, [me?.authed, subscribed, loadMe])
 
   // Only while there is nothing else to show. Login's onDone reloads /me, so a
   // transient failure in the second after signing in would otherwise replace the
@@ -119,13 +132,12 @@ function AdminApp() {
   if (!me.authed) {
     return (
       <>
-        <Login github={me.github} passwordEnabled={me.password_login} onDone={() => { loadMe(); refresh() }} />
+        <Login github={me.github} passwordEnabled={me.password_login} onDone={loadMe} />
         <Toaster position="top-center" theme={dark ? "dark" : "light"} />
       </>
     )
   }
 
-  const sorted = nodes && admin ? [...nodes].sort((a, b) => a.sort - b.sort || a.id - b.id) : null
 
   async function signOut() {
     if (signingOut || !dispatchEvent(new Event("cmonitor:navigate", { cancelable: true }))) return
@@ -153,7 +165,7 @@ function AdminApp() {
                 {me.hub_version && <span className="font-mono sm:ml-2">Hub v{me.hub_version}</span>}
               </span>
             </div>
-            {lastUpdatedAt && <div title="节点状态最近更新" className="tnum flex items-center gap-1.5 text-xs text-muted-foreground">
+            {subscribed && lastUpdatedAt && <div title="节点状态最近更新" className="tnum flex items-center gap-1.5 text-xs text-muted-foreground">
               <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${stale ? "bg-warn" : connection === "live" ? "bg-ok" : "bg-muted-foreground"}`} />
               {stale ? "更新中断" : connection === "live" ? "实时更新" : "轮询更新"}
               <time dateTime={new Date(lastUpdatedAt).toISOString()} title="最近更新">{new Date(lastUpdatedAt).toLocaleTimeString("zh-CN", { hour12: false })}</time>

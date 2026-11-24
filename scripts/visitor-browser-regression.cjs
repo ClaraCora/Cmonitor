@@ -42,7 +42,7 @@ async function run() {
       if (pathname.startsWith('/api/')) return route.fulfill({json:{}})
       return route.fulfill({path:path.join(dist, pathname === '/clara/visitors' ? 'index.html' : pathname.slice('/clara/'.length))})
     })
-    await page.routeWebSocket('**/api/ws', ws => ws.send(JSON.stringify({nodes:[],admin:true})))
+    await page.routeWebSocket(/\/api\/ws(?:\?|$)/, ws => ws.send(JSON.stringify({nodes:[],admin:true})))
     await page.goto(origin + '/clara/visitors')
     const atlas = page.getByRole('img', {name:/访客世界分布图/})
     const records = page.getByRole('list', {name:'访问记录'}).getByRole('listitem')

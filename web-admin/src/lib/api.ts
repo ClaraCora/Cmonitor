@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
+import { nextInventory, type InventorySnapshot } from "./inventory-live.ts"
 
 export type Metrics = {
   uptime: number
@@ -255,103 +256,134 @@ export async function upload<T>(
   return last!.json()
 }
 
-/**
- * Live node list. Uses the WebSocket the hub pushes every two seconds, falling
- * back to polling if it cannot be established.
- */
-export function useNodes() {
-  const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null)
-  const [now, setNow] = useState(() => Date.now())
-  const [connection, setConnection] = useState("connecting")
-  const stale = lastUpdatedAt !== null && now - lastUpdatedAt >= 15_000
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1000)
-    return () => clearInterval(timer)
-  }, [])
+export function needsInventory(path: string) {
+  return ["/clara/nodes", "/clara/ping", "/clara/notify"].includes(path)
+}
+
+export function useNodes(enabled: boolean) {
   const [nodes, setNodes] = useState<Node[] | null>(null)
-  // null until a frame reports it. The panel treats an explicit false as the
-  // session no longer being an admin one, so an unanswered first fetch must not
-  // read as that; see App.tsx.
-  const [admin, setAdmin] = useState<boolean | null>(null)
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null)
+  const [stale, setStale] = useState(false)
+  const [connection, setConnection] = useState("connecting")
   const [error, setError] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
+  const lastSuccess = useRef(0)
+  const refresh = useCallback(() => setReload(n => n + 1), [])
 
   useEffect(() => {
+    if (!enabled) {
+      lastSuccess.current = 0
+      // Discard private inventory when leaving the panel or ending a session.
+      // oxlint-disable-next-line react/set-state-in-effect
+      setNodes(null)
+      setLastUpdatedAt(null)
+      setStale(false)
+      setError(null)
+      return
+    }
+
     let socket: WebSocket | null = null
-    let poll: ReturnType<typeof setInterval> | null = null
-    let retry: ReturnType<typeof setTimeout> | null = null
-    let closed = false
-    let lastReceived = Date.now()
+    let request: AbortController | null = null
+    let watchdog: ReturnType<typeof setInterval> | undefined
+    let running = false
+    let live = false
+    let lastFrame = 0
+    let lastPoll = 0
+    let retryAt = 0
 
-    const fetchOnce = () =>
-      api<{ nodes: Node[]; admin: boolean }>("/nodes")
-        .then((d) => {
-          if (closed) return
-          lastReceived = Date.now()
-          setLastUpdatedAt(lastReceived)
-          setConnection("polling")
-          setNodes(d.nodes)
-          setAdmin(d.admin)
-          setError(null)
-        })
-        .catch((e: Error) => {
-          if (closed) return
-          setError(e.message || "无法获取最新状态")
-          // With the public page switched off, a revoked session receives a 401
-          // here and on the stream, so the frame that would report admin=false
-          // never arrives and the panel would retain the list it already had.
-          if (e instanceof ApiError && e.status === 401) setAdmin(false)
-        })
-
-    fetchOnce()
-
-    const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws`
-    // A hub restart closes every stream. Without reconnecting, a page that
-    // outlives a deploy would remain on the fallback poll for the rest of its
-    // life, refreshing at a fifth of the live rate with no indication.
-    const connect = () => {
+    function receive(list: Node[], source: "polling" | "live") {
+      lastSuccess.current = Date.now()
+      setLastUpdatedAt(lastSuccess.current)
+      setConnection(source)
+      setStale(false)
+      setNodes(list)
+      setError(null)
+    }
+    function abortPoll() {
+      request?.abort()
+      request = null
+    }
+    function revoke() {
+      stop()
+      setNodes(null)
+      setLastUpdatedAt(null)
+      dispatchEvent(new Event("cmonitor:reauth-required"))
+    }
+    async function poll() {
+      if (!running || live || request) return
+      const current = new AbortController()
+      request = current
+      lastPoll = Date.now()
       try {
-        socket = new WebSocket(url)
-      } catch {
-        poll ??= setInterval(fetchOnce, 5000)
-        return
-      }
-      socket.onmessage = (event) => {
-        if (closed) return
-        let frame
-        try { frame = JSON.parse(event.data); if (!Array.isArray(frame.nodes)) return } catch { return }
-        lastReceived = Date.now()
-        setLastUpdatedAt(lastReceived)
-        setConnection("live")
-        setNodes(frame.nodes)
-        setAdmin(frame.admin)
-        setError(null)
-        // The stream has returned; the poll was only covering for it.
-        if (poll) {
-          clearInterval(poll)
-          poll = null
-        }
-      }
-      socket.onerror = () => socket?.close()
-      socket.onclose = () => {
-        if (closed) return
-        setConnection("reconnecting")
-        fetchOnce()
-        poll ??= setInterval(fetchOnce, 5000)
-        retry = setTimeout(connect, 5000)
-      }
+        const frame = await api<{admin: boolean; nodes: Node[]}>("/nodes?view=inventory", {signal: current.signal})
+        if (request !== current) return
+        if (frame.admin === false) { revoke(); return }
+        if (frame.admin !== true || !Array.isArray(frame.nodes)) throw new Error("节点列表格式无效")
+        receive(frame.nodes, "polling")
+      } catch (e) {
+        if (request !== current) return
+        if (e instanceof ApiError && e.status === 401) revoke()
+        else setError(e instanceof Error && e.message || "无法获取最新状态")
+      } finally { if (request === current) request = null }
     }
-    connect()
-    const watchdog = setInterval(() => { if (!closed && Date.now()-lastReceived >= 10_000) fetchOnce() }, 5000)
-
-    return () => {
-      closed = true
+    function disconnect() {
+      const old = socket
+      socket = null
+      live = false
+      old?.close()
+    }
+    function recover() {
+      disconnect()
+      retryAt = Date.now() + 5000
+      setConnection("reconnecting")
+      void poll()
+    }
+    function connect() {
+      const scheme = location.protocol === "https:" ? "wss" : "ws"
+      try { socket = new WebSocket(`${scheme}://${location.host}/api/ws?view=inventory&format=delta-v1`) }
+      catch { recover(); return }
+      const current = socket
+      lastFrame = Date.now()
+      let base: InventorySnapshot | null = null
+      current.onmessage = event => {
+        if (socket !== current) return
+        try {
+          const frame = JSON.parse(event.data)
+          if (frame.admin === false) { revoke(); return }
+          base = nextInventory(base, frame)
+          lastFrame = Date.now()
+          live = true
+          abortPoll()
+          receive(base.nodes, "live")
+        } catch { recover() }
+      }
+      current.onclose = current.onerror = () => { if (socket === current) recover() }
+    }
+    function start() {
+      if (running || document.hidden) return
+      running = true
+      lastPoll = Date.now()
+      setConnection("connecting")
+      connect()
+      watchdog = setInterval(() => {
+        const now = Date.now()
+        if (lastSuccess.current && now - lastSuccess.current >= 15_000) setStale(true)
+        if (socket && now - lastFrame >= 10_000) recover()
+        else if (!socket && now >= retryAt) connect()
+        if (!live && now - lastPoll >= 5000) void poll()
+      }, 1000)
+    }
+    function stop() {
+      running = false
       clearInterval(watchdog)
-      socket?.close()
-      if (poll) clearInterval(poll)
-      if (retry) clearTimeout(retry)
+      disconnect()
+      abortPoll()
     }
-  }, [reload])
+    function visibility() { if (document.hidden) stop(); else start() }
+    document.addEventListener("visibilitychange", visibility)
+    start()
+    return () => { document.removeEventListener("visibilitychange", visibility); stop() }
+  }, [enabled, reload])
 
-  return { nodes, admin, error, lastUpdatedAt, stale, connection, refresh: () => setReload((n) => n + 1) }
+  return { nodes, error, lastUpdatedAt, stale, connection, refresh }
 }

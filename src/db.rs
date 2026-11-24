@@ -17,9 +17,22 @@ pub struct Db {
 
 #[derive(Default, Serialize)]
 pub struct PingHistory {
-    pub ping: Vec<serde_json::Value>,
+    pub ping: Vec<PingPoint>,
     pub loss: serde_json::Map<String, serde_json::Value>,
     pub stats: serde_json::Map<String, serde_json::Value>,
+}
+
+// Thousands of points can be returned together. Serialize their fixed fields
+// directly, avoiding a JSON object and heap-allocated keys for every point.
+#[derive(Serialize)]
+pub struct PingPoint {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    band: Option<[i64; 2]>,
+    pub latency: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loss: Option<i64>,
+    pub task_id: i64,
+    ts: i64,
 }
 
 #[derive(Default)]
@@ -1281,44 +1294,40 @@ impl Db {
     pub fn accumulate(&self, node_id: i64, boot_id: &str, counters: Option<(i64, i64)>) -> Result<Traffic> {
         let mut connection = self.conn();
         let conn = connection.transaction()?;
-        let (
-            prev_boot,
-            last_rx,
-            last_tx,
-            mut total_rx,
-            mut total_tx,
-            mut month_rx,
-            mut month_tx,
-            month_start,
-            mut day_rx,
-            mut day_tx,
-            day_start,
-            reset_day,
-            history_since,
-            mut traffic_incomplete,
-        ) = conn
+        // Today's ledger and the provider's billing period both follow the Hub's local calendar.
+        let date = Local::now().date_naive();
+        let today = date.to_string();
+        let (mut traffic, has_baseline, same_boot, last_rx, last_tx, same_month, same_day) = conn
             .prepare_cached(
                 "SELECT t.boot_id, t.last_rx, t.last_tx, t.total_rx, t.total_tx, t.month_rx, t.month_tx,
                     t.month_start, t.day_rx, t.day_tx, t.day_start, n.traffic_reset_day, t.history_since, t.period_incomplete
                  FROM traffic t JOIN node n ON n.id = t.node_id WHERE t.node_id=?1",
             )?
-            .query_row([node_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, i64>(5)?,
-                    r.get::<_, i64>(6)?,
-                    r.get::<_, String>(7)?,
-                    r.get::<_, i64>(8)?,
-                    r.get::<_, i64>(9)?,
-                    r.get::<_, String>(10)?,
-                    r.get::<_, u32>(11)?,
-                    r.get::<_, String>(12)?,
-                    r.get::<_, bool>(13)?,
-                ))
+            .query_row([node_id], |row| {
+                // These strings belong to the current SQLite row. Compare them
+                // before stepping the statement so no per-frame copies are needed.
+                let previous_boot = row.get_ref(0)?.as_str()?;
+                let period = period_start(date, row.get(11)?).to_string();
+                let same_month = row.get_ref(7)?.as_str()? == period;
+                let same_day = row.get_ref(10)?.as_str()? == today;
+                let traffic_incomplete = if same_month {
+                    row.get(13)?
+                } else {
+                    let since = row.get_ref(12)?.as_str()?;
+                    since.is_empty() || since > period.as_str()
+                };
+                let traffic = Traffic {
+                    total_rx: row.get(3)?,
+                    total_tx: row.get(4)?,
+                    month_rx: if same_month { row.get(5)? } else { 0 },
+                    month_tx: if same_month { row.get(6)? } else { 0 },
+                    month_start: period,
+                    traffic_incomplete,
+                    day_rx: if same_day { row.get(8)? } else { 0 },
+                    day_tx: if same_day { row.get(9)? } else { 0 },
+                };
+                Ok((traffic, !previous_boot.is_empty(), previous_boot == boot_id,
+                    row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, same_month, same_day))
             })?;
 
         // Only bytes this hub observed a counter climb through are booked.
@@ -1339,11 +1348,11 @@ impl Db {
         // report's lifetime counter as a single delta.
         let (d_rx, d_tx) = match counters {
             None => (0, 0),
-            Some(_) if prev_boot.is_empty() || prev_boot != boot_id => {
+            Some(_) if !has_baseline || !same_boot => {
                 // Logged in either case: on a healthy node this is a reboot,
                 // while one every few seconds indicates two machines sharing a
                 // token.
-                if !prev_boot.is_empty() {
+                if has_baseline {
                     info!("node {node_id} reports a new boot; re-aligning");
                 }
                 (0, 0)
@@ -1356,51 +1365,36 @@ impl Db {
         // column: a node's own counters, which arrive from another repository's
         // binary, and `set_traffic`, through which the panel writes corrections.
         // Clamping here covers both rather than each caller separately.
-        total_rx = total_rx.saturating_add(d_rx);
-        total_tx = total_tx.saturating_add(d_tx);
-        month_rx = month_rx.saturating_add(d_rx);
-        month_tx = month_tx.saturating_add(d_tx);
-        day_rx = day_rx.saturating_add(d_rx);
-        day_tx = day_tx.saturating_add(d_tx);
-
-        // Both boundaries are calendar dates -- the day a provider resets an
-        // allowance, the day a person means by "today" -- so both follow the
-        // hub's local timezone rather than UTC.
-        let date = Local::now().date_naive();
-        let period = period_start(date, reset_day).to_string();
-        if month_start != period {
-            // A new billing period restarts the month counter but not the total.
-            traffic_incomplete = history_since.is_empty() || history_since > period;
-            month_rx = d_rx;
-            month_tx = d_tx;
-        }
-        let today = date.to_string();
-        if day_start != today {
-            day_rx = d_rx;
-            day_tx = d_tx;
-        }
+        traffic.total_rx = traffic.total_rx.saturating_add(d_rx);
+        traffic.total_tx = traffic.total_tx.saturating_add(d_tx);
+        traffic.month_rx = traffic.month_rx.saturating_add(d_rx);
+        traffic.month_tx = traffic.month_tx.saturating_add(d_tx);
+        traffic.day_rx = traffic.day_rx.saturating_add(d_rx);
+        traffic.day_tx = traffic.day_tx.saturating_add(d_tx);
 
         if let Some((rx, tx)) = counters {
-            conn.prepare_cached(
-                "UPDATE traffic SET boot_id=?2, last_rx=?3, last_tx=?4, total_rx=?5, total_tx=?6,
-                                month_rx=?7, month_tx=?8, month_start=?9, day_rx=?10, day_tx=?11,
-                                day_start=?12, period_incomplete=?13 WHERE node_id=?1",
-            )?
-            .execute(params![
-                node_id,
-                boot_id,
-                rx,
-                tx,
-                total_rx,
-                total_tx,
-                month_rx,
-                month_tx,
-                period,
-                day_rx,
-                day_tx,
-                today,
-                traffic_incomplete
-            ])?;
+            if !same_boot || rx != last_rx || tx != last_tx || !same_month || !same_day {
+                conn.prepare_cached(
+                    "UPDATE traffic SET boot_id=?2, last_rx=?3, last_tx=?4, total_rx=?5, total_tx=?6,
+                                    month_rx=?7, month_tx=?8, month_start=?9, day_rx=?10, day_tx=?11,
+                                    day_start=?12, period_incomplete=?13 WHERE node_id=?1",
+                )?
+                .execute(params![
+                    node_id,
+                    boot_id,
+                    rx,
+                    tx,
+                    traffic.total_rx,
+                    traffic.total_tx,
+                    traffic.month_rx,
+                    traffic.month_tx,
+                    traffic.month_start,
+                    traffic.day_rx,
+                    traffic.day_tx,
+                    today,
+                    traffic.traffic_incomplete
+                ])?;
+            }
             // A missing reading must not turn an unobserved day into a measured zero.
             conn.prepare_cached(
                 "INSERT INTO traffic_daily(node_id,day,rx,tx) VALUES(?1,?2,?3,?4)
@@ -1411,16 +1405,7 @@ impl Db {
             .execute(params![node_id, today, d_rx, d_tx])?;
         }
         conn.commit()?;
-        Ok(Traffic {
-            total_rx,
-            total_tx,
-            month_rx,
-            month_tx,
-            month_start: period,
-            traffic_incomplete,
-            day_rx,
-            day_tx,
-        })
+        Ok(traffic)
     }
 
     /// Allows the panel to correct a total, for example after moving a node to
@@ -2131,7 +2116,7 @@ impl Db {
 /// `"loss":0` on each would add 29 kB of nothing. Rounded up, so that the absence
 /// of a `loss` key means no timeouts occurred: truncating would report a bucket
 /// that lost 1 of 180 as clean.
-fn close_bucket(out: &mut Vec<serde_json::Value>, open: &mut Vec<(i64, Vec<i64>, i64)>, ts: i64) {
+fn close_bucket(out: &mut Vec<PingPoint>, open: &mut Vec<(i64, Vec<i64>, i64)>, ts: i64) {
     // Ordered by probe rather than by which answered first in this bucket, since
     // the chart shades its lines by arrival order.
     open.sort_unstable_by_key(|(task, ..)| *task);
@@ -2142,20 +2127,12 @@ fn close_bucket(out: &mut Vec<serde_json::Value>, open: &mut Vec<(i64, Vec<i64>,
             n if n % 2 == 1 => Some(answered[n / 2]),
             n => Some((answered[n / 2 - 1] + answered[n / 2]) / 2),
         };
-        let mut row = serde_json::json!({"task_id": task, "ts": ts, "latency": middle});
-        // Only when the bucket actually varied. At the hour and six-hour windows a
-        // bucket holds one sample, and a band would be a zero-height ribbon under
-        // every line.
-        if let (Some(lo), Some(hi)) = (answered.first(), answered.last()) {
-            if hi > lo {
-                row["band"] = serde_json::json!([lo, hi]);
-            }
-        }
-        if lost > 0 {
+        let band = answered.first().zip(answered.last()).and_then(|(&lo, &hi)| (hi > lo).then_some([lo, hi]));
+        let loss = (lost > 0).then(|| {
             let total = answered.len() as i64 + lost;
-            row["loss"] = ((100 * lost + total - 1) / total).into();
-        }
-        out.push(row);
+            (100 * lost + total - 1) / total
+        });
+        out.push(PingPoint { band, latency: middle, loss, task_id: task, ts });
     }
 }
 
@@ -2646,6 +2623,36 @@ mod tests {
         assert_eq!(stored(), "", "an answer about an address the node has left is dropped");
         db.set_country(id, "JP", "203.0.113.9").unwrap();
         assert_eq!(stored(), "JP", "the answer about the address it is at now lands");
+    }
+
+    #[test]
+    fn idle_reading_backfills_a_missing_day_and_a_failed_ledger_write_can_be_retried() {
+        let db = db();
+        let id = node(&db, 1);
+        db.accumulate(id, "boot", Some((300, 200))).unwrap();
+        db.conn().execute("DELETE FROM traffic_daily WHERE node_id=?1", [id]).unwrap();
+        let ledger = || {
+            db.conn()
+                .query_row("SELECT rx,tx FROM traffic_daily WHERE node_id=?1", [id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })
+                .optional()
+                .unwrap()
+        };
+        db.accumulate(id, "boot", None).unwrap();
+        assert_eq!(ledger(), None);
+        db.accumulate(id, "boot", Some((300, 200))).unwrap();
+        assert_eq!(ledger(), Some((0, 0)));
+        db.conn().execute_batch(
+            "CREATE TRIGGER broken_ledger BEFORE UPDATE ON traffic_daily BEGIN SELECT RAISE(ABORT,'unavailable'); END",
+        ).unwrap();
+        assert!(db.accumulate(id, "boot", Some((700, 900))).is_err());
+        assert_eq!(db.all_traffic()[&id].total_rx, 0);
+        assert_eq!(ledger(), Some((0, 0)));
+        db.conn().execute_batch("DROP TRIGGER broken_ledger").unwrap();
+        let traffic = db.accumulate(id, "boot", Some((700, 900))).unwrap();
+        assert_eq!((traffic.total_rx, traffic.total_tx), (400, 700));
+        assert_eq!(ledger(), Some((400, 700)));
     }
 
     #[test]

@@ -52,7 +52,7 @@ pub struct App {
     /// Last rendered node list per audience, `[public, admin]`, with the
     /// millisecond it was built. Shared by every browser stream so viewers do
     /// not multiply the query load. See `api::live_snapshot`.
-    pub(crate) snapshot: [Mutex<api::live_delta::Snapshot>; 3],
+    pub(crate) snapshot: [Mutex<api::live_delta::Snapshot>; 4],
     weekly: Mutex<Option<weekly::Cache>>,
     pub throttle: auth::Throttle,
     /// Failed agent registrations, counted separately from failed sign-ins: the
@@ -545,6 +545,7 @@ async fn main() -> Result<()> {
         // Read paths; the public page reaches these unauthenticated.
         .route("/healthz", get(api::healthz))
         .route("/api/me", get(api::me))
+        .route("/api/auth/session", get(api::session_status))
         .route("/api/visitor", get(api::visitor))
         .route("/api/visitor-log", get(api::visitor_log).delete(api::clear_visitor_log))
         .route("/api/nodes", get(api::nodes))

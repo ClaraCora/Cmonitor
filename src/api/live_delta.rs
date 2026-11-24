@@ -15,6 +15,13 @@ pub(super) enum Audience {
     Public,
     Admin,
     SignedStatus,
+    Inventory,
+}
+
+impl Audience {
+    pub(super) fn is_admin(self) -> bool {
+        matches!(self, Self::Admin | Self::Inventory)
+    }
 }
 
 #[derive(Default)]
@@ -51,7 +58,7 @@ impl Snapshot {
         format: Format,
         fetch: impl FnOnce() -> Vec<Value>,
     ) -> (u64, Option<Message>) {
-        let admin = audience == Audience::Admin;
+        let admin = audience.is_admin();
         if matches!(format, Format::Delta { .. }) {
             self.last_delta_read = Some(now);
         }
@@ -66,7 +73,7 @@ impl Snapshot {
                 let delta = changes(&self.nodes, &nodes, self.seq, next, at);
                 self.delta_has_only_public_fields = match audience {
                     Audience::Public => true,
-                    Audience::Admin => false,
+                    Audience::Inventory | Audience::Admin => false,
                     Audience::SignedStatus => delta.public_status_metrics_only(),
                 };
                 Some(encode(&delta))
@@ -111,7 +118,11 @@ impl Encoded {
     fn message(&self, gzip: bool) -> Message {
         if gzip && self.text.len() >= 1024 {
             let compressed = self.gzip.get_or_init(|| {
-                let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+                // All viewers share the compressed frame. Level 4 saved 17% on
+                // sampled public deltas. Limit extra time holding the cache lock.
+                let level =
+                    if self.text.len() <= 64 * 1024 { Compression::new(4) } else { Compression::fast() };
+                let mut encoder = GzEncoder::new(Vec::new(), level);
                 encoder.write_all(self.text.as_bytes()).ok()?;
                 let bytes = encoder.finish().ok()?;
                 (bytes.len() < self.text.len()).then(|| Bytes::from(bytes))

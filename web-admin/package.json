@@ -19,7 +19,7 @@
     "lint": "oxlint",
     "test": "node src/lib/api.test.ts",
     "preview": "vite preview",
-    "test:browser": "node ../scripts/browser-regression.cjs && node ../scripts/rollout-browser-regression.cjs && node ../scripts/visitor-browser-regression.cjs"
+    "test:browser": "node ../scripts/browser-regression.cjs && node ../scripts/rollout-browser-regression.cjs && node ../scripts/visitor-browser-regression.cjs && node ../scripts/inventory-browser-regression.cjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

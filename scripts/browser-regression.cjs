@@ -53,6 +53,7 @@ async function main() {
     await context.route('**/api/**', async route => {
       const req = route.request(), pathname = new URL(req.url()).pathname
       const fail = body => route.fulfill({status:503,body})
+      if (pathname === '/api/auth/session') return route.fulfill({status:authed ? 204 : 401})
       if (pathname === '/api/agent-upgrades' && req.method()==='GET') return route.fulfill({json:{target:'1.2.1',nodes:{1:'ready',2:'plaintext',3:'ready',4:'ready'},batch:null}})
       if (outage && pathname === '/api/nodes') return fail('模拟网络中断')
       if (settingsFail && pathname === '/api/settings') return fail('模拟设置加载失败')
@@ -96,7 +97,7 @@ async function main() {
       else if (pathname === '/api/sessions') data=[]
       return route.fulfill({contentType:'application/json',body:JSON.stringify(data)})
     })
-    await context.routeWebSocket('**/api/ws', ws => {
+    await context.routeWebSocket(/\/api\/ws(?:\?|$)/, ws => {
       if (outage) { ws.close(); return }
       sockets.add(ws)
       ws.onClose(() => sockets.delete(ws))
@@ -319,7 +320,7 @@ async function main() {
       await page.locator('input[type=file]').setInputFiles({name:'isolated.db',mimeType:'application/octet-stream',buffer:Buffer.from('fixture upload only')})
       await page.getByRole('button',{name:'确认恢复',exact:true}).click()
       await page.getByRole('status',{name:'备份恢复结果'}).waitFor()
-      await page.clock.fastForward(6000)
+      await page.clock.fastForward(16000)
       await page.getByRole('button',{name:'登录',exact:true}).waitFor()
       assert.match(restoreId,/^[a-f0-9]{32}$/)
       assert.equal(await page.evaluate(()=>sessionStorage.getItem('cmonitor-restore')),restoreId,'lost response preserves operation ID')

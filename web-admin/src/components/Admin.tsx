@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
-import { api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask, type VisitorRow } from "@/lib/api"
+import { api, changes, GIB, needsInventory, provisioningSite, trafficCorrection, upload, type Node, type PingTask, type VisitorRow } from "@/lib/api"
 import { bytes, CYCLES } from "@/lib/format"
 import { AgentRollout } from "./AgentRollout"
 import { NodeInventory } from "./NodeInventory"
@@ -2321,7 +2321,7 @@ export function Admin({
   canProvision: boolean
 }) {
   const section = ADMIN_SECTIONS.find(item => item.path === path)
-  const usesNodes = path === "/clara/nodes" || path === "/clara/ping" || path === "/clara/notify"
+  const usesNodes = needsInventory(path)
   useEffect(() => {
     const previous = document.title
     document.title = `${section?.label ?? "页面不存在"} · Monitor 后台`

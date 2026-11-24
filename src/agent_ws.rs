@@ -2,9 +2,10 @@
 //! notifications. A single long-lived connection on which either end may speak
 //! first, with self-describing frames readable via curl or a browser console.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -181,8 +182,9 @@ impl Minute {
 }
 
 #[derive(Deserialize)]
-struct Rpc {
-    method: String,
+struct Rpc<'a> {
+    #[serde(borrow)]
+    method: Cow<'a, str>,
     #[serde(default)]
     params: serde_json::Value,
 }
@@ -359,7 +361,7 @@ fn dispatch_session(app: &App, node_id: i64, ip: &str, text: &str, session: Opti
         );
     }
     let rpc: Rpc = serde_json::from_str(text)?;
-    match rpc.method.as_str() {
+    match rpc.method.as_ref() {
         "terminal.ready" | "terminal.output" | "terminal.error" | "terminal.exit" => {
             if let Some(session) = session {
                 crate::terminal::from_agent(app, node_id, session, &rpc.params, text);
@@ -513,7 +515,9 @@ fn report_fields() -> impl Iterator<Item = &'static str> {
 /// Those carrying a plain number. `boot_id` is a string and `load` an array of
 /// three; each is checked separately.
 fn numeric_fields() -> impl Iterator<Item = &'static str> {
-    report_fields().filter(|k| !matches!(*k, "boot_id" | "load"))
+    static FIELDS: LazyLock<Vec<&'static str>> =
+        LazyLock::new(|| report_fields().filter(|k| !matches!(*k, "boot_id" | "load")).collect());
+    FIELDS.iter().copied()
 }
 
 /// Reports, once per connection, when a report omits fields the hub depends on.
@@ -542,14 +546,21 @@ fn report_session(
     // baseline.
     let number = |v: &serde_json::Value| v.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0);
     anyhow::ensure!(metrics.is_object(), "report must be an object");
+    let mut complete = metrics.get("boot_id").is_some_and(|v| !v.is_null());
     for key in numeric_fields() {
-        anyhow::ensure!(metrics.get(key).is_none_or(number), "invalid report field {key}");
+        if let Some(value) = metrics.get(key) {
+            anyhow::ensure!(number(value), "invalid report field {key}");
+        } else {
+            complete = false;
+        }
     }
     if let Some(load) = metrics.get("load") {
         anyhow::ensure!(
             load.as_array().is_some_and(|v| v.len() == 3 && v.iter().all(number)),
             "invalid load"
         );
+    } else {
+        complete = false;
     }
     let now = Utc::now().timestamp();
     // Read once, alongside the wall clock: the stamp is a point in time taken
@@ -587,9 +598,7 @@ fn report_session(
     let Some(entry) = agents.get_mut(&node_id).filter(|a| session.is_none_or(|s| s == a.session)) else {
         return Ok(());
     };
-    let complete = !entry.rollout.version.is_empty()
-        && report_fields().all(|key| metrics.get(key).is_some_and(|v| !v.is_null()));
-    entry.rollout.record_report(complete, now);
+    entry.rollout.record_report(complete && !entry.rollout.version.is_empty(), now);
     let first = entry.last_seen == 0;
     if first {
         check_contract(node_id, &metrics);
@@ -706,6 +715,27 @@ mod tests {
                        "mem_used": 100, "net_rx_total": rx, "net_tx_total": tx}
         })
         .to_string()
+    }
+
+    #[test]
+    fn incomplete_reports_are_accepted_but_cannot_confirm_an_upgrade() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        app.agents.write().unwrap().get_mut(&id).unwrap().rollout.version = "1.2.3".into();
+        let mut full = json!({"boot_id":"fixture","load":[0,0,0]});
+        for key in numeric_fields() {
+            full[key] = json!(1);
+        }
+        for key in report_fields() {
+            let mut incomplete = full.clone();
+            incomplete.as_object_mut().unwrap().remove(key);
+            report(&app, id, incomplete).unwrap();
+            assert!(!app.agents.read().unwrap()[&id].rollout.reported, "missing {key}");
+        }
+        // A JSON-RPC method may be escaped even though agents normally send it verbatim.
+        let frame = format!(r#"{{"method":"\u0072eport","params":{full}}}"#);
+        dispatch(&app, id, "ip", &frame).unwrap();
+        assert!(app.agents.read().unwrap()[&id].rollout.reported);
     }
 
     #[test]
@@ -1013,7 +1043,7 @@ mod tests {
             .unwrap()
             .ping
             .iter()
-            .map(|r| (r["task_id"].as_i64().unwrap(), r["latency"].as_i64().unwrap()))
+            .map(|r| (r.task_id, r.latency.unwrap()))
             .collect();
         seen.sort();
         assert_eq!(seen, vec![(one, 42), (two, 15)], "each real task keeps its own result, and only those");

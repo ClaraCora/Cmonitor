@@ -83,7 +83,7 @@ async function run() {
       const asset = pathname === '/clara/nodes' ? 'index.html' : pathname.slice('/clara/'.length)
       return route.fulfill({ path: path.join(dist, asset) })
     })
-    await page.routeWebSocket('**/api/ws', ws => ws.send(JSON.stringify({ nodes, admin: true })))
+    await page.routeWebSocket(/\/api\/ws(?:\?|$)/, ws => ws.send(JSON.stringify({ nodes, admin: true })))
     await page.routeWebSocket('**/api/terminal/ws', ws => {
       terminalConnections++
       ws.onMessage(message => {

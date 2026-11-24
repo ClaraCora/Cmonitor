@@ -94,7 +94,7 @@ fn node_view(
     current: Option<&Agent>,
     traffic: &Traffic,
     tasks: &[&PingTask],
-    full: bool,
+    audience: Audience,
     now: i64,
     timezone: &str,
 ) -> Value {
@@ -112,6 +112,7 @@ fn node_view(
     let live = |key: &str, stored: i64| {
         current.and_then(|a| a.metrics.get(key).and_then(serde_json::Value::as_i64)).unwrap_or(stored)
     };
+    let full = audience.is_admin();
     let pings = tasks.iter().map(|task| {
             let reading = current.and_then(|agent| agent.pings.get(&task.id));
             let fresh = reading.filter(|v| now - v.updated_at <= task.interval * 2 + 30);
@@ -189,6 +190,7 @@ fn node_view(
     view["permanent"] = json!(node.permanent);
     view["traffic_incomplete"] = json!(traffic.traffic_incomplete);
     view["metrics"] = match current.map(|a| &a.metrics) {
+        _ if audience == Audience::Inventory => Value::Null,
         Some(Value::Object(m)) if !full => Value::Object(
             m.iter()
                 .filter(|(k, _)| PUBLIC_METRICS.contains(&k.as_str()))
@@ -237,10 +239,12 @@ fn billing_boundary(date: Option<&str>, months: u32) -> Option<i64> {
 }
 
 fn visible_nodes(app: &App, audience: Audience) -> Result<Vec<Value>, anyhow::Error> {
-    let full = audience == Audience::Admin;
+    let full = audience.is_admin();
     let nodes = app.db.nodes()?;
     let traffic = app.db.all_traffic();
-    let tasks = app.db.ping_tasks()?;
+    // Node management uses billing counters and connection state; charts and
+    // probe windows are only consumed by other views.
+    let tasks = if audience == Audience::Inventory { Vec::new() } else { app.db.ping_tasks()? };
     let mut by_node: HashMap<i64, Vec<&PingTask>> = HashMap::new();
     for task in &tasks {
         for id in &task.nodes {
@@ -279,7 +283,7 @@ fn visible_nodes(app: &App, audience: Audience) -> Result<Vec<Value>, anyhow::Er
                     agents.get(&n.id),
                     traffic.get(&n.id).unwrap_or(&none),
                     by_node.get(&n.id).map(Vec::as_slice).unwrap_or_default(),
-                    full,
+                    audience,
                     time.timestamp(),
                     &timezone,
                 )
@@ -511,6 +515,7 @@ impl LiveOptions {
         match (authenticated, self.view.as_deref()) {
             (false, _) => Audience::Public,
             (true, Some("public")) => Audience::SignedStatus,
+            (true, Some("inventory")) => Audience::Inventory,
             (true, _) => Audience::Admin,
         }
     }
@@ -712,6 +717,12 @@ pub async fn healthz(State(app): State<Shared>) -> impl IntoResponse {
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "status": "unavailable" })))
     }
+}
+
+// The panel also checks revocation on pages without a node stream. Avoid
+// loading settings, parsing theme manifests and reading the theme directory.
+pub async fn session_status(_: Admin) -> impl IntoResponse {
+    (StatusCode::NO_CONTENT, [(header::CACHE_CONTROL, "no-store")])
 }
 
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
@@ -2600,6 +2611,7 @@ mod tests {
         // Keyed by task rather than index: the rows share a timestamp, so
         // `ORDER BY ts` leaves their order to SQLite.
         let PingHistory { ping: rows, loss: window_loss, .. } = app.db.ping_records(id, base, 120).unwrap();
+        let rows: Vec<Value> = rows.into_iter().map(|r| serde_json::to_value(r).unwrap()).collect();
         let probe = |task: i64| {
             rows.iter().find(|r| r["task_id"] == task).unwrap_or_else(|| panic!("no probe {task}"))
         };
@@ -2629,7 +2641,7 @@ mod tests {
         }
         let rows = app.db.ping_records(wide, wide_base, 180).unwrap().ping;
         assert_eq!(rows.len(), 1, "the fixture has to be one bucket for this to mean anything");
-        let row = &rows[0];
+        let row = serde_json::to_value(&rows[0]).unwrap();
         assert_eq!(row["loss"], 1, "a bucket that lost one of 180 has not lost none");
 
         // What the band conveys: the median reading and the two extremes the
@@ -2640,7 +2652,8 @@ mod tests {
         for (i, latency) in [10, 20, 50, 20, 20].into_iter().enumerate() {
             app.db.insert_ping(jitter, jitter_probe, wide_base + i as i64, latency).unwrap();
         }
-        let row = &app.db.ping_records(jitter, wide_base, 180).unwrap().ping[0];
+        let row =
+            serde_json::to_value(&app.db.ping_records(jitter, wide_base, 180).unwrap().ping[0]).unwrap();
         assert_eq!(row["latency"], 20, "the middle answer, not the mean of 24");
         assert_eq!(row["band"], json!([10, 50]));
 
@@ -2652,7 +2665,7 @@ mod tests {
         for (i, latency) in [40, 10, 30, 20].into_iter().enumerate() {
             app.db.insert_ping(even, even_probe, wide_base + i as i64, latency).unwrap();
         }
-        assert_eq!(app.db.ping_records(even, wide_base, 180).unwrap().ping[0]["latency"], 25);
+        assert_eq!(app.db.ping_records(even, wide_base, 180).unwrap().ping[0].latency, Some(25));
     }
 
     /// What a window lost is the proportion of its samples lost, and only the hub
@@ -2677,7 +2690,7 @@ mod tests {
         app.db.insert_ping(id, probe, base + 60, -1).unwrap();
 
         let PingHistory { ping: rows, loss, .. } = app.db.ping_records(id, base, 60).unwrap();
-        let per_bucket: Vec<i64> = rows.iter().map(|r| r["loss"].as_i64().unwrap_or(0)).collect();
+        let per_bucket: Vec<i64> = rows.iter().map(|r| r.loss.unwrap_or(0)).collect();
         assert_eq!(per_bucket, vec![0, 100], "the buckets are right about themselves");
 
         // Their mean is 50%, while one round of thirteen did not answer.
@@ -2986,6 +2999,29 @@ mod tests {
             public,
             "the frame is reused, not rebuilt per viewer"
         );
+    }
+
+    #[test]
+    fn inventory_keeps_panel_fields_but_skips_live_chart_series() {
+        let app = app();
+        let id = node(&app, "private-node", false);
+        let _session = connect(&app, id, json!({"cpu":21,"mem_total":1024}));
+        task(&app, vec![id]);
+        let inventory = LiveOptions { view: Some("inventory".into()), ..Default::default() };
+        let read = |audience| serde_json::from_str::<Value>(&live_snapshot(&app, audience)).unwrap();
+        let panel = read(inventory.audience(true));
+        assert_eq!(panel["admin"], true);
+        let row = &panel["nodes"][0];
+        assert_eq!(row["name"], "private-node");
+        assert_eq!(row["mem_total"], 1024);
+        assert!(row["token"].is_string() && row["metrics"].is_null());
+        assert_eq!(row["pings"], json!([]));
+        let full = read(Audience::Admin);
+        assert_eq!(full["nodes"][0]["metrics"]["cpu"], 21);
+        assert_eq!(full["nodes"][0]["pings"].as_array().unwrap().len(), 1);
+        let public = read(inventory.audience(false));
+        assert_eq!(public["admin"], false);
+        assert_eq!(public["nodes"], json!([]));
     }
 
     #[tokio::test]
@@ -3665,7 +3701,7 @@ mod tests {
             assert_eq!(err["error_count"], 1);
             assert!(err["p95_ms"].is_null() && err["jitter_ms"].is_null() && err["loss_pct"].is_null());
             assert!(!history.loss.contains_key(&errors.to_string()));
-            assert!(history.ping.iter().all(|row| row["task_id"] != errors));
+            assert!(history.ping.iter().all(|row| row.task_id != errors));
             assert_eq!(history.loss[&lost.to_string()], 100.0);
             assert!(history.stats[&lost.to_string()]["avg_ms"].is_null());
         }
