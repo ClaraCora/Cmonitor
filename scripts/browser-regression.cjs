@@ -12,6 +12,16 @@ const metric = { uptime: 1000, cpu: 5, load: [0, 0, 0], mem_total: 1024, mem_use
 const nodes = (mode === 'admin' ? [1, 2, 3, 4] : [1, 2]).map(id => ({ id, name: `测试节点 ${id}`, sort: id, public: true, online: true, country: 'SG', last_seen: Math.floor(Date.now()/1000), metrics: metric, hostname: 'fixture', ip: `198.51.100.${id}`, ipv4: '', ipv6: '', os: 'Linux', kernel: '', arch: 'x86_64', virt: 'kvm', cpu_name: 'Test CPU', cpu_cores: 2, mem_total: 1024, swap_total: 0, disk_total: 2048, agent_version: '1.2.0', price: 5, currency: 'USD', billing_cycle: 'monthly', expires_at: '2026-12-10', permanent: false, traffic_limit: 1024**3, traffic_mode: 'sum', traffic_reset_day: 1, total_rx: 1000, total_tx: 2000, month_rx: 100, month_tx: 200, month_start: '2026-11-01', day_rx: 10, day_tx: 20, traffic_incomplete: false, token: 'fixture-only', notify: true, muted_until: 0, remark: '', tags: '', website: 'https://example.com', pings: [{id: 1, name: '测试探测', latency: 20, updated_at: Math.floor(Date.now()/1000), samples: [20,21,19]}] }))
 const settings = { site_name: 'Monitor', retention_days: '7', public_page: 'on', visitor_card: 'on', notify_grace: '3', notify_traffic: '80', notify_expiry: '7', notify_disk_percent: '90', notify_disk_minutes: '10', notify_ping_failures: '3', notify_cooldown: '60', notify_login: 'on', notify_telegram_chat: '', notify_telegram_text: '{{title}}', notify_webhook_body: '{"text":"{{message}}"}', password_login: 'on' }
 const me = { authed: true, github: false, password_login: true, hub_version: 'test', site_name: 'Monitor', public_page: true, site: 'https://monitor.example.com', can_provision: true, admin_url: '/clara/nodes', visitor_card: true }
+const visitor = {
+  id: 1, ts: 1794280900, ip: '2001:0db8:0000:0000:1234:5678:abcd:ef01',
+  city: 'Singapore', country: 'SG', org: 'AS64496 Example Networks',
+  ua: 'LayoutFixture/' + 'long-client-identifier'.repeat(12),
+}
+const pingTask = { id: 1, name: 'IPv6 出口', target: '[2001:0db8:0000:0000:1234:5678:abcd:ef01]:443', interval: 60, nodes: [1] }
+if (mode === 'admin') {
+  Object.assign(nodes[0], {ipv4: nodes[0].ip, ipv6: '2001:0db8:0000:0000:1234:5678:abcd:ef01'})
+  Object.assign(nodes[1], {name: 'Singapore-Production-Monitoring-Node-Long-Name', terminal_reason: 'plaintext', offline_only: true})
+}
 
 async function main() {
   fs.mkdirSync(output, { recursive: true })
@@ -24,7 +34,8 @@ async function main() {
     fs.createReadStream(filename).pipe(res)
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
-  const origin = `http://127.0.0.1:${server.address().port}`
+  const localOrigin = `http://127.0.0.1:${server.address().port}`
+  const origin = mode === 'admin' ? 'https://hub.example.test' : localOrigin
   const browser = await chromium.launch({ headless: true, ...(process.env.UX_BROWSER_CHANNEL ? { channel: process.env.UX_BROWSER_CHANNEL } : {}) })
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, locale: 'zh-CN', hasTouch: true })
   let settingsFail = false, pingFail = false, outage = false, authed = true, restorePhase = 'applying', restoreId = ''
@@ -32,6 +43,13 @@ async function main() {
   const sockets = new Set(), timers = new Set(), writes = [], historyCalls = []
   const errors = []
   try {
+    if (mode === 'admin') {
+      // Exercise the HTTPS-only provisioning controls with the same local build.
+      await context.route(origin + '/**', async route => {
+        const {pathname, search} = new URL(route.request().url())
+        await route.fulfill({response: await route.fetch({url: localOrigin + pathname + search})})
+      })
+    }
     await context.route('**/api/**', async route => {
       const req = route.request(), pathname = new URL(req.url()).pathname
       const fail = body => route.fulfill({status:503,body})
@@ -68,8 +86,8 @@ async function main() {
         const now=Math.floor(Date.now()/1000)
         data={metrics:[{ts:now-60,cpu:5,mem_used:128,disk_used:256,net_rx:10,net_tx:20},{ts:now,cpu:6,mem_used:130,disk_used:256,net_rx:20,net_tx:20}],ping:[{task_id:1,ts:now-60,latency:20},{task_id:1,ts:now,latency:21}],probes:{1:'测试探测'},loss:{}}
       }
-      else if (pathname === '/api/ping-tasks') data={tasks:[]}
-      else if (pathname === '/api/visitor-log') data={visits:[]}
+      else if (pathname === '/api/ping-tasks') data={tasks:[pingTask]}
+      else if (pathname === '/api/visitor-log') data={visits:[visitor]}
       else if (pathname === '/api/visitor') data={ip:'198.51.100.99',city:'测试地区',country:'CN'}
       else if (pathname.endsWith('/renewals')) data={history:[]}
       else if (pathname === '/api/notify/history') data={items:[]}
@@ -89,7 +107,53 @@ async function main() {
     await page.clock.install()
     page.on('pageerror',e => errors.push(e.message))
     if (mode === 'admin') {
+      await page.goto(localOrigin+'/clara/nodes')
+      const restrictedInstall = page.getByRole('group', {name: `${nodes[0].name} 操作`, exact:true}).getByRole('button', {name:'安装 Agent'})
+      await restrictedInstall.waitFor()
+      assert(await restrictedInstall.isDisabled(), 'plain HTTP shows the disabled install action')
       await page.goto(origin+'/clara/nodes')
+      const firstActions = page.getByRole('group', {name: `${nodes[0].name} 操作`, exact: true})
+      const inventoryTable = page.getByRole('table', {name: '节点列表'})
+      const httpActions = page.getByRole('group', {name: `${nodes[1].name} 操作`, exact: true})
+      for (const width of [320, 390, 767, 768, 1024, 1280, 1440]) {
+        await page.setViewportSize({width, height: width < 768 ? 844 : 1000})
+        await firstActions.waitFor()
+        if (width >= 768) {
+          assert.deepEqual(await inventoryTable.getByRole('columnheader').allTextContents(),
+            ['名称', 'IP', '状态', '流量', '价格', '到期', '操作'], `seven-column node table at ${width}px`)
+        } else {
+          assert.equal(await inventoryTable.count(), 0, `mobile list at ${width}px`)
+          assert(await page.getByRole('listitem').filter({has: firstActions}).isVisible())
+        }
+        for (const name of ['升级 Agent', '批量添加', '添加节点']) {
+          await page.getByRole('button', {name, exact:true}).click({trial:true})
+        }
+        const moveUp = firstActions.getByRole('button', {name:'上移', exact:true})
+        assert(await moveUp.isVisible() && await moveUp.isDisabled(), 'first node shows the disabled move-up action')
+        for (const name of [/隐藏/, /打开.*终端|打开 Web Terminal/, /禁用.*终端/, /安装 Agent/, /编辑/, /续费/, /删除/, /下移/]) {
+          const button = firstActions.getByRole('button', {name})
+          // Check that the button receives clicks without executing maintenance actions.
+          await button.click({trial:true})
+        }
+        assert(await httpActions.getByRole('button', {name: /HTTP/}).isDisabled())
+        await httpActions.getByRole('button', {name:'上移', exact:true}).click({trial:true})
+        await page.getByRole('button', {name:'复制升级命令', exact:true}).click({trial:true})
+        const clipped = await firstActions.evaluate(group => {
+          const bounds = group.getBoundingClientRect()
+          return [...group.querySelectorAll('button')].some(button => {
+            const rect = button.getBoundingClientRect()
+            return rect.width === 0 || rect.height === 0 || rect.left < Math.max(0, bounds.left) - 1 ||
+              rect.right > Math.min(document.documentElement.clientWidth, bounds.right) + 1 ||
+              rect.bottom > bounds.bottom + 1
+          })
+        })
+        assert.equal(clipped, false, `node actions fit their row and viewport at ${width}px`)
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `nodes fit at ${width}px`)
+        if ([390, 768, 1440].includes(width)) {
+          await page.evaluate(() => window.scrollTo(0, 0))
+          await page.screenshot({animations:'disabled', path:path.join(output, `nodes-${width}.png`)})
+        }
+      }
       await page.getByRole('button',{name:'升级 Agent',exact:true}).click()
       const picker=page.getByRole('dialog'); await picker.getByRole('checkbox').first().waitFor()
       assert(await picker.getByRole('checkbox').nth(1).isDisabled(),'HTTP node cannot be selected')
@@ -126,11 +190,28 @@ async function main() {
       await page.getByLabel('名称',{exact:true}).waitFor()
       await page.screenshot({animations:"disabled",path:path.join(output,'editor-mobile.png')})
       await page.keyboard.press('Escape')
-      await page.getByRole('button',{name:`${nodes[0].name} 更多操作`,exact:true}).tap()
-      await page.getByRole('menuitem',{name:'下移',exact:true}).tap()
+      await firstActions.getByRole('button',{name:'下移',exact:true}).tap()
       assert(writes.some(w=>w.pathname==='/api/nodes/order'),'mobile sorting uses explicit controls')
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false)
       await page.screenshot({animations:"disabled",path:path.join(output,'admin-mobile.png')})
+      const nav = page.getByRole('navigation', {name:'后台导航'})
+      await nav.getByRole('link', {name:'访客', exact:true}).click()
+      await page.getByText(visitor.ip, {exact:true}).waitFor()
+      await page.getByText('查看 UA', {exact:true}).focus()
+      await page.keyboard.press('Enter')
+      await page.getByText(visitor.ua, {exact:true}).waitFor()
+      await page.setViewportSize({width:320,height:640})
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, 'full IPv6 and expanded UA fit narrow screens')
+      const lastLink = await nav.getByRole('link', {name:'设置', exact:true}).boundingBox()
+      assert(lastLink && lastLink.x >= 0 && lastLink.x + lastLink.width <= 320, 'last mobile route is visible without sideways scrolling')
+      await nav.getByRole('link', {name:'通知',exact:true}).click()
+      await page.getByText('Webhook', {exact:true}).click()
+      await page.getByLabel('接收渠道', {exact:true}).waitFor()
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, 'expanded Webhook settings fit mobile')
+      await nav.getByRole('link', {name:'安全',exact:true}).click()
+      await page.getByRole('heading', {name:'应急密码'}).waitFor()
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, 'security settings fit mobile')
+      await page.setViewportSize({width:390,height:844})
       settingsFail=true
       await page.goto(origin+'/clara/settings')
       await page.getByRole('button',{name:'重新加载',exact:true}).click()
@@ -163,6 +244,18 @@ async function main() {
       await page.goto(origin+'/clara/ping')
       await page.getByText('加载失败：模拟探测加载失败').waitFor()
       assert.equal(await page.getByText('还没有延迟监控。',{exact:false}).count(),0)
+      pingFail=false
+      await page.getByRole('button', {name:'重新加载'}).click()
+      await page.getByText(pingTask.target, {exact:true}).waitFor()
+      await page.getByRole('button', {name:'编辑监控：IPv6 出口'}).click()
+      const pingEditor = page.getByRole('dialog')
+      await pingEditor.getByRole('button', {name:'全选',exact:true}).click()
+      assert.equal(await pingEditor.getByRole('checkbox', {checked:true}).count(), nodes.length)
+      await pingEditor.getByRole('button', {name:'清空',exact:true}).click()
+      assert.equal(await pingEditor.getByRole('checkbox', {checked:true}).count(), 0)
+      page.once('dialog', d => d.accept())
+      await pingEditor.getByRole('button', {name:'取消',exact:true}).click()
+      await pingEditor.waitFor({state:'hidden'})
 
       await page.goto(origin+'/clara/data')
       await page.getByRole('heading',{name:'自动备份',exact:true}).waitFor()

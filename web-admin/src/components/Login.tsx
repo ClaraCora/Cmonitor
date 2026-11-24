@@ -50,7 +50,7 @@ export function Login({ github, passwordEnabled, onDone }: { github: boolean; pa
         <h1 className="text-lg font-semibold">登录后台</h1>
 
         {error && (
-          <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>
+          <p role="alert" className="break-words rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>
         )}
 
         {github && (
@@ -82,7 +82,7 @@ export function Login({ github, passwordEnabled, onDone }: { github: boolean; pa
             />
           </div>
           <Button type="submit" className="w-full" disabled={busy || !password}>
-            登录
+            {busy ? "登录中…" : "登录"}
           </Button>
         </form>}
         {!passwordEnabled && <p className="text-sm text-muted-foreground">应急密码登录已关闭。{github ? "请使用 GitHub 登录。" : "请由服务器管理员恢复登录配置。"}</p>}

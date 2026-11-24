@@ -39,6 +39,7 @@ function usePath() {
       const to = normalise(next)
       history.pushState({}, "", to)
       setPath(to)
+      window.scrollTo(0, 0)
     }, []),
   ] as const
 }
@@ -127,35 +128,40 @@ function AdminApp() {
 
   return (
     <div className="min-h-svh">
-      <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
-        <div className="mx-auto flex max-w-[1600px] flex-wrap items-center gap-3 px-4 py-3">
-          {/* The site name is the way back to the status page, as in the
-              theme's own header. */}
-          <a href="/" className="flex items-center gap-2 font-semibold transition-opacity hover:opacity-70">
-            <img src={`${import.meta.env.BASE_URL}favicon.svg`} alt="" className="size-5 rounded-md" />
-            {me.site_name || "Monitor"}
-          </a>
-          <span title={`内置主题 ${me.embedded_theme_version ?? "未知"} · 当前主题 ${me.active_theme_version ?? "未知"}`} className="text-xs text-muted-foreground">后台{me.hub_version && <span className="ml-2 whitespace-nowrap font-mono">Hub v{me.hub_version}</span>}</span>
-          <div className="flex-1" />
-          {/* The status page is a separate app, so this is a navigation. */}
-          <Button variant="ghost" size="sm" asChild>
-            <a href="/">
-              <ExternalLink /> 状态面板
-            </a>
-          </Button>
-          <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
-            {dark ? <Sun /> : <Moon />}
-          </Button>
-          <Button variant="ghost" size="icon" onClick={signOut} disabled={signingOut} title="退出登录">
-            <LogOut />
-          </Button>
+      <header className="sticky top-0 z-10 border-b bg-background/95 backdrop-blur">
+        <div className="mx-auto flex h-16 max-w-[1600px] items-center gap-2 px-3 sm:gap-4 sm:px-6">
+          <img src={`${import.meta.env.BASE_URL}favicon.svg`} alt="" className="size-8 shrink-0 rounded-lg" />
+          <div className="min-w-0 flex-1">
+            <div className="flex items-baseline gap-2">
+              <a href="/" className="truncate rounded-sm font-semibold hover:underline focus-visible:outline-2" title={me.site_name || "Monitor"}>{me.site_name || "Monitor"}</a>
+              <span title={`内置主题 ${me.embedded_theme_version ?? "未知"} · 当前主题 ${me.active_theme_version ?? "未知"}`} className="shrink-0 text-xs text-muted-foreground">
+                <span className={me.hub_version ? "hidden sm:inline" : ""}>后台</span>
+                {me.hub_version && <span className="font-mono sm:ml-2">Hub v{me.hub_version}</span>}
+              </span>
+            </div>
+            {lastUpdatedAt && <div className="tnum flex items-center gap-1.5 text-xs text-muted-foreground">
+              <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${stale ? "bg-warn" : connection === "live" ? "bg-ok" : "bg-muted-foreground"}`} />
+              {stale ? "更新中断" : connection === "live" ? "实时更新" : "轮询更新"}
+              <time dateTime={new Date(lastUpdatedAt).toISOString()} title="最近更新">{new Date(lastUpdatedAt).toLocaleTimeString("zh-CN", { hour12: false })}</time>
+            </div>}
+          </div>
+          <div className="flex shrink-0 items-center gap-0.5 sm:gap-1">
+            <Button variant="ghost" size="sm" className="size-10 sm:w-auto" asChild>
+              <a href="/" aria-label="状态面板" title="状态面板"><ExternalLink /><span className="hidden sm:inline">状态面板</span></a>
+            </Button>
+            <Button variant="ghost" size="icon-lg" onClick={toggleTheme} title="切换主题">
+              {dark ? <Sun /> : <Moon />}
+            </Button>
+            <Button variant="ghost" size="icon-lg" onClick={signOut} disabled={signingOut} title="退出登录">
+              <LogOut />
+            </Button>
+          </div>
         </div>
       </header>
 
-      <main className="mx-auto max-w-[1600px] space-y-5 px-4 py-6">
-        {stale && <p role="status" className="rounded-lg border p-3 text-sm">数据更新中断。以下为 {lastUpdatedAt ? new Date(lastUpdatedAt).toLocaleTimeString("zh-CN") : "—"} 收到的历史状态，请勿据此判断当前在线情况。<Button variant="ghost" size="sm" onClick={refresh}>重试</Button></p>}
-        {!stale && lastUpdatedAt && <p className="text-xs text-muted-foreground">{connection === "live" ? "实时更新" : "轮询更新"} · 最近更新 {new Date(lastUpdatedAt).toLocaleTimeString("zh-CN")}</p>}
-        {error && <p className="text-sm text-destructive">{error}</p>}
+      <main className="mx-auto max-w-[1600px] space-y-4 px-3 py-4 sm:px-6 sm:py-6">
+        {stale && <p role="status" className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/40 bg-popover px-4 py-2 text-sm"><span>数据更新中断。以下为 {lastUpdatedAt ? new Date(lastUpdatedAt).toLocaleTimeString("zh-CN") : "—"} 收到的历史状态，请勿据此判断当前在线情况。</span><Button variant="outline" size="sm" onClick={refresh}>重试</Button></p>}
+        {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
         {!nodes ? (
           <Skeleton className="h-64" />
         ) : (

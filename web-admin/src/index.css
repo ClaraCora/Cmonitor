@@ -27,7 +27,7 @@
   --secondary: oklch(0.93 0.005 260);
   --secondary-foreground: oklch(0.21 0.01 260);
   --muted: oklch(0.945 0.005 260);
-  --muted-foreground: oklch(0.57 0.015 260);
+  --muted-foreground: oklch(0.46 0.018 260);
   --accent: oklch(0.93 0.005 260);
   --accent-foreground: oklch(0.21 0.01 260);
   --destructive: oklch(0.62 0.23 27);
@@ -55,7 +55,7 @@
   --secondary: oklch(0.29 0.008 260);
   --secondary-foreground: oklch(0.97 0.004 260);
   --muted: oklch(0.27 0.007 260);
-  --muted-foreground: oklch(0.67 0.012 260);
+  --muted-foreground: oklch(0.75 0.014 260);
   --accent: oklch(0.29 0.008 260);
   --accent-foreground: oklch(0.97 0.004 260);
   --destructive: oklch(0.66 0.22 26);
@@ -112,13 +112,13 @@
   /* The same wallpapers the status page sits on, under this app's /clara/
      base rather than the theme's root. */
   body {
-    background-image: url("/clara/wallpaper-day.svg");
+    background-image: linear-gradient(oklch(0.97 0.006 260 / 83%), oklch(0.97 0.006 260 / 83%)), url("/clara/wallpaper-day.svg");
     background-size: cover;
     background-position: center;
     background-attachment: fixed;
   }
   .dark body {
-    background-image: url("/clara/wallpaper-night.svg");
+    background-image: linear-gradient(oklch(0.155 0.012 260 / 74%), oklch(0.155 0.012 260 / 74%)), url("/clara/wallpaper-night.svg");
   }
   /* Tailwind v4 leaves `button` and `input` on the browser's default cursor,
      where v3 made buttons a pointer. Radix renders Switch as a button, so without

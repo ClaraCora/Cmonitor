@@ -1,7 +1,5 @@
 import { lazy, Suspense, Children, cloneElement, isValidElement, useEffect, useId, useRef, useState } from "react"
-import { DropdownMenu } from "radix-ui"
-import { flushSync } from "react-dom"
-import { Bell, CalendarClock, MoreHorizontal, ChevronRight, Copy, Database, Download, Eye, EyeOff, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Terminal as TerminalIcon, Trash2, Upload, Users } from "lucide-react"
+import { Bell, ChevronRight, Copy, Database, Download, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Trash2, Upload, Users } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -12,10 +10,10 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { addresses, api, changes, GIB, provisioningSite, terminalControl, trafficCorrection, upload, type Node, type PingTask, type VisitorRow } from "@/lib/api"
-import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
+import { api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask, type VisitorRow } from "@/lib/api"
+import { bytes, CYCLES } from "@/lib/format"
 import { AgentRollout } from "./AgentRollout"
+import { NodeInventory } from "./NodeInventory"
 import { OfflineUpgradeButton } from "./OfflineUpgradeButton"
 import { trackRestore, useRestoreOperation } from "@/lib/restore"
 
@@ -33,40 +31,10 @@ const TRAFFIC_MODES: Record<string, string> = {
   down: "仅下行",
 }
 
-// Reordering uses the browser's view transitions, so displaced rows slide.
-// Browsers without support jump instead.
-function animate(update: () => void) {
-  if (document.startViewTransition) document.startViewTransition(() => flushSync(update))
-  else update()
-}
-
 function copy(text: string) {
   navigator.clipboard.writeText(text).then(
     () => toast.success("已复制"),
     () => toast.error("复制失败"),
-  )
-}
-
-// Every address a node has, each click-to-copy: pasting one into an ssh command
-// is why they are shown.
-function Addresses({ node }: { node: Node }) {
-  const list = addresses(node)
-  if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
-  return (
-    <div className="flex flex-col items-start gap-y-0.5">
-      {list.map((address) => (
-        <button
-          key={address}
-          type="button"
-          onClick={() => copy(address)}
-          title="点击复制"
-          className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
-        >
-          {address}
-          <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
-        </button>
-      ))}
-    </div>
   )
 }
 
@@ -76,7 +44,7 @@ function Field({ label, hint, className = "", children }: { label: string; hint?
     const result: React.ReactNode[] = []
     for (const child of Children.toArray(content)) {
       if (!isValidElement<Record<string, unknown>>(child)) { result.push(child); continue }
-      if (!linked && (child.type === Input || child.type === SelectTrigger || child.type === "textarea")) {
+      if (!linked && (child.type === Input || child.type === SelectTrigger || child.type === "textarea" || child.type === "select")) {
         result.push(cloneElement(child, { id, "aria-describedby": hint ? `${id}-hint` : undefined })); linked = true
       } else if (child.props.children) {
         const [children, found] = link(child.props.children as React.ReactNode, linked)
@@ -689,6 +657,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
 const TerminalDialog = lazy(() => import("./TerminalDialog").then(m => ({ default: m.TerminalDialog })))
 
 function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh: () => void; site: string; canProvision: boolean }) {
+  const [query, setQuery] = useState("")
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
@@ -698,23 +667,6 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   const reg = useRegisterWindow()
   const [deleting, setDeleting] = useState<Node | null>(null)
   const [removing, setRemoving] = useState(false)
-  const [manualOrder, setManualOrder] = useState<number[]>([])
-  const [query, setQuery] = useState("")
-  const [dragging, setDragging] = useState<number | null>(null)
-  const orderBeforeDrag = useRef<number[]>([])
-  const byId = new Map(nodes.map((node) => [node.id, node]))
-  const orderedIds = new Set(manualOrder)
-  const order = [
-    ...manualOrder.map((id) => byId.get(id)).filter((node): node is Node => Boolean(node)),
-    ...nodes.filter((node) => !orderedIds.has(node.id)),
-  ]
-  // Name and address, the two things a row is looked up by. `order` itself stays
-  // whole, because the order sent on drop is the order of every node.
-  const needle = query.trim().toLowerCase()
-  const visible = needle
-    ? order.filter((n) => [n.name, n.ip, n.ipv4, n.ipv6].some((v) => v?.toLowerCase().includes(needle)))
-    : order
-
   async function toggleTerminal(n: Node) {
     try {
       await api(`/nodes/${n.id}/terminal`, { method: "PUT", body: JSON.stringify({ enabled: n.terminal_enabled === false }) })
@@ -747,244 +699,30 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
     }
   }
 
-  // Rows are displaced while the pointer is down; the order is saved on drop.
-  function move(from: number, to: number) {
-    if (from < 0 || to < 0 || to >= order.length || from === to) return
-    const next = [...order]
-    next.splice(to, 0, ...next.splice(from, 1))
-    const ids = next.map((node) => node.id)
-    animate(() => setManualOrder(ids))
-    return ids
-  }
-
-  // Dropped outside the table or cancelled with Escape: the order is restored.
-  function cancel() {
-    setDragging(null)
-    const rollback = orderBeforeDrag.current
-    if (rollback.length) animate(() => setManualOrder(rollback))
-  }
-
-  function save(ids: number[]) {
-    setDragging(null)
-    const rollback = orderBeforeDrag.current
-    if (!rollback.length || ids.join() === rollback.join()) return
-    orderBeforeDrag.current = ids
-    api("/nodes/order", { method: "PUT", body: JSON.stringify({ ids }) }).then(refresh, (e: Error) => {
-      setManualOrder(rollback)
-      toast.error(e.message)
-    })
-  }
-
   return (
-    <div className="space-y-4">
-      {!canProvision && <p className="text-sm text-muted-foreground">请通过 HTTPS 域名访问面板后添加或安装节点。</p>}
-      <div className="flex flex-wrap items-center justify-end gap-2">
-        <Input
-          className="mr-auto w-full sm:w-64"
-          placeholder="搜索名称或地址"
-          aria-label="搜索节点"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-        <AgentRollout nodes={nodes} site={site} />
-        {/* An open window is visible from the list itself, so nobody has to
-            remember they left one open. */}
-        <Button variant="outline" disabled={!canProvision} onClick={() => setRegistering(true)}>
-          <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
-        </Button>
-        <Button disabled={!canProvision} onClick={() => setCreating(true)}>
-          <Plus /> 添加节点
-        </Button>
-      </div>
-
-      <div className="divide-y rounded-xl border bg-card md:hidden">
-        {visible.map((n) => {
-          const index = order.findIndex(item => item.id === n.id)
-          const moveBy = (delta: number) => { orderBeforeDrag.current = order.map(node => node.id); const ids = move(index,index+delta); if (ids) save(ids) }
-          const action = "w-full cursor-pointer rounded-md px-3 py-2.5 text-left text-sm outline-none data-[highlighted]:bg-muted data-[disabled]:pointer-events-none data-[disabled]:opacity-40"
-          return <div key={n.id} className="space-y-2 p-4">
-            <div className="flex items-start gap-3">
-              <div className="min-w-0 flex-1"><p className="break-words font-medium">{n.name}</p><p className="mt-1 text-xs text-muted-foreground">{n.online ? "在线" : "离线"} · {n.permanent ? "永久有效" : n.expires_at || "未设置到期日"}{!n.public && " · 不公开"}</p></div>
-              <Button size="sm" variant="secondary" onClick={() => setEditing(n)}>编辑</Button>
-              <DropdownMenu.Root><DropdownMenu.Trigger asChild><Button variant="ghost" size="icon" aria-label={`${n.name} 更多操作`}><MoreHorizontal /></Button></DropdownMenu.Trigger>
-                <DropdownMenu.Portal><DropdownMenu.Content align="end" sideOffset={6} className="z-50 min-w-40 rounded-lg border bg-popover p-1 text-popover-foreground shadow-md">
-                  <DropdownMenu.Item className={action} onSelect={() => setBilling(n)}>续费设置</DropdownMenu.Item>
-                  <DropdownMenu.Item className={action} onSelect={() => togglePublic(n)}>{n.public ? "隐藏节点" : "公开节点"}</DropdownMenu.Item>
-                  <DropdownMenu.Item className={action} onSelect={() => toggleTerminal(n)}>{n.terminal_enabled === false ? "允许节点终端" : "禁用节点终端"}</DropdownMenu.Item>
-                  <DropdownMenu.Item className={action} disabled={terminalControl(n).disabled} onSelect={() => setTerminal(n)}>{terminalControl(n).text}</DropdownMenu.Item>
-                  <DropdownMenu.Item className={action} disabled={!canProvision} onSelect={() => setInstalling(n)}>安装 Agent</DropdownMenu.Item>
-                  <DropdownMenu.Separator className="my-1 h-px bg-border" />
-                  <DropdownMenu.Item className={action} disabled={!!needle || index===0} onSelect={() => moveBy(-1)}>上移</DropdownMenu.Item>
-                  <DropdownMenu.Item className={action} disabled={!!needle || index===order.length-1} onSelect={() => moveBy(1)}>下移</DropdownMenu.Item>
-                  <DropdownMenu.Separator className="my-1 h-px bg-border" />
-                  <DropdownMenu.Item className={`${action} text-destructive`} onSelect={() => setDeleting(n)}>删除节点</DropdownMenu.Item>
-                </DropdownMenu.Content></DropdownMenu.Portal>
-              </DropdownMenu.Root>
-            </div>
-            <Addresses node={n} />
-            {n.network_interfaces?.length ? <p className="text-xs text-muted-foreground">统计网卡：{n.network_interfaces.join(", ")}</p> : null}
-            {n.offline_only && <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground"><span>仅离线升级</span><OfflineUpgradeButton node={n} /></div>}
-            <p className="text-xs text-muted-foreground">本期流量 {n.traffic_incomplete ? "≥ " : ""}{bytes(monthUsage(n))}{n.traffic_incomplete && "（历史不完整）"} · {n.price>0 ? money(n.price,n.currency) : "免费"}</p>
-          </div>
-        })}
-        {visible.length===0 && <p className="p-6 text-center text-sm text-muted-foreground">{needle ? "没有匹配的节点" : "还没有节点，先添加一台服务器"}</p>}
-      </div>
-      <Card className="hidden overflow-x-auto p-0 md:block">
-        <Table>
-          <TableHeader>
-            {/* Percentages, or the address column swallows every spare pixel
-                and pushes status across the table. */}
-            <TableRow>
-              <TableHead className="w-[16%]">名称</TableHead>
-              <TableHead className="w-[18%]">IP</TableHead>
-              <TableHead className="w-[10%]">状态</TableHead>
-              <TableHead className="w-[14%]">流量</TableHead>
-              <TableHead className="w-[8%]">价格</TableHead>
-              <TableHead className="w-[10%]">到期</TableHead>
-              <TableHead className="text-right">操作</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {visible.map((n, index) => (
-              <TableRow
-                key={n.id}
-                style={{ viewTransitionName: `node-${n.id}` }}
-                data-dragging={dragging === n.id || undefined}
-                className="transition-opacity data-[dragging]:opacity-40"
-                onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move" }}
-                onDragEnter={() => dragging !== null && move(order.findIndex((node) => node.id === dragging), index)}
-                onDrop={(e) => { e.preventDefault(); save(order.map((node) => node.id)) }}
-              >
-                <TableCell>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      draggable={!needle}
-                      // A drop sends the order of every node, and a filtered list
-                      // offers only its own rows to drop onto, so the index below
-                      // is the full one exactly while nothing is filtered out.
-                      disabled={!!needle}
-                      className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
-                      title={needle ? "清空搜索后可拖动排序" : "拖动排序"}
-                      aria-label={`拖动 ${n.name} 排序`}
-                      onDragStart={(e) => {
-                        orderBeforeDrag.current = order.map((node) => node.id)
-                        setDragging(n.id)
-                        e.dataTransfer.effectAllowed = "move"
-                        // Firefox refuses to start a drag without a payload.
-                        e.dataTransfer.setData("text/plain", String(n.id))
-                      }}
-                      onDragEnd={(e) => (e.dataTransfer.dropEffect === "none" ? cancel() : save(order.map((node) => node.id)))}
-                      onKeyDown={(e) => {
-                        const delta = e.key === "ArrowUp" ? -1 : e.key === "ArrowDown" ? 1 : 0
-                        if (!delta) return
-                        e.preventDefault()
-                        orderBeforeDrag.current = order.map((node) => node.id)
-                        const ids = move(index, index + delta)
-                        if (ids) save(ids)
-                      }}
-                    >
-                      <GripVertical className="size-4" />
-                    </button>
-                    <div className="min-w-0 font-medium">{n.name}</div>
-                    {n.country && (
-                      <Badge variant="outline" className="shrink-0 font-normal text-muted-foreground">
-                        {n.country}
-                      </Badge>
-                    )}
-                  </div>
-                  {n.offline_only && <div className="ml-8 mt-1"><OfflineUpgradeButton node={n} /></div>}
-                </TableCell>
-                {/* Addresses live only here, never on the public page. */}
-                <TableCell>
-                  <Addresses node={n} />
-            {n.network_interfaces?.length ? <p className="text-xs text-muted-foreground">统计网卡：{n.network_interfaces.join(", ")}</p> : null}
-                </TableCell>
-                <TableCell>
-                  <Badge variant={n.online ? "default" : "secondary"} className="font-normal">
-                    {n.online ? "在线" : "离线"}
-                  </Badge>
-                  {!n.public && <Badge variant="outline" className="ml-1 font-normal">不公开</Badge>}
-                  {n.agent_version && <div className="tnum mt-1 text-xs text-muted-foreground">Cagent {n.agent_version}</div>}
-                  {/* Under the badge, not inside it: the column is a tenth of
-                      the table and the three do not share one line. */}
-                  {!n.online && n.last_seen > 0 && Date.now() / 1000 - n.last_seen >= 60 && (
-                    <div className="tnum mt-1 text-xs text-muted-foreground">
-                      {uptime(Date.now() / 1000 - n.last_seen)}
-                    </div>
-                  )}
-                </TableCell>
-                {/* Counted by the node's own billing rule, as on the public
-                    page. */}
-                <TableCell className="tnum text-sm">
-                  {n.traffic_incomplete ? "≥ " : ""}{bytes(monthUsage(n))}
-                  <span className="text-muted-foreground">
-                    {" / "}{n.traffic_limit > 0 ? bytes(n.traffic_limit) : FOREVER}
-                    {n.traffic_incomplete && <span className="block text-xs">本期历史不完整</span>}
-                  </span>
-                </TableCell>
-                <TableCell className="tnum text-sm">
-                  {n.price > 0 ? money(n.price, n.currency) : "免费"}
-                </TableCell>
-                <TableCell className="text-sm">{n.permanent ? "永久" : n.expires_at || "未设置"}</TableCell>
-                {/* Wraps to a second row before it clips: on a narrow window
-                    the table scrolls only once the icons no longer fit two
-                    across. */}
-                <TableCell className="px-1 text-right">
-                  <div className="flex flex-wrap justify-end">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => togglePublic(n)}
-                    title={n.public ? "在状态页隐藏该节点" : "在状态页显示该节点"}
-                    aria-label={n.public ? "在状态页隐藏该节点" : "在状态页显示该节点"}
-                  >
-                    {n.public ? <Eye /> : <EyeOff className="text-muted-foreground" />}
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    disabled={terminalControl(n).disabled}
-                    onClick={() => setTerminal(n)}
-                    title={terminalControl(n).text}
-                    aria-label={terminalControl(n).text}
-                  >
-                    <TerminalIcon />
-                  </Button>
-                  <Button size="icon" variant="ghost" onClick={() => toggleTerminal(n)} title={n.terminal_enabled === false ? "允许节点终端" : "禁用节点终端"} aria-label={n.terminal_enabled === false ? "允许节点终端" : "禁用节点终端"}><Shield className={n.terminal_enabled === false ? "text-destructive" : ""} /></Button>
-                  <Button variant="ghost" size="icon" disabled={!canProvision} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
-                    <Download />
-                  </Button>
-                  <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="编辑节点" aria-label="编辑节点">
-                    <Pencil />
-                  </Button>
-                  <Button variant="ghost" size="icon" onClick={() => setBilling(n)} title="续费设置" aria-label="续费设置">
-                    <CalendarClock />
-                  </Button>
-                  <Button variant="ghost" size="icon" onClick={() => setDeleting(n)} title="删除节点" aria-label="删除节点">
-                    <Trash2 className="text-destructive" />
-                  </Button>
-                  </div>
-                </TableCell>
-              </TableRow>
-            ))}
-            {nodes.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  还没有节点，右上角添加
-                </TableCell>
-              </TableRow>
-            )}
-            {needle && nodes.length > 0 && !visible.length && (
-              <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  没有匹配的节点
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
-        </Table>
-      </Card>
+    <div className="@container/nodes min-w-0 space-y-4">
+      <header className="flex flex-wrap items-center justify-end gap-2">
+        <h1 className="sr-only">节点管理</h1>
+        <Input type="search" className="mr-auto w-full @min-[38rem]/nodes:w-64"
+          placeholder="搜索名称或地址" aria-label="搜索节点" value={query} onChange={event => setQuery(event.target.value)} />
+        <div className="flex flex-wrap justify-end gap-2">
+          <AgentRollout nodes={nodes} site={site} />
+          <Button variant="outline" disabled={!canProvision} onClick={() => setRegistering(true)}>
+            <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
+          </Button>
+          <Button disabled={!canProvision} onClick={() => setCreating(true)}>
+            <Plus /> 添加节点
+          </Button>
+        </div>
+      </header>
+      {!canProvision && <p className="rounded-lg border bg-muted/50 px-3 py-2 text-sm text-muted-foreground">添加或安装节点需要通过 HTTPS 域名访问面板。</p>}
+      <NodeInventory nodes={nodes} refresh={refresh} canProvision={canProvision} copy={copy} query={query} clearQuery={() => setQuery("")}
+        onCreate={() => setCreating(true)}
+        actions={{
+          edit: setEditing, bill: setBilling, install: setInstalling, terminal: setTerminal,
+          toggleTerminal, togglePublic, remove: setDeleting,
+        }}
+      />
 
       {creating && (
         <CreateNode
@@ -1147,94 +885,110 @@ function Ping({ nodes }: { nodes: Node[] }) {
       return { ...t, nodes: nodes.includes(id) ? nodes.filter((n) => n !== id) : [...nodes, id] }
     })
 
+  const coveredNodes = new Set(tasks.flatMap((task) => task.nodes)).size
+  const selectedCount = editing?.nodes?.length ?? 0
+  const desktopColumns = "lg:grid-cols-[minmax(0,1fr)_minmax(5rem,0.25fr)_minmax(6rem,0.3fr)_auto]"
+
   return (
     <div className="space-y-4">
-      {(error || !loaded) && <LoadState error={error} retry={load} />}
-      <div className="flex justify-end">
+      <header className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">延迟监控</h1>
+          {loaded && !error && (
+            <p className="tnum mt-1 text-sm text-muted-foreground">{tasks.length} 个监控目标 · 已分配至 {coveredNodes} 个节点</p>
+          )}
+        </div>
         <Button onClick={() => openEditor({ name: "", target: "", interval: 60, nodes: [] })}>
           <Plus /> 添加监控
         </Button>
-      </div>
-
-      <Card className="overflow-x-auto p-0">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-[24%]">名称</TableHead>
-              <TableHead className="w-[40%]">目标</TableHead>
-              <TableHead className="w-[12%]">间隔</TableHead>
-              <TableHead className="w-[12%]">节点</TableHead>
-              <TableHead className="text-right">操作</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {tasks.map((t) => (
-              <TableRow key={t.id}>
-                <TableCell className="font-medium">{t.name}</TableCell>
-                <TableCell className="tnum text-sm">{t.target}</TableCell>
-                <TableCell className="tnum text-sm">{t.interval}s</TableCell>
-                <TableCell className="text-sm text-muted-foreground">{t.nodes.length} 个</TableCell>
-                <TableCell className="text-right whitespace-nowrap">
-                  <Button variant="ghost" size="icon" onClick={() => openEditor(t)} title="编辑监控" aria-label="编辑监控"><Pencil /></Button>
-                  <Button variant="ghost" size="icon" onClick={() => setDeleting(t)} title="删除监控" aria-label="删除监控">
-                    <Trash2 className="text-destructive" />
+      </header>
+      {(error || !loaded) && <LoadState error={error} retry={load} />}
+      {tasks.length > 0 && (
+        <Card className="gap-0 overflow-hidden p-0">
+          <div aria-hidden="true" className={`hidden items-center gap-4 border-b bg-muted/50 px-5 py-2.5 text-xs font-medium text-muted-foreground lg:grid ${desktopColumns}`}>
+            <span>监控目标</span><span>探测间隔</span><span>运行节点</span><span className="w-28 text-right">操作</span>
+          </div>
+          <ul aria-label="监控目标" className="divide-y">
+            {tasks.map((task) => (
+              <li key={task.id} className={`grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 px-4 py-3 sm:px-5 lg:gap-x-4 ${desktopColumns}`}>
+                <div className="col-span-2 min-w-0 space-y-1 lg:col-auto">
+                  <h2 className="text-sm font-semibold [overflow-wrap:anywhere]">{task.name}</h2>
+                  <p className="font-mono text-xs leading-relaxed text-muted-foreground [overflow-wrap:anywhere]">{task.target}</p>
+                </div>
+                <div className="tnum flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground lg:contents lg:text-sm">
+                  <span><span className="lg:sr-only">每 </span>{task.interval} 秒</span>
+                  <span className={task.nodes.length ? "lg:text-foreground" : "font-medium"}>
+                    {task.nodes.length ? <>{task.nodes.length} 个节点</> : "未分配节点"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-end gap-1 lg:w-28">
+                  <Button variant="ghost" size="sm" className="h-10" onClick={() => openEditor(task)} aria-label={`编辑监控：${task.name}`}>
+                    <Pencil /> 编辑
                   </Button>
-                </TableCell>
-              </TableRow>
+                  <Button variant="ghost" size="icon" className="size-10 text-muted-foreground hover:bg-destructive/10 hover:text-destructive" onClick={() => setDeleting(task)} title="删除监控" aria-label={`删除监控：${task.name}`}>
+                    <Trash2 />
+                  </Button>
+                </div>
+              </li>
             ))}
-            {loaded && !error && tasks.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">
-                  还没有延迟监控。每个节点独立 TCP 连接目标端口并上报耗时。
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
-        </Table>
-      </Card>
+          </ul>
+        </Card>
+      )}
+      {loaded && !error && tasks.length === 0 && (
+        <Card className="items-center gap-2 px-5 py-10 text-center">
+          <Radio aria-hidden="true" className="size-5 text-muted-foreground" />
+          <p className="text-sm font-medium">还没有延迟监控。</p>
+          <p className="text-sm text-muted-foreground">添加目标并分配节点后，节点会定时上报 TCP 连接耗时。</p>
+        </Card>
+      )}
 
       {editing && (
         <Dialog open onOpenChange={(open) => !open && closeEditor()}>
-          <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
-            <DialogHeader>
+          <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="flex flex-col gap-0 overflow-hidden p-0 sm:max-w-xl">
+            <DialogHeader className="shrink-0 px-5 pt-5 pr-12 pb-4 text-left">
               <DialogTitle>{editing.id ? "编辑监控" : "添加监控"}</DialogTitle>
+              <DialogDescription>设置 TCP 探测目标，并指定哪些节点负责上报。</DialogDescription>
             </DialogHeader>
-            <div className="space-y-5">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="名称">
-                  {/* A new monitor starts empty, so the cursor belongs here;
-                      editing an existing one starts with nothing selected. */}
-                  <Input autoFocus={!editing.id} value={editing.name ?? ""} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="Cloudflare" />
-                </Field>
-                <Field label="间隔（秒）" hint="5–3600">
-                  {/* `|| 60`, as the three other number boxes on this page do:
-                      an emptied `type="number"` reads back as "", and Number("")
-                      is 0 -- which the hub used to clamp into a 5-second probe on
-                      every assigned node. It refuses that now, so this keeps a
-                      cleared box from being a round trip to an error. */}
-                  <Input type="number" min="5" max="3600" value={editing.interval ?? 60} onChange={(e) => setEditing({ ...editing, interval: Number(e.target.value) || 60 })} />
-                </Field>
-              </div>
-              <Field label="目标地址" hint="host:port">
-                <Input value={editing.target ?? ""} onChange={(e) => setEditing({ ...editing, target: e.target.value })} placeholder="1.1.1.1:443" />
-              </Field>
-              <div className="space-y-2">
-                <Label className="text-sm font-medium">运行节点</Label>
-                <div className="max-h-48 space-y-1 overflow-y-auto rounded-lg border bg-muted/20 p-2">
-                  {nodes.map((n) => (
-                    <label key={n.id} className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-sm hover:bg-background">
-                      <input type="checkbox" checked={editing.nodes?.includes(n.id) ?? false} onChange={() => toggle(n.id)} className="accent-primary" />
-                      {n.name}
-                    </label>
-                  ))}
-                  {nodes.length === 0 && <p className="p-2 text-xs text-muted-foreground">先添加节点</p>}
+            <form onSubmit={(event) => { event.preventDefault(); if (!saving) void save() }} className="flex min-h-0 flex-col">
+              <div className="min-h-0 space-y-4 overflow-y-auto px-5 pb-4">
+                <div className="grid grid-cols-[minmax(0,1fr)_6.5rem] gap-4 sm:grid-cols-[minmax(0,1fr)_9rem]">
+                  <Field label="名称">
+                    <Input required autoFocus={!editing.id} value={editing.name ?? ""} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="Cloudflare" />
+                  </Field>
+                  <Field label="间隔（秒）" hint="5–3600 秒">
+                    <Input required type="number" min="5" max="3600" value={editing.interval ?? ""} onChange={(e) => setEditing({ ...editing, interval: e.target.value === "" ? undefined : Number(e.target.value) })} />
+                  </Field>
                 </div>
+                <Field label="目标地址" hint="填写主机和端口。IPv6 示例：[2001:db8::1]:443">
+                  <Input required autoCapitalize="none" spellCheck={false} value={editing.target ?? ""} onChange={(e) => setEditing({ ...editing, target: e.target.value })} placeholder="1.1.1.1:443" />
+                </Field>
+                <fieldset className="min-w-0 border-t pt-3">
+                  <legend className="float-left w-full text-sm font-medium">运行节点</legend>
+                  <div className="clear-both mb-2 flex min-h-9 items-center justify-between gap-2 text-xs text-muted-foreground">
+                    <span className="tnum" aria-live="polite">已选 {selectedCount} / {nodes.length}</span>
+                    {nodes.length > 0 && (
+                      <div className="flex gap-1">
+                        <Button type="button" variant="ghost" size="sm" disabled={selectedCount === nodes.length} onClick={() => setEditing({ ...editing, nodes: nodes.map((node) => node.id) })}>全选</Button>
+                        <Button type="button" variant="ghost" size="sm" disabled={!selectedCount} onClick={() => setEditing({ ...editing, nodes: [] })}>清空</Button>
+                      </div>
+                    )}
+                  </div>
+                  <div className="grid max-h-48 gap-1 overflow-y-auto rounded-lg border bg-muted/20 p-1.5 sm:grid-cols-2">
+                    {nodes.map((n) => (
+                      <label key={n.id} className="flex min-h-10 min-w-0 cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-sm hover:bg-accent has-checked:bg-primary/10 focus-within:ring-2 focus-within:ring-inset focus-within:ring-ring">
+                        <input type="checkbox" checked={editing.nodes?.includes(n.id) ?? false} onChange={() => toggle(n.id)} className="size-4 shrink-0 accent-primary" />
+                        <span className="[overflow-wrap:anywhere]">{n.name}</span>
+                      </label>
+                    ))}
+                    {nodes.length === 0 && <p className="p-2 text-sm text-muted-foreground sm:col-span-2">暂无节点。添加节点后即可分配此监控。</p>}
+                  </div>
+                </fieldset>
               </div>
-            </div>
-            <DialogFooter>
-              <Button variant="ghost" onClick={closeEditor}>取消</Button>
-              <Button onClick={save} disabled={saving}>保存</Button>
-            </DialogFooter>
+              <DialogFooter className="shrink-0 flex-row justify-end border-t px-5 py-3">
+                <Button type="button" variant="ghost" onClick={closeEditor}>取消</Button>
+                <Button type="submit" disabled={saving}>{saving ? "保存中…" : "保存"}</Button>
+              </DialogFooter>
+            </form>
           </DialogContent>
         </Dialog>
       )}
@@ -1338,20 +1092,16 @@ function Themes() {
   if (!themes) return <LoadState error={error} retry={load} />
   return (
     <div className="space-y-4">
+      <h1 className="text-2xl font-semibold tracking-tight">主题</h1>
       {error && <LoadState error={error} retry={load} />}
-      <Card className="gap-4 p-5">
-        <div>
-          <h3 className="text-sm font-medium">安装主题</h3>
+      <Card className="gap-3 p-4 sm:flex-row sm:items-center sm:justify-between sm:gap-6 sm:p-5">
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold">安装主题</h2>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            上传主题作者发布的 <code>theme.tar.gz</code>，同名主题整体替换。
-            <br />
-            主题的 <code>url</code> 指向 GitHub 仓库时，卡片上的 <RefreshCw className="inline size-3" /> 从它最新的
-            release 取 <code>theme.tar.gz</code>，版本没变就不下载。
-            <br />
-            主题代码在访客浏览器中执行，请只安装可信来源。
+            上传可信来源的 <code>theme.tar.gz</code>。同名主题会被替换，主题代码将在访客浏览器中执行。
           </p>
         </div>
-        <div>
+        <div className="shrink-0">
           <Button size="sm" disabled={!!busy} onClick={() => picker.current?.click()}>
             <Upload /> {busy === "upload" ? "安装中…" : "上传主题包"}
           </Button>
@@ -1372,7 +1122,7 @@ function Themes() {
       {/* items-start：有预览图和没有的卡片不该为了等高而留白 */}
       <div className="grid items-start gap-3 sm:grid-cols-2">
         {themes.map((theme) => (
-          <Card key={theme.short} className="gap-4 p-5">
+          <Card key={theme.short} className={`min-w-0 gap-3 p-4 sm:p-5 ${theme.selected ? "border-primary/35" : ""}`}>
             {/* 主题包里可选的 preview.png，所以后端不用告诉前端有没有这张图：
                 没有就是 404，图一直不显示。hidden 挂在 <a> 上而不是 <img> 上——
                 隐藏的是整个链接，否则卡片里留着一个高度为 0 却照样吃 gap-4 的空
@@ -1394,44 +1144,44 @@ function Themes() {
                 className="aspect-video w-full rounded-md border object-cover object-top"
               />
             </button>
-            <div className="flex items-start gap-3">
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <h3 className="font-medium">{theme.name}</h3>
-                  {theme.selected && <Badge>当前</Badge>}
-                  {theme.builtin && <Badge variant="secondary" className="font-normal">内置</Badge>}
-                </div>
-                <p className="mt-1 text-sm text-muted-foreground">{theme.description}</p>
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="min-w-0 break-words font-semibold">{theme.name}</h2>
+                {theme.selected && <Badge>当前</Badge>}
+                {theme.builtin && <Badge variant="secondary" className="font-normal">内置</Badge>}
               </div>
-              <div className="flex shrink-0 items-center gap-1">
-                <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
-                  {theme.selected ? "使用中" : "使用"}
-                </Button>
-                {updatable(theme) && (
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    title="从 GitHub 更新"
-                    disabled={!!busy}
-                    onClick={() => update(theme)}
-                  >
-                    <RefreshCw className={busy === `update:${theme.short}` ? "animate-spin" : ""} />
-                  </Button>
-                )}
-                {/* The built-in theme is served from the binary and has no
-                    directory to delete -- it is also the fallback everything
-                    else lands on. */}
-                {!theme.builtin && (
-                  <Button size="icon" variant="ghost" disabled={!!busy} onClick={() => setDoomed(theme)}>
-                    <Trash2 />
-                  </Button>
-                )}
-              </div>
+              {theme.description && <p className="mt-2 break-words text-sm leading-relaxed">{theme.description}</p>}
+              <p className="mt-1.5 break-words text-xs text-muted-foreground">
+                {[theme.author, theme.version].filter(Boolean).join(" · ")}
+              </p>
             </div>
-            <p className="text-xs text-muted-foreground">
-              {theme.author} · {theme.version}
-              {theme.url && <> · <a className="hover:underline" href={theme.url} target="_blank" rel="noreferrer">源码</a></>}
-            </p>
+            <div className="flex flex-wrap items-center gap-2 border-t pt-3">
+              <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
+                {theme.selected ? "使用中" : "使用"}
+              </Button>
+              {updatable(theme) && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  title="从 GitHub 的最新 Release 检查更新"
+                  aria-label={`从 GitHub 更新 ${theme.name}`}
+                  disabled={!!busy}
+                  onClick={() => update(theme)}
+                >
+                  <RefreshCw className={busy === `update:${theme.short}` ? "animate-spin" : ""} />
+                  更新
+                </Button>
+              )}
+              {/* The built-in theme is served from the binary and has no
+                  directory to delete -- it is also the fallback everything
+                  else lands on. */}
+              {!theme.builtin && (
+                <Button size="icon" variant="ghost" title={`删除 ${theme.name}`} aria-label={`删除 ${theme.name}`} disabled={!!busy} onClick={() => setDoomed(theme)}>
+                  <Trash2 />
+                </Button>
+              )}
+              {theme.url && <a className="ml-auto py-2 text-xs text-muted-foreground underline underline-offset-4 hover:text-foreground" href={theme.url} target="_blank" rel="noreferrer">源码</a>}
+            </div>
           </Card>
         ))}
       </div>
@@ -1540,58 +1290,69 @@ function SettingsTab() {
 
   return (
     <div className="space-y-4">
-      <Card className="gap-4 p-5">
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="站点名称">
-            <Input value={String(s.site_name ?? "")} onChange={(e) => set("site_name", e.target.value)} placeholder="Monitor" />
-          </Field>
-          <Field label="预设筛选标签" hint="每行一个，也可用中英文分号分隔。最多 12 个，每个 32 字，重复项自动合并。按填写顺序显示在国别按钮之前；精确匹配节点标签文字，无需颜色。留空隐藏。">
-            <textarea
-              rows={3}
-              className={TEXTAREA}
-              value={String(s.preset_tag ?? "")}
-              onChange={(e) => set("preset_tag", e.target.value)}
-              placeholder={"例如：游走\n主力\n备用"}
-            />
-          </Field>
-          <Field label="历史数据保留天数" hint="超出的明细自动清理，累计流量不受影响">
-            <Input
-              type="number"
-              value={String(s.retention_days ?? "")}
-              onChange={(e) => set("retention_days", e.target.value)}
-              placeholder="7"
-            />
-          </Field>
-          <Field
-            label="GitHub 代理"
-            hint="留空直连。仅在 hub 自己拉不到 GitHub Release 时填。这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像"
-          >
-            <Input
-              value={String(s.github_proxy ?? "")}
-              onChange={(e) => set("github_proxy", e.target.value)}
-              placeholder="https://ghfast.top"
-            />
-          </Field>
+      <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
+      <Card className="gap-0 overflow-hidden p-0">
+        <div className="grid divide-y lg:grid-cols-2 lg:divide-x lg:divide-y-0">
+          <section aria-labelledby="public-settings-title" className="min-w-0 space-y-5 p-4 sm:p-5">
+            <h2 id="public-settings-title" className="text-sm font-semibold">公开状态页</h2>
+            <Field label="站点名称">
+              <Input value={String(s.site_name ?? "")} onChange={(e) => set("site_name", e.target.value)} placeholder="Monitor" />
+            </Field>
+            <Field label="预设筛选标签" hint="每行一个，也可用中英文分号分隔。最多 12 个，每个 32 字，重复项自动合并。按钮按填写顺序显示在国别之前，精确匹配标签文字。留空隐藏。">
+              <textarea
+                rows={3}
+                className={TEXTAREA}
+                value={String(s.preset_tag ?? "")}
+                onChange={(e) => set("preset_tag", e.target.value)}
+                placeholder={"例如：游走\n主力\n备用"}
+              />
+            </Field>
+            <div className="divide-y border-y">
+              <div className="flex items-center justify-between gap-4 py-3">
+                <div>
+                  <div id="public-page-label" className="text-sm">开放公开状态页</div>
+                  <p id="public-page-hint" className="mt-0.5 text-xs text-muted-foreground">关闭后，所有页面均需登录才能访问。</p>
+                </div>
+                <Switch
+                  aria-labelledby="public-page-label"
+                  aria-describedby="public-page-hint"
+                  checked={s.public_page !== "off"}
+                  onCheckedChange={(v) => set("public_page", v ? "on" : "off")}
+                />
+              </div>
+              <div className="flex items-center justify-between gap-4 py-3">
+                <span id="visitor-card-label" className="text-sm">在状态页底部显示访客信息</span>
+                <Switch
+                  aria-labelledby="visitor-card-label"
+                  checked={s.visitor_card !== "off"}
+                  onCheckedChange={(v) => set("visitor_card", v ? "on" : "off")}
+                />
+              </div>
+            </div>
+          </section>
+          <section aria-labelledby="hub-settings-title" className="min-w-0 space-y-5 p-4 sm:p-5">
+            <h2 id="hub-settings-title" className="text-sm font-semibold">Hub 运行设置</h2>
+            <Field label="历史数据保留天数" hint="超出的明细自动清理，累计流量不受影响">
+              <Input
+                type="number"
+                value={String(s.retention_days ?? "")}
+                onChange={(e) => set("retention_days", e.target.value)}
+                placeholder="7"
+              />
+            </Field>
+            <Field
+              label="GitHub 代理"
+              hint="留空直连。仅在 hub 自己拉不到 GitHub Release 时填。这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像"
+            >
+              <Input
+                value={String(s.github_proxy ?? "")}
+                onChange={(e) => set("github_proxy", e.target.value)}
+                placeholder="https://ghfast.top"
+              />
+            </Field>
+          </section>
         </div>
-        {/* 不是 <label>：点文字不该切换开关，只有开关自己可点。
-            aria-labelledby 保住读屏软件那边的关联。 */}
-        <div className="flex items-center gap-2 text-sm">
-          <Switch
-            aria-labelledby="public-page-label"
-            checked={s.public_page !== "off"}
-            onCheckedChange={(v) => set("public_page", v ? "on" : "off")}
-          />
-          <span id="public-page-label">开放公开状态页，关闭后所有页面需登录</span>
-        </div>
-        <div className="flex items-center gap-2 text-sm">
-          <Switch
-            aria-labelledby="visitor-card-label"
-            checked={s.visitor_card !== "off"}
-            onCheckedChange={(v) => set("visitor_card", v ? "on" : "off")}
-          />
-          <span id="visitor-card-label">状态页底部显示可展开的访客信息</span>
-        </div>
-        <div>
+        <div className="flex justify-end border-t bg-muted/20 px-4 py-3 sm:px-5">
           <Button
             size="sm"
             disabled={saving}
@@ -1768,26 +1529,19 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
   }
 
   return (
-    <div className="space-y-4">
-      <Card className="gap-4 p-5">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <h3 className="text-sm font-medium">通知渠道</h3>
-            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              Telegram 和 Webhook 配了哪个就发哪个，也可以同时用。离线通知在下方按节点打开；流量和到期提醒对填了额度、到期日的节点生效。
-            </p>
-            {!(s.notify_telegram_token_set && text("notify_telegram_chat").trim()) && !s.notify_webhook_url_set && (
-              <p role="alert" className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-                尚未配置通知接收渠道。事件会记录在 Hub 中，但不会送达 Telegram 或 Webhook。
-              </p>
-            )}
-          </div>
-          <Button size="sm" variant="secondary" disabled={testing} onClick={test}>
+    <section className="@container space-y-4">
+        <div className="flex items-center justify-between gap-3">
+          <h1 className="text-2xl font-semibold tracking-tight">通知</h1>
+          <Button size="sm" variant="outline" disabled={testing} onClick={test}>
             <Send /> {testing ? "发送中…" : "发送测试"}
           </Button>
         </div>
-      </Card>
-
+            {!(s.notify_telegram_token_set && text("notify_telegram_chat").trim()) && !s.notify_webhook_url_set && (
+              <p role="alert" className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-300">
+                尚未配置通知接收渠道。事件会记录在 Hub 中，但不会送达 Telegram 或 Webhook。
+              </p>
+            )}
+      <div className="grid items-start gap-4 @4xl:grid-cols-2">
       <ChannelCard title="Telegram" configured={!!s.notify_telegram_token_set && text("notify_telegram_chat") !== ""}>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Bot Token" hint={secretHint("notify_telegram_token")}>
@@ -1882,11 +1636,11 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
         </div>
       </ChannelCard>
 
-      <NotificationHistory />
+      </div>
       <OfflineNodes nodes={nodes} refresh={refresh} />
 
       <Card className="gap-4 p-5">
-        <h3 className="text-sm font-medium">事件</h3>
+        <h2 className="font-semibold">提醒规则</h2>
         <div className="grid gap-4 sm:grid-cols-3">
           <Field label="离线宽限期（分钟）" hint="断开超过这么久才算离线，1–30">
             <Input type="number" min={1} max={30}value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
@@ -1922,7 +1676,8 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           </Button>
         </div>
       </Card>
-    </div>
+      <NotificationHistory />
+    </section>
   )
 }
 
@@ -1984,7 +1739,7 @@ function Sessions() {
             {/* 当前会话没有删除按钮：右上角的退出登录做的就是这件事，而在这里删
                 只会让已经渲染好的面板以为自己还登着。 */}
             {!s.current && (
-              <Button size="icon" variant="ghost" disabled={!!busy} onClick={() => remove(s.id)}>
+              <Button size="icon" variant="ghost" aria-label={`删除 ${new Date(s.created_at * 1000).toLocaleString()} 的会话`} disabled={!!busy} onClick={() => remove(s.id)}>
                 <Trash2 />
               </Button>
             )}
@@ -2006,15 +1761,19 @@ function Security({ site }: { site: string }) {
   const callback = `${site}/api/auth/github/callback`
 
   return (
-    <div className="space-y-4">
-      <Sessions />
-      <TerminalHistory />
+    <section className="@container space-y-4">
+      <h1 className="text-2xl font-semibold tracking-tight">安全</h1>
+      <div className="grid items-start gap-4 @4xl:grid-cols-2">
+        <Sessions />
+        <TerminalHistory />
+      </div>
 
+      <div className="grid items-start gap-4 @4xl:grid-cols-2">
       <Card className="gap-4 p-5">
         <div>
           <h3 className="text-sm font-medium">GitHub 单点登录</h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            OAuth App 回调地址 <code className="rounded bg-muted px-1">{callback}</code>
+            OAuth App 回调地址 <code className="rounded bg-muted px-1 [overflow-wrap:anywhere]">{callback}</code>
           </p>
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
@@ -2086,7 +1845,8 @@ function Security({ site }: { site: string }) {
           </Button>
         </div>
       </Card>
-    </div>
+      </div>
+    </section>
   )
 }
 
@@ -2189,44 +1949,47 @@ function Data() {
   const delay = backup?.scheduler.random_delay?.replace(/min/g, " 分钟").replace(/sec/g, " 秒")
   const backupState = backup?.scheduler.state === "active" ? "已启用" : backup?.scheduler.state === "inactive" ? "已停用" : backup?.scheduler.state === "not_installed" ? "尚未安装定时任务" : "无法确认定时任务状态"
   const stat = (label: string, value: string) => (
-    <div key={label}>
-      <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="tnum mt-0.5 text-sm">{value}</div>
+    <div key={label} className="min-w-0">
+      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dd className="tnum mt-1 break-words text-sm font-medium">{value}</dd>
     </div>
   )
 
   return (
     <div className="space-y-4">
+      <h1 className="text-2xl font-semibold tracking-tight">数据与备份</h1>
       {error && <LoadState error={error} retry={load} />}
-      <Card className="gap-4 p-5" aria-labelledby="scheduled-backup-title">
+      <Card className="gap-4 p-4 sm:p-5" aria-labelledby="scheduled-backup-title">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h3 id="scheduled-backup-title" className="text-sm font-medium">自动备份</h3>
-            <p className="mt-1 text-sm" role="status">{backupState}{backup?.scheduler.state === "active" && !backup.scheduler.boot_enabled ? "（未设置开机启用）" : ""}</p>
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 id="scheduled-backup-title" className="text-sm font-semibold">自动备份</h2>
+            <Badge variant="secondary" role="status" className="whitespace-normal">{backupState}{backup?.scheduler.state === "active" && !backup.scheduler.boot_enabled ? "（未设置开机启用）" : ""}</Badge>
           </div>
           <Button size="sm" variant="secondary" disabled={refreshing || !!busy || !!operation} onClick={load}>
             <RefreshCw className={refreshing ? "animate-spin" : ""} /> {refreshing ? "刷新中…" : "刷新备份状态"}
           </Button>
         </div>
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          {stat("执行时间（服务器时间）", calendar ? `${daily ? `每天 ${daily}` : calendar}${delay && delay !== "0" ? `，最多延后 ${delay}` : ""}` : "暂无计划信息")}
-          {stat("保留策略", backup?.policy ? `最近 ${backup.policy.keep} 份及最近 ${backup.policy.keep} 个备份日期的每日副本` : "等待备份任务上报")}
-          {stat("已有备份", backup?.copies != null ? `${backup.copies} 份` : "无法读取备份目录")}
+        {info.backup_error && <p role="alert" className="break-words rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">最近备份失败：{info.backup_error}</p>}
+        {backup?.stale && <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">备份状态尚未上报或已过期，请检查服务器上的状态上报任务。</p>}
+        <dl className="grid gap-4 rounded-lg bg-muted/45 p-3 sm:grid-cols-3 sm:p-4">
           {stat("最近成功", info.backup_success ? new Date(Number(info.backup_success) * 1000).toLocaleString("zh-CN") : "尚无成功记录")}
           {stat("下次执行（服务器时间）", backup?.scheduler.next_run?.replace(/^\w+ (\d{4}-\d{2}-\d{2}) /, "$1 ") ?? "暂无下次执行时间")}
+          {stat("已有备份", backup?.copies != null ? `${backup.copies} 份` : "无法读取备份目录")}
+        </dl>
+        <dl className="grid gap-4 sm:grid-cols-3">
+          {stat("执行时间（服务器时间）", calendar ? `${daily ? `每天 ${daily}` : calendar}${delay && delay !== "0" ? `，最多延后 ${delay}` : ""}` : "暂无计划信息")}
+          {stat("保留策略", backup?.policy ? `最近 ${backup.policy.keep} 份及最近 ${backup.policy.keep} 个备份日期的每日副本` : "等待备份任务上报")}
           {stat("异机复制", backup?.policy ? backup.policy.offsite ? "已配置" : "未配置，目前仅保存在本机" : "等待备份任务上报")}
-        </div>
-        {info.backup_error && <p role="alert" className="text-sm text-destructive">最近备份失败：{info.backup_error}</p>}
-        {backup?.stale && <p role="alert" className="text-sm text-destructive">备份状态尚未上报或已过期，请检查服务器上的状态上报任务。</p>}
+        </dl>
         {backup?.policy && <p className="break-all text-xs text-muted-foreground">备份目录：<code>{backup.policy.directory}</code></p>}
         <p className="text-xs leading-relaxed text-muted-foreground">
           新备份成功后才清理超出的旧备份；保留份数与历史数据保留天数分别计算。保留策略和目录来自最近一次备份任务。
           {backup?.checked_at != null && <> 服务器时区：{backup.timezone}；最近上报 {new Date(backup.checked_at * 1000).toLocaleTimeString("zh-CN")}。</>} 状态每分钟更新一次。
         </p>
       </Card>
-      <Card className="gap-4 p-5">
-        <h3 className="text-sm font-medium">数据库</h3>
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+      <Card className="gap-4 p-4 sm:p-5">
+        <h2 className="text-sm font-semibold">数据库</h2>
+        <dl className="grid grid-cols-2 gap-4 sm:grid-cols-4">
           {stat("文件大小", bytes(info.size))}
           {stat("预写日志", bytes(info.wal))}
           {stat("可回收空间", bytes(info.free))}
@@ -2235,60 +1998,62 @@ function Data() {
               那次 prune 没在跑。 */}
           {stat("历史跨度", info.oldest ? `${Math.floor((Date.now() / 1000 - info.oldest) / 86400)} 天` : "—")}
           {DB_ROWS.map(([key, label]) => stat(label, (info.rows[key] ?? 0).toLocaleString()))}
-        </div>
-        <p className="truncate text-xs text-muted-foreground" title={info.path}>
-          <code>{info.path}</code>
+        </dl>
+        <p className="break-all border-t pt-3 text-xs text-muted-foreground">
+          数据库路径：<code>{info.path}</code>
         </p>
       </Card>
 
-      <Card className="gap-4 p-5">
-        <div>
-          <h3 className="text-sm font-medium">回收空间</h3>
-          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            按保留天数清掉过期明细，再重建数据库文件把空出来的页还给磁盘（SQLite 的 VACUUM）。
-            重建期间需要与数据库等量的空闲磁盘，过程中面板和上报会短暂变慢。
-          </p>
-        </div>
-        <div>
-          <Button size="sm" variant="secondary" disabled={!!busy || !!operation} onClick={() => setConfirm("vacuum")}>
-            {busy === "vacuum" ? "回收中…" : "立即回收"}
-          </Button>
-        </div>
-      </Card>
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card className="min-w-0 justify-between gap-4 p-4 sm:p-5">
+          <div>
+            <h2 className="text-sm font-semibold">回收空间</h2>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              按保留天数清掉过期明细，再重建数据库文件把空出来的页还给磁盘（SQLite 的 VACUUM）。
+              重建期间需要与数据库等量的空闲磁盘，过程中面板和上报会短暂变慢。
+            </p>
+          </div>
+          <div>
+            <Button size="sm" variant="secondary" disabled={!!busy || !!operation} onClick={() => setConfirm("vacuum")}>
+              {busy === "vacuum" ? "回收中…" : "立即回收"}
+            </Button>
+          </div>
+        </Card>
 
-      <Card className="gap-4 p-5">
-        <div>
-          <h3 className="text-sm font-medium">手动备份与恢复</h3>
-          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            导出的是整个数据库，含节点凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，
-            当前节点、设置、历史全部作废，所有设备需要重新登录。
-            <br />
-            请用这里导出的文件恢复：直接复制 <code>monitor.db</code> 会丢掉预写日志里还没落盘的那部分。
-          </p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          {/* The browser's own download: the file is streamed straight from
-              the response, never held in the page. */}
-          <Button size="sm" asChild>
-            <a href="/api/db/backup" download>
-              <Download /> 导出备份
-            </a>
-          </Button>
-          <Button size="sm" variant="secondary" disabled={!!busy || !!operation} onClick={() => picker.current?.click()}>
-            <Upload /> 导入备份
-          </Button>
-          <input
-            ref={picker}
-            type="file"
-            accept=".db,application/octet-stream"
-            className="hidden"
-            onChange={(e) => {
-              setPending(e.target.files?.[0] ?? null)
-              e.target.value = ""
-            }}
-          />
-        </div>
-      </Card>
+        <Card className="min-w-0 justify-between gap-4 p-4 sm:p-5">
+          <div>
+            <h2 className="text-sm font-semibold">手动备份与恢复</h2>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              导出的是整个数据库，含节点凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，
+              当前节点、设置、历史全部作废，所有设备需要重新登录。
+              <br />
+              请用这里导出的文件恢复：直接复制 <code>monitor.db</code> 会丢掉预写日志里还没落盘的那部分。
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {/* The browser's own download: the file is streamed straight from
+                the response, never held in the page. */}
+            <Button size="sm" asChild>
+              <a href="/api/db/backup" download>
+                <Download /> 导出备份
+              </a>
+            </Button>
+            <Button size="sm" variant="secondary" disabled={!!busy || !!operation} onClick={() => picker.current?.click()}>
+              <Upload /> 导入备份
+            </Button>
+            <input
+              ref={picker}
+              type="file"
+              accept=".db,application/octet-stream"
+              className="hidden"
+              onChange={(e) => {
+                setPending(e.target.files?.[0] ?? null)
+                e.target.value = ""
+              }}
+            />
+          </div>
+        </Card>
+      </div>
 
       {confirm === "vacuum" && (
         <ConfirmDialog
@@ -2342,31 +2107,28 @@ export function Admin({
   site: string
   canProvision: boolean
 }) {
-  const navigation = useRef<HTMLElement>(null)
-  useEffect(() => {
-    const nav = navigation.current
-    const active = nav?.querySelector<HTMLButtonElement>('[aria-current="page"]')
-    if (nav && active && nav.scrollWidth > nav.clientWidth) {
-      nav.scrollLeft += active.getBoundingClientRect().left - nav.getBoundingClientRect().left - 8
-    }
-  }, [path])
   return (
-    <div className="flex flex-col gap-6 md:flex-row">
-      <nav ref={navigation} className="flex gap-1 overflow-x-auto rounded-xl border bg-card p-2 shadow-sm backdrop-blur-md md:w-44 md:shrink-0 md:flex-col md:self-start md:overflow-visible">
+    <div className="flex flex-col gap-5 lg:flex-row lg:gap-6">
+      <nav aria-label="后台导航" className="grid grid-cols-4 gap-1 rounded-xl border bg-card p-1.5 shadow-sm backdrop-blur-md min-[800px]:grid-cols-8 lg:sticky lg:top-20 lg:flex lg:max-h-[calc(100dvh-6rem)] lg:w-40 lg:shrink-0 lg:flex-col lg:self-start lg:overflow-y-auto lg:p-2 xl:w-44">
         {ADMIN_SECTIONS.map(({ path: to, label, icon: Icon }) => {
           const active = path === to
           return (
-            <button
+            <a
               key={to}
-              onClick={() => go(to)}
+              href={to}
+              onClick={(e) => {
+                if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return
+                e.preventDefault()
+                if (!active) go(to)
+              }}
               aria-current={active ? "page" : undefined}
-              className={`flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
-                active ? "bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"
+              className={`flex min-h-10 items-center justify-center gap-1.5 rounded-lg px-1 text-xs whitespace-nowrap transition-colors focus-visible:outline-2 focus-visible:outline-ring min-[460px]:text-sm lg:justify-start lg:gap-2.5 lg:px-3 ${
+                active ? "bg-primary/10 font-semibold text-primary ring-1 ring-inset ring-primary/25 dark:text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground"
               }`}
             >
-              <Icon className="size-4" />
+              <Icon aria-hidden="true" className="hidden size-4 shrink-0 min-[460px]:block min-[800px]:hidden lg:block" />
               {label}
-            </button>
+            </a>
           )
         })}
       </nav>
