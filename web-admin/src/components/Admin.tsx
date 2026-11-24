@@ -87,23 +87,25 @@ function useDirtyGuard(dirty: boolean, busy = false) {
 }
 
 
-function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm }: {
+function ConfirmDialog({ title, description, confirmLabel, busy = false, canCancelWhileBusy = false, onClose, onConfirm }: {
   title: string
   description: string
   confirmLabel: string
   busy?: boolean
+  canCancelWhileBusy?: boolean
   onClose: () => void
   onConfirm: () => void
 }) {
+  const canClose = !busy || canCancelWhileBusy
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="sm:max-w-md">
+    <Dialog open onOpenChange={(open) => !open && canClose && onClose()}>
+      <DialogContent className="sm:max-w-md" showCloseButton={canClose}>
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription className="leading-relaxed">{description}</DialogDescription>
         </DialogHeader>
         <DialogFooter className="border-t pt-4">
-          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button variant="ghost" onClick={onClose} disabled={!canClose}>取消</Button>
           <Button variant="destructive" onClick={onConfirm} disabled={busy}>{confirmLabel}</Button>
         </DialogFooter>
       </DialogContent>
@@ -822,7 +824,11 @@ function Visitors() {
           </Button>
         </div>
       </div>
-      {(error || rows === null) && <LoadState error={error} retry={load} />}
+      {rows === null && <LoadState error={error} retry={load} />}
+      {rows !== null && loading && <p role="status" className="text-sm text-muted-foreground">正在刷新访客记录…</p>}
+      {rows !== null && error && <p role="alert" className="rounded-lg border p-3 text-sm [overflow-wrap:anywhere]">
+        刷新失败，当前显示上次加载的记录。{error}
+      </p>}
       {rows && <Suspense fallback={<p role="status" className="text-sm text-muted-foreground">正在加载访客分布…</p>}>
         <VisitorOverview rows={rows} />
       </Suspense>}
@@ -835,29 +841,60 @@ function Ping({ nodes }: { nodes: Node[] }) {
   const [tasks, setTasks] = useState<PingTask[]>([])
   const [editing, setEditing] = useState<Partial<PingTask> | null>(null)
   const [initialEditing, setInitialEditing] = useState<Partial<PingTask> | null>(null)
-  const openEditor = (value: Partial<PingTask>) => { setInitialEditing(value); setEditing(value) }
+  const [nodeQuery, setNodeQuery] = useState("")
+  const [saveError, setSaveError] = useState("")
+  const nameInput = useRef<HTMLInputElement>(null)
+  const targetInput = useRef<HTMLInputElement>(null)
+  const openEditor = (value: Partial<PingTask>) => {
+    setNodeQuery("")
+    setSaveError("")
+    setInitialEditing(value)
+    setEditing(value)
+  }
   const [deleting, setDeleting] = useState<PingTask | null>(null)
   const [saving, setSaving] = useState(false)
   const [removing, setRemoving] = useState(false)
 
   const [error, setError] = useState("")
   const [loaded, setLoaded] = useState(false)
-  const load = () => { setError(""); return api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => { setTasks(d.tasks); setLoaded(true) }).catch((e: Error) => setError(e.message || "网络错误")) }
+  const latest = useRef(0)
+  const load = async () => {
+    const request = ++latest.current
+    setError("")
+    try {
+      const { tasks } = await api<{ tasks: PingTask[] }>("/ping-tasks")
+      if (request === latest.current) { setTasks(tasks); setLoaded(true) }
+    } catch (e) {
+      if (request === latest.current) setError((e as Error).message || "网络错误")
+    }
+  }
   useEffect(() => { queueMicrotask(load) }, [])
 
   const canClose = useDirtyGuard(editing !== null && JSON.stringify(editing) !== JSON.stringify(initialEditing), saving)
   const closeEditor = () => { if (canClose()) setEditing(null) }
   async function save() {
     if (!editing) return
-    if (!editing.name?.trim() || !editing.target?.trim()) return toast.error("请填写名称和目标")
+    if (!editing.name?.trim()) {
+      setSaveError("请输入监控名称。")
+      nameInput.current?.focus()
+      return
+    }
+    const target = editing.target?.trim() ?? ""
+    const match = /^(?:\[[^\]\s]+\]|[^:[\]\s/]+):(\d+)$/.exec(target)
+    if (!match || Number(match[1]) < 1 || Number(match[1]) > 65535) {
+      setSaveError("请输入主机和 1–65535 之间的端口，例如 example.com:443。IPv6 地址请用方括号包裹。")
+      targetInput.current?.focus()
+      return
+    }
+    setSaveError("")
     setSaving(true)
     try {
       await api("/ping-tasks", { method: "POST", body: JSON.stringify(editing) })
-      toast.success("已保存，正在下发")
+      toast.success(editing.nodes?.length ? "已保存监控分配" : "监控已保存，尚未分配运行节点")
       setEditing(null)
       load()
     } catch (e) {
-      toast.error((e as Error).message)
+      setSaveError((e as Error).message || "保存失败，请重试")
     } finally {
       setSaving(false)
     }
@@ -887,6 +924,17 @@ function Ping({ nodes }: { nodes: Node[] }) {
 
   const coveredNodes = new Set(tasks.flatMap((task) => task.nodes)).size
   const selectedCount = editing?.nodes?.length ?? 0
+  const query = nodeQuery.trim().toLowerCase()
+  const visibleNodes = query ? nodes.filter((node) => node.name.toLowerCase().includes(query)) : nodes
+  const visibleIds = new Set(visibleNodes.map(node => node.id))
+  const selectedVisible = (editing?.nodes ?? []).filter(id => visibleIds.has(id)).length
+  function setVisibleSelection(selected: boolean) {
+    setEditing((task) => {
+      if (!task) return task
+      const assigned = (task.nodes ?? []).filter(id => !visibleIds.has(id))
+      return { ...task, nodes: selected ? [...assigned, ...visibleIds] : assigned }
+    })
+  }
   const desktopColumns = "lg:grid-cols-[minmax(0,1fr)_minmax(5rem,0.25fr)_minmax(6rem,0.3fr)_auto]"
 
   return (
@@ -950,44 +998,56 @@ function Ping({ nodes }: { nodes: Node[] }) {
               <DialogDescription>设置 TCP 探测目标，并指定哪些节点负责上报。</DialogDescription>
             </DialogHeader>
             <form onSubmit={(event) => { event.preventDefault(); if (!saving) void save() }} className="flex min-h-0 flex-col">
-              <div className="min-h-0 space-y-4 overflow-y-auto px-5 pb-4">
+              <div className="min-h-0 overflow-y-auto px-5 pb-4">
+                <fieldset disabled={saving} className="min-w-0 space-y-4">
                 <div className="grid grid-cols-[minmax(0,1fr)_6.5rem] gap-4 sm:grid-cols-[minmax(0,1fr)_9rem]">
                   <Field label="名称">
-                    <Input required autoFocus={!editing.id} value={editing.name ?? ""} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="Cloudflare" />
+                    <Input ref={nameInput} required autoFocus={!editing.id} value={editing.name ?? ""} onChange={(e) => { setSaveError(""); setEditing({ ...editing, name: e.target.value }) }} placeholder="Cloudflare" />
                   </Field>
                   <Field label="间隔（秒）" hint="5–3600 秒">
                     <Input required type="number" min="5" max="3600" value={editing.interval ?? ""} onChange={(e) => setEditing({ ...editing, interval: e.target.value === "" ? undefined : Number(e.target.value) })} />
                   </Field>
                 </div>
                 <Field label="目标地址" hint="填写主机和端口。IPv6 示例：[2001:db8::1]:443">
-                  <Input required autoCapitalize="none" spellCheck={false} value={editing.target ?? ""} onChange={(e) => setEditing({ ...editing, target: e.target.value })} placeholder="1.1.1.1:443" />
+                  <Input ref={targetInput} required autoCapitalize="none" spellCheck={false} value={editing.target ?? ""} onChange={(e) => { setSaveError(""); setEditing({ ...editing, target: e.target.value }) }} placeholder="1.1.1.1:443" />
                 </Field>
                 <fieldset className="min-w-0 border-t pt-3">
                   <legend className="float-left w-full text-sm font-medium">运行节点</legend>
+                  {nodes.length > 8 && <div className="clear-both pt-2">
+                    <Input type="search" value={nodeQuery} aria-label="查找运行节点" placeholder="按节点名称查找"
+                      onChange={event => setNodeQuery(event.target.value)}
+                      onKeyDown={event => { if (event.key === "Enter") event.preventDefault() }} />
+                  </div>}
                   <div className="clear-both mb-2 flex min-h-9 items-center justify-between gap-2 text-xs text-muted-foreground">
-                    <span className="tnum" aria-live="polite">已选 {selectedCount} / {nodes.length}</span>
+                    <span className="tnum" aria-live="polite">已选 {selectedCount} / {nodes.length}{query && ` · 匹配 ${visibleNodes.length}`}</span>
                     {nodes.length > 0 && (
                       <div className="flex gap-1">
-                        <Button type="button" variant="ghost" size="sm" disabled={selectedCount === nodes.length} onClick={() => setEditing({ ...editing, nodes: nodes.map((node) => node.id) })}>全选</Button>
-                        <Button type="button" variant="ghost" size="sm" disabled={!selectedCount} onClick={() => setEditing({ ...editing, nodes: [] })}>清空</Button>
+                        <Button type="button" variant="ghost" size="sm" disabled={selectedVisible === visibleNodes.length} onClick={() => setVisibleSelection(true)}>{query ? "选中匹配" : "全选"}</Button>
+                        <Button type="button" variant="ghost" size="sm" disabled={!selectedVisible} onClick={() => setVisibleSelection(false)}>{query ? "取消匹配" : "清空"}</Button>
                       </div>
                     )}
                   </div>
                   <div className="grid max-h-48 gap-1 overflow-y-auto rounded-lg border bg-muted/20 p-1.5 sm:grid-cols-2">
-                    {nodes.map((n) => (
+                    {visibleNodes.map((n) => (
                       <label key={n.id} className="flex min-h-10 min-w-0 cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-sm hover:bg-accent has-checked:bg-primary/10 focus-within:ring-2 focus-within:ring-inset focus-within:ring-ring">
                         <input type="checkbox" checked={editing.nodes?.includes(n.id) ?? false} onChange={() => toggle(n.id)} className="size-4 shrink-0 accent-primary" />
                         <span className="[overflow-wrap:anywhere]">{n.name}</span>
                       </label>
                     ))}
                     {nodes.length === 0 && <p className="p-2 text-sm text-muted-foreground sm:col-span-2">暂无节点。添加节点后即可分配此监控。</p>}
+                    {nodes.length > 0 && visibleNodes.length === 0 && <p className="p-2 text-sm text-muted-foreground sm:col-span-2">没有匹配的节点，请更换名称。</p>}
                   </div>
+                  {nodes.length > 0 && !selectedCount && <p className="mt-2 text-xs text-muted-foreground">未分配节点时，只保存监控，不会开始探测。</p>}
+                </fieldset>
                 </fieldset>
               </div>
-              <DialogFooter className="shrink-0 flex-row justify-end border-t px-5 py-3">
-                <Button type="button" variant="ghost" onClick={closeEditor}>取消</Button>
-                <Button type="submit" disabled={saving}>{saving ? "保存中…" : "保存"}</Button>
-              </DialogFooter>
+              <div className="shrink-0 border-t px-5 py-3">
+                {saveError && <p role="alert" className="mb-2 max-h-20 overflow-auto text-sm text-destructive [overflow-wrap:anywhere]">{saveError}</p>}
+                <DialogFooter className="flex-row justify-end">
+                  <Button type="button" variant="ghost" onClick={closeEditor} disabled={saving}>取消</Button>
+                  <Button type="submit" disabled={saving}>{saving ? "保存中…" : "保存"}</Button>
+                </DialogFooter>
+              </div>
             </form>
           </DialogContent>
         </Dialog>
@@ -1031,12 +1091,16 @@ function Themes() {
   useEffect(() => { queueMicrotask(load) }, [])
 
   async function select(short: string) {
+    setBusy(`select:${short}`)
     try {
       await api("/settings", { method: "PUT", body: JSON.stringify({ theme: short }) })
       setThemes((old) => old?.map((theme) => ({ ...theme, selected: theme.short === short })) ?? old)
+      dispatchEvent(new Event("cmonitor:site-updated"))
       toast.success("主题已切换")
     } catch (e) {
       toast.error((e as Error).message)
+    } finally {
+      setBusy("")
     }
   }
 
@@ -1047,7 +1111,8 @@ function Themes() {
       // The hub reads a theme from disk on every request, so it is already live;
       // reloading the list only brings this page up to date.
       toast.success(`已安装 ${theme.name} ${theme.version}`)
-      load()
+      dispatchEvent(new Event("cmonitor:site-updated"))
+      await load()
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -1067,7 +1132,10 @@ function Themes() {
         { method: "POST" },
       )
       toast.success(updated ? `${theme.name} 已更新到 ${version}` : `${theme.name} 已是最新版本 ${version}`)
-      if (updated) load()
+      if (updated) {
+        dispatchEvent(new Event("cmonitor:site-updated"))
+        await load()
+      }
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -1080,12 +1148,13 @@ function Themes() {
     try {
       await api(`/themes/${theme.short}`, { method: "DELETE" })
       toast.success(`已删除 ${theme.name}`)
-      load()
+      dispatchEvent(new Event("cmonitor:site-updated"))
+      setDoomed(null)
+      await load()
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
       setBusy("")
-      setDoomed(null)
     }
   }
 
@@ -1156,8 +1225,8 @@ function Themes() {
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2 border-t pt-3">
-              <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
-                {theme.selected ? "使用中" : "使用"}
+              <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected || !!busy || !!error} onClick={() => select(theme.short)}>
+                {busy === `select:${theme.short}` ? "切换中…" : theme.selected ? "使用中" : "使用"}
               </Button>
               {updatable(theme) && (
                 <Button
@@ -1165,18 +1234,18 @@ function Themes() {
                   variant="ghost"
                   title="从 GitHub 的最新 Release 检查更新"
                   aria-label={`从 GitHub 更新 ${theme.name}`}
-                  disabled={!!busy}
+                  disabled={!!busy || !!error}
                   onClick={() => update(theme)}
                 >
                   <RefreshCw className={busy === `update:${theme.short}` ? "animate-spin" : ""} />
-                  更新
+                  {busy === `update:${theme.short}` ? "检查中…" : "检查更新"}
                 </Button>
               )}
               {/* The built-in theme is served from the binary and has no
                   directory to delete -- it is also the fallback everything
                   else lands on. */}
               {!theme.builtin && (
-                <Button size="icon" variant="ghost" title={`删除 ${theme.name}`} aria-label={`删除 ${theme.name}`} disabled={!!busy} onClick={() => setDoomed(theme)}>
+                <Button size="icon" variant="ghost" title={`删除 ${theme.name}`} aria-label={`删除 ${theme.name}`} disabled={!!busy || !!error} onClick={() => setDoomed(theme)}>
                   <Trash2 />
                 </Button>
               )}
@@ -1214,9 +1283,9 @@ function Themes() {
                 ? "这是当前使用的主题，删除后公开页会回到内置的默认主题。"
                 : "主题目录会从磁盘上删掉，重新上传主题包可以装回来。"
           }
-          confirmLabel="删除"
+          confirmLabel={busy === "delete" ? "删除中…" : "删除"}
           busy={!!busy}
-          onClose={() => setDoomed(null)}
+          onClose={() => { if (!busy) setDoomed(null) }}
           onConfirm={() => remove(doomed)}
         />
       )}
@@ -1225,6 +1294,30 @@ function Themes() {
 }
 
 type Settings = Record<string, string | boolean>
+
+const SECRET_FLAGS: Record<string, string> = {
+  notify_telegram_token: "notify_telegram_token_set",
+  notify_webhook_url: "notify_webhook_url_set",
+  notify_webhook_headers: "notify_webhook_headers_set",
+  github_client_secret: "github_secret_set",
+}
+
+// When the write succeeds but the following read fails, keep only what that
+// write confirms. Passwords and tokens never become saved form values.
+function confirmedSettings(patch: Record<string, string>): Settings {
+  const confirmed: Settings = {}
+  for (const [key, value] of Object.entries(patch)) {
+    const flag = SECRET_FLAGS[key]
+    confirmed[key] = flag || key === "admin_password" ? "" : value
+    if (flag) confirmed[flag] = !!value
+  }
+  if (["github_client_id", "github_client_secret", "github_allowed_users"].some(key => key in patch)) {
+    confirmed.github_ready = false
+    confirmed.github_verified = false
+    confirmed.github_status_unknown = true
+  }
+  return confirmed
+}
 
 // Two pages write settings, and each loads only what it displays.
 function useSettings() {
@@ -1235,9 +1328,11 @@ function useSettings() {
   const [baseline, setBaseline] = useState<Settings | null>(null)
   const load = () => { setError(""); api<Settings>("/settings").then(data => { setBaseline(data); setS(data) }).catch((e: Error) => setError(e.message || "网络错误")) }
   useEffect(() => { queueMicrotask(load) }, [])
-  useDirtyGuard(s !== null && JSON.stringify(s) !== JSON.stringify(baseline), saving)
+  const dirtyKeys = new Set(Object.keys(s ?? {}).filter(key => (s?.[key] ?? "") !== (baseline?.[key] ?? "")))
+  const dirty = dirtyKeys.size > 0
+  useDirtyGuard(dirty, saving)
   return {
-    s, saving, error, load,
+    s, saving, error, load, baseline, dirty, dirtyKeys,
     set: (k: string, v: string) => setS((old) => ({ ...(old ?? {}), [k]: v })),
     save: async (patch: Record<string, string>) => {
       if (inFlight.current) return false
@@ -1246,32 +1341,34 @@ function useSettings() {
       try {
         const result = await api<{ reauth_required?: boolean }>("/settings", { method: "PUT", body: JSON.stringify(patch) })
         if (result.reauth_required) {
-          location.assign("/clara")
+          dispatchEvent(new Event("cmonitor:reauth-required"))
           return true
         }
-        toast.success("已保存")
         // Only the saved keys and the `*_set` flags are taken from the hub: a
         // credential comes back as a flag, so the typed value must not linger,
         // while another card's unsaved edits on the same page must survive.
-        const fresh = await api<Settings>("/settings").catch(() => {
-          toast.info("设置已保存，最新状态读取失败，请刷新页面确认")
-          const known: Settings = { ...s, ...patch }
-          for (const key of ["notify_telegram_token","notify_webhook_url","notify_webhook_headers","github_secret"]) {
-            if (key in patch) { known[key] = ""; known[`${key}_set`] = !!patch[key] }
+        let confirmed: Settings
+        try {
+          const fresh = await api<Settings>("/settings")
+          confirmed = Object.fromEntries(Object.keys(patch).map(key => [key, fresh[key] ?? ""]))
+          confirmed.github_status_unknown = false
+          for (const [key, value] of Object.entries(fresh)) {
+            if (key.endsWith("_set") || ["github_ready","github_verified","password_login"].includes(key)) confirmed[key] = value
           }
-          return known
-        })
-        setBaseline(old => {
-          const next = { ...old, ...Object.fromEntries(Object.keys(patch).map(key => [key, fresh[key]])) }
-          for (const [key,value] of Object.entries(fresh)) if (key.endsWith("_set") || ["github_ready","github_verified","password_login"].includes(key)) next[key] = value
-          return next
-        })
+          toast.success("已保存")
+        } catch {
+          confirmed = confirmedSettings(patch)
+          toast.info("设置已保存，最新状态读取失败，请刷新页面确认")
+        }
+        setBaseline(old => ({ ...old, ...confirmed }))
         setS((old) => {
           const next = { ...old }
-          for (const key of Object.keys(patch)) next[key] = fresh[key]
-          for (const [key, value] of Object.entries(fresh)) if (key.endsWith("_set") || ["github_ready", "github_verified", "password_login"].includes(key)) next[key] = value
+          for (const [key,value] of Object.entries(confirmed)) {
+            if (!(key in patch) || old?.[key] === s?.[key]) next[key] = value
+          }
           return next
         })
+        if ("site_name" in patch || "public_page" in patch) dispatchEvent(new Event("cmonitor:site-updated"))
         return true
       } catch (e) {
         toast.error((e as Error).message)
@@ -1285,13 +1382,18 @@ function useSettings() {
 }
 
 function SettingsTab() {
-  const { s, set, save, saving, error, load } = useSettings()
+  const { s, set, save, saving, dirty, dirtyKeys, error, load } = useSettings()
   if (!s) return <LoadState error={error} retry={load} />
 
   return (
     <div className="space-y-4">
       <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
       <Card className="gap-0 overflow-hidden p-0">
+        <form onSubmit={event => {
+          event.preventDefault()
+          const patch = Object.fromEntries([...dirtyKeys].map(key => [key, String(s[key] ?? "").trim()]))
+          if (dirty) void save(patch)
+        }}>
         <div className="grid divide-y lg:grid-cols-2 lg:divide-x lg:divide-y-0">
           <section aria-labelledby="public-settings-title" className="min-w-0 space-y-5 p-4 sm:p-5">
             <h2 id="public-settings-title" className="text-sm font-semibold">公开状态页</h2>
@@ -1332,9 +1434,10 @@ function SettingsTab() {
           </section>
           <section aria-labelledby="hub-settings-title" className="min-w-0 space-y-5 p-4 sm:p-5">
             <h2 id="hub-settings-title" className="text-sm font-semibold">Hub 运行设置</h2>
-            <Field label="历史数据保留天数" hint="超出的明细自动清理，累计流量不受影响">
+            <Field label="历史数据保留天数" hint="可保留 1–3650 天。超期明细自动清理，累计流量不受影响。">
               <Input
                 type="number"
+                min={1} max={3650} step={1} required
                 value={String(s.retention_days ?? "")}
                 onChange={(e) => set("retention_days", e.target.value)}
                 placeholder="7"
@@ -1345,6 +1448,7 @@ function SettingsTab() {
               hint="留空直连。仅在 hub 自己拉不到 GitHub Release 时填。这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像"
             >
               <Input
+                type="url" pattern="https://.+" title="请输入以 https:// 开头的地址，或留空以直连 GitHub"
                 value={String(s.github_proxy ?? "")}
                 onChange={(e) => set("github_proxy", e.target.value)}
                 placeholder="https://ghfast.top"
@@ -1352,27 +1456,13 @@ function SettingsTab() {
             </Field>
           </section>
         </div>
-        <div className="flex justify-end border-t bg-muted/20 px-4 py-3 sm:px-5">
-          <Button
-            size="sm"
-            disabled={saving}
-            onClick={() =>
-              save({
-                site_name: String(s.site_name ?? ""),
-                preset_tag: String(s.preset_tag ?? "").trim(),
-                // `||` rather than `??`: the hub returns "" for an unset key
-                // rather than null, and "" is the one value this key's write path
-                // refuses.
-                retention_days: String(s.retention_days || "7"),
-                github_proxy: String(s.github_proxy ?? ""),
-                public_page: s.public_page === "off" ? "off" : "on",
-                visitor_card: s.visitor_card === "off" ? "off" : "on",
-              })
-            }
-          >
-            保存站点设置
+        <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-2 border-t bg-muted/20 px-4 py-3 sm:px-5">
+          {dirty && <span className="text-xs text-muted-foreground">有未保存的修改</span>}
+          <Button size="sm" type="submit" disabled={saving || !dirty}>
+            {saving ? "保存中…" : "保存站点设置"}
           </Button>
         </div>
+        </form>
       </Card>
     </div>
   )
@@ -1420,16 +1510,16 @@ function TemplatePreview({ template, site, json = false }: { template: string; s
 
 // A channel's form, collapsed until needed. The summary carries whether the
 // channel is configured, so the closed card still answers the common question.
-function ChannelCard({ title, configured, children }: { title: string; configured: boolean; children: React.ReactNode }) {
+function ChannelCard({ title, configured, dirty, children }: { title: string; configured: boolean; dirty: boolean; children: React.ReactNode }) {
   return (
     <Card className="p-5">
       <details className="group">
-        <summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded-md outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+        <summary className="flex min-h-9 cursor-pointer list-none items-center justify-between gap-3 rounded-md outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
           <span className="flex items-center gap-2 text-sm font-medium">
             <ChevronRight className="size-4 text-muted-foreground transition-transform group-open:rotate-90" />
             {title}
           </span>
-          <Badge variant={configured ? "secondary" : "outline"}>{configured ? "已配置" : "未配置"}</Badge>
+          <Badge variant={configured ? "secondary" : "outline"}>{dirty ? "待保存" : configured ? "已配置" : "未配置"}</Badge>
         </summary>
         <div className="mt-4 space-y-4">{children}</div>
       </details>
@@ -1443,17 +1533,22 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
   const [busy, setBusy] = useState(false)
 
   async function apply(targets: Node[], on: boolean) {
+    const changed = targets.filter(node => !!node.notify !== on)
+    if (!changed.length) return
     setBusy(true)
     try {
       // Awaited in turn, the requests would cost one round trip per node, and
       // the two-second stream would render each one as it lands.
-      await Promise.all(
-        targets
-          .filter((n) => !!n.notify !== on)
-          .map((n) => api(`/nodes/${n.id}`, { method: "PUT", body: JSON.stringify({ notify: on }) })),
-      )
-    } catch (e) {
-      toast.error((e as Error).message)
+      const results = await Promise.allSettled(changed.map(node =>
+        api(`/nodes/${node.id}`, { method: "PUT", body: JSON.stringify({ notify: on }) })
+      ))
+      const failed = changed.filter((_, i) => results[i].status === "rejected")
+      if (failed.length) {
+        const names = failed.slice(0, 3).map(node => node.name).join("、")
+        toast.error(`${failed.length} 台未能更新离线通知`, { description: names + (failed.length > 3 ? " 等" : "") + "。请重试。" })
+      } else {
+        toast.success(`已${on ? "打开" : "关闭"} ${changed.length} 台节点的离线通知`)
+      }
     } finally {
       refresh()
       setBusy(false)
@@ -1463,10 +1558,10 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
   const enabled = nodes.filter((n) => n.notify).length
   return (
     <Card className="gap-4 p-5">
-      <div className="flex flex-wrap items-start justify-between gap-3">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 flex-1">
-          <h3 className="text-sm font-medium">离线通知</h3>
-          <p className="mt-1 text-xs text-muted-foreground">按节点打开，默认关。已打开 {enabled} / {nodes.length} 台</p>
+          <h2 className="text-sm font-medium">离线通知</h2>
+          <p className="mt-1 text-xs text-muted-foreground">{nodes.length ? `已打开 ${enabled} / ${nodes.length} 台，开关立即生效。` : "添加节点后，可在这里开启离线通知。"}</p>
         </div>
         <div className="flex gap-2">
           <Button size="sm" variant="secondary" disabled={busy || enabled === nodes.length} onClick={() => apply(nodes, true)}>全部打开</Button>
@@ -1474,11 +1569,11 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
         </div>
       </div>
       {nodes.length > 0 && (
-        <div className="grid max-h-64 gap-x-6 gap-y-2 overflow-y-auto sm:grid-cols-2">
+        <div className="grid max-h-64 grid-cols-1 gap-x-6 gap-y-1 overflow-y-auto sm:grid-cols-2">
           {nodes.map((node) => (
-            <label key={node.id} className="flex cursor-pointer items-center justify-between gap-3 text-sm">
-              <span className="truncate">{node.name}</span>
-              <Switch checked={!!node.notify} disabled={busy} onCheckedChange={(v) => apply([node], v)} />
+            <label key={node.id} htmlFor={`notify-node-${node.id}`} className="flex min-h-10 min-w-0 cursor-pointer items-center justify-between gap-3 text-sm">
+              <span className="truncate" title={node.name}>{node.name}</span>
+              <Switch id={`notify-node-${node.id}`} checked={!!node.notify} disabled={busy} onCheckedChange={(v) => apply([node], v)} />
             </label>
           ))}
         </div>
@@ -1489,25 +1584,71 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
 
 type Delivery = { id: string; title: string; created_at: number; channel: string; status: string; attempts: number; last_error: string }
 function NotificationHistory() {
-  const [items,setItems] = useState<Delivery[] | null>(null)
-  const [error,setError] = useState("")
-  const [busy,setBusy] = useState("")
-  const load = () => { setError(""); api<{ items: Delivery[] }>("/notify/history").then(d => setItems(d.items)).catch((e: Error) => setError(e.message || "网络错误")) }
-  useEffect(() => { queueMicrotask(load); const timer=setInterval(load,15000); return () => clearInterval(timer) },[])
+  const [items, setItems] = useState<Delivery[] | null>(null)
+  const [error, setError] = useState("")
+  const [busy, setBusy] = useState("")
+  const [loading, setLoading] = useState(true)
+  const [revision, setRevision] = useState(0)
+  function load() {
+    setLoading(true)
+    setRevision(previous => previous + 1)
+  }
+  useEffect(() => {
+    const controller = new AbortController()
+    const { signal } = controller
+    let timer: ReturnType<typeof setTimeout> | undefined
+    api<{ items: Delivery[] }>("/notify/history", { signal })
+      .then(data => { if (!signal.aborted) { setItems(data.items); setError("") } })
+      .catch((e: Error) => { if (!signal.aborted) setError(e.message || "网络错误") })
+      .finally(() => {
+        if (!signal.aborted) {
+          setLoading(false)
+          timer = setTimeout(load, 15000)
+        }
+      })
+    return () => { controller.abort(); clearTimeout(timer) }
+  }, [revision])
+  async function retry(id: string) {
+    setBusy(id)
+    try {
+      await api(`/notify/${id}/retry`, { method: "POST" })
+      toast.success("此条通知的失败渠道已加入重试队列")
+      load()
+    } catch (e) { toast.error((e as Error).message) }
+    finally { setBusy("") }
+  }
   return <Card className="gap-3 p-5">
-    <div className="flex items-center justify-between gap-3"><h3 className="text-sm font-medium">最近投递记录</h3><Button size="sm" variant="ghost" onClick={load}>刷新</Button></div>
+    <div className="flex items-center justify-between gap-3">
+      <h2 className="text-sm font-medium">最近投递记录</h2>
+      <Button size="sm" variant="ghost" disabled={loading} onClick={load}>{loading ? "刷新中…" : "刷新"}</Button>
+    </div>
     {(error || !items) && <LoadState error={error} retry={load} />}
-    {items?.length===0 && <p className="text-sm text-muted-foreground">还没有投递记录。配置渠道并开启节点通知后，事件会保存在这里。</p>}
-    <div className="max-h-96 divide-y overflow-y-auto">{items?.map(item => <div key={`${item.id}:${item.channel}`} className="flex items-start gap-3 py-3">
-      <div className="min-w-0 flex-1"><p className="break-words text-sm">{item.title}</p><p className="mt-1 text-xs text-muted-foreground">{new Date(item.created_at*1000).toLocaleString("zh-CN")} · {item.channel} · {{pending:"等待重试",delivered:"接收端已接受",failed:"投递失败"}[item.status] || item.status} · 尝试 {item.attempts} 次</p>{item.last_error && <p className="mt-1 break-words text-xs text-destructive">{item.last_error}</p>}</div>
-      {item.status==="failed" && <Button size="sm" variant="outline" disabled={!!busy} onClick={async () => { setBusy(item.id); try { await api(`/notify/${item.id}/retry`,{method:"POST"}); load() } catch(e) { toast.error((e as Error).message) } finally { setBusy("") } }}>重试</Button>}
-    </div>)}</div>
+    {items?.length === 0 && !error && <p className="text-sm text-muted-foreground">还没有投递记录。通知送往渠道后，可在这里查看结果。</p>}
+    {!!items?.length && <ul className="max-h-96 divide-y overflow-y-auto">
+      {items.map((item, index) => {
+        const failed = item.status === "failed"
+        const status = failed ? "投递失败" : item.status === "delivered" ? "接收端已接受" :
+          item.status === "pending" ? (item.attempts ? "等待重试" : "等待投递") : item.status
+        // The Hub retries all failed channels for an event in one request.
+        const canRetry = failed && !items.slice(0, index).some(row => row.id === item.id && row.status === "failed")
+        return <li key={`${item.id}:${item.channel}`} className="space-y-1.5 py-3 text-sm">
+          <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+            <span className="min-w-0 [overflow-wrap:anywhere]">{item.title}</span>
+            <span className={`text-xs ${failed ? "text-destructive" : "text-muted-foreground"}`}>{status}</span>
+          </div>
+          <p className="text-xs text-muted-foreground">{new Date(item.created_at * 1000).toLocaleString("zh-CN")} · {item.channel} · 尝试 {item.attempts} 次</p>
+          {item.last_error && <p className="text-xs text-destructive [overflow-wrap:anywhere]">{item.last_error}</p>}
+          {canRetry && <Button size="sm" variant="outline" disabled={loading || !!busy || !!error} onClick={() => retry(item.id)}>{busy === item.id ? "提交中…" : "重试失败渠道"}</Button>}
+        </li>
+      })}
+    </ul>}
   </Card>
 }
 
 function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
-  const { s, set, save, error, load } = useSettings()
+  const { s, set, save, saving, baseline, dirtyKeys, error, load } = useSettings()
   const [testing, setTesting] = useState(false)
+  const [clear, setClear] = useState<"telegram" | "webhook" | "headers" | null>(null)
   if (!s) return <LoadState error={error} retry={load} />
   const text = (k: string) => String(s[k] ?? "")
   // A credential is sent only when something was typed: the field starts empty
@@ -1515,6 +1656,19 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
   const typed = (...keys: string[]) =>
     Object.fromEntries(keys.filter((k) => typeof s[k] === "string" && s[k] !== "").map((k) => [k, text(k)]))
   const secretHint = (k: string) => (s[`${k}_set`] ? "已设置，留空不变" : "未设置")
+  const dirty = [...dirtyKeys]
+  const telegramDirty = dirty.some(key => key.startsWith("notify_telegram_"))
+  const webhookDirty = dirty.some(key => key.startsWith("notify_webhook_"))
+  const ruleKeys = dirty.filter(key => !key.startsWith("notify_telegram_") && !key.startsWith("notify_webhook_"))
+  const telegramReady = !!baseline?.notify_telegram_token_set && !!String(baseline.notify_telegram_chat ?? "").trim()
+  const webhookReady = !!baseline?.notify_webhook_url_set
+  const testHint = telegramDirty || webhookDirty ? "请先保存渠道修改，再发送测试。" :
+    !telegramReady && !webhookReady ? "配置并保存至少一个通知渠道后，可发送测试。" : ""
+  const clearActions = {
+    telegram: { title: "清除 Telegram 渠道", description: "将移除已保存的 Bot Token 和 Chat ID，并停止向 Telegram 投递通知。", patch: { notify_telegram_token: "", notify_telegram_chat: "" } },
+    webhook: { title: "清除 Webhook 渠道", description: "将移除已保存的 URL 和请求头，并停止向 Webhook 投递通知。", patch: { notify_webhook_url: "", notify_webhook_headers: "" } },
+    headers: { title: "清除请求头", description: "Webhook 将不再携带自定义请求头。", patch: { notify_webhook_headers: "" } },
+  } satisfies Record<string, { title: string; description: string; patch: Record<string, string> }>
 
   async function test() {
     setTesting(true)
@@ -1532,17 +1686,13 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
     <section className="@container space-y-4">
         <div className="flex items-center justify-between gap-3">
           <h1 className="text-2xl font-semibold tracking-tight">通知</h1>
-          <Button size="sm" variant="outline" disabled={testing} onClick={test}>
+          <Button size="sm" variant="outline" disabled={testing || saving || !!testHint} aria-describedby={testHint ? "notify-test-hint" : undefined} onClick={test}>
             <Send /> {testing ? "发送中…" : "发送测试"}
           </Button>
         </div>
-            {!(s.notify_telegram_token_set && text("notify_telegram_chat").trim()) && !s.notify_webhook_url_set && (
-              <p role="alert" className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-300">
-                尚未配置通知接收渠道。事件会记录在 Hub 中，但不会送达 Telegram 或 Webhook。
-              </p>
-            )}
+      {testHint && <p id="notify-test-hint" role="status" className="rounded-lg border px-4 py-3 text-sm text-muted-foreground">{testHint}</p>}
       <div className="grid items-start gap-4 @4xl:grid-cols-2">
-      <ChannelCard title="Telegram" configured={!!s.notify_telegram_token_set && text("notify_telegram_chat") !== ""}>
+      <ChannelCard title="Telegram" configured={telegramReady} dirty={telegramDirty}>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Bot Token" hint={secretHint("notify_telegram_token")}>
             <Input
@@ -1561,9 +1711,10 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           <textarea rows={3} className={TEXTAREA} value={text("notify_telegram_text")} onChange={(e) => set("notify_telegram_text", e.target.value)} />
         </Field>
         <TemplatePreview template={text("notify_telegram_text")} site={text("site_name") || "Monitor"} />
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <Button
             size="sm"
+            disabled={saving || testing || !telegramDirty}
             onClick={() =>
               save({
                 notify_telegram_chat: text("notify_telegram_chat"),
@@ -1575,14 +1726,14 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
             保存 Telegram
           </Button>
           {s.notify_telegram_token_set && (
-            <Button size="sm" variant="ghost" onClick={() => save({ notify_telegram_token: "", notify_telegram_chat: "" })}>
-              清除
+            <Button size="sm" variant="ghost" disabled={saving || testing} onClick={() => setClear("telegram")}>
+              清除渠道
             </Button>
           )}
         </div>
       </ChannelCard>
 
-      <ChannelCard title="Webhook" configured={!!s.notify_webhook_url_set}>
+      <ChannelCard title="Webhook" configured={webhookReady} dirty={webhookDirty}>
         <Field label="接收渠道" hint="自动识别官方域名；自建中转请明确选择渠道。通用 HTTP 仅确认接收端返回成功。">
           <select className="w-full rounded-md border bg-background px-3 py-2 text-sm" value={text("notify_webhook_kind") || "auto"} onChange={e => set("notify_webhook_kind", e.target.value)}>
             <option value="auto">自动识别</option><option value="http">通用 HTTP</option><option value="wecom">企业微信</option><option value="dingtalk">钉钉</option><option value="feishu">飞书 / Lark</option>
@@ -1592,7 +1743,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           <Input value={text("notify_webhook_success_path")} onChange={e => set("notify_webhook_success_path", e.target.value)} placeholder="/code" />
         </Field>
         <Field label="预期 JSON 值" hint='例如 0、true 或 "ok"'>
-          <Input value={text("notify_webhook_success_value") || "0"} onChange={e => set("notify_webhook_success_value", e.target.value)} />
+          <Input value={text("notify_webhook_success_value")} placeholder="0" onChange={e => set("notify_webhook_success_value", e.target.value)} />
         </Field>
         <Field label="URL" hint={secretHint("notify_webhook_url")}>
           <Input
@@ -1616,21 +1767,22 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           <textarea rows={4} className={TEXTAREA} value={text("notify_webhook_body")} onChange={(e) => set("notify_webhook_body", e.target.value)} />
         </Field>
         <TemplatePreview template={text("notify_webhook_body")} site={text("site_name") || "Monitor"} json />
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <Button
             size="sm"
+            disabled={saving || testing || !webhookDirty}
             onClick={() => save({ notify_webhook_kind: text("notify_webhook_kind") || "auto", notify_webhook_success_path: text("notify_webhook_success_path"), notify_webhook_success_value: text("notify_webhook_success_value") || "0", notify_webhook_body: text("notify_webhook_body"), ...typed("notify_webhook_url", "notify_webhook_headers") })}
           >
             保存 Webhook
           </Button>
           {s.notify_webhook_headers_set && (
-            <Button size="sm" variant="ghost" onClick={() => save({ notify_webhook_headers: "" })}>
+            <Button size="sm" variant="ghost" disabled={saving || testing} onClick={() => setClear("headers")}>
               清除请求头
             </Button>
           )}
           {s.notify_webhook_url_set && (
-            <Button size="sm" variant="ghost" onClick={() => save({ notify_webhook_url: "", notify_webhook_headers: "" })}>
-              清除
+            <Button size="sm" variant="ghost" disabled={saving || testing} onClick={() => setClear("webhook")}>
+              清除渠道
             </Button>
           )}
         </div>
@@ -1640,43 +1792,44 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
       <OfflineNodes nodes={nodes} refresh={refresh} />
 
       <Card className="gap-4 p-5">
+        <form className="space-y-4" onSubmit={event => {
+          event.preventDefault()
+          if (ruleKeys.length) void save(Object.fromEntries(ruleKeys.map(key => [key,text(key)])))
+        }}>
         <h2 className="font-semibold">提醒规则</h2>
         <div className="grid gap-4 sm:grid-cols-3">
           <Field label="离线宽限期（分钟）" hint="断开超过这么久才算离线，1–30">
-            <Input type="number" min={1} max={30}value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
+            <Input type="number" required min={1} max={30} value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
           </Field>
           <Field label="流量提醒（%）" hint="本期用量达到该比例和 100% 时各提醒一次，0 关闭">
-            <Input type="number" min={0} max={100} value={text("notify_traffic")} onChange={(e) => set("notify_traffic", e.target.value)} />
+            <Input type="number" required min={0} max={100} value={text("notify_traffic")} onChange={(e) => set("notify_traffic", e.target.value)} />
           </Field>
           <Field label="到期提醒（天）" hint="每天 9 点汇总这么多天内到期的节点，0 关闭">
-            <Input type="number" min={0} max={365} value={text("notify_expiry")} onChange={(e) => set("notify_expiry", e.target.value)} />
+            <Input type="number" required min={0} max={365} value={text("notify_expiry")} onChange={(e) => set("notify_expiry", e.target.value)} />
           </Field>
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
-          {[["notify_disk_percent","磁盘告警阈值（%）","0 关闭；恢复阈值低 5 个百分点"],["notify_disk_minutes","磁盘持续时间（分钟）","达到阈值并持续这么久才提醒"],["notify_ping_failures","TCP 连续失败次数","0 关闭；成功后发恢复通知"],["notify_cooldown","重复告警冷却（分钟）","恢复后再次异常的最短提醒间隔"]].map(([key,label,hint]) => <Field key={key} label={label} hint={hint}><Input type="number" min={0} value={text(key)} onChange={e => set(key,e.target.value)} /></Field>)}
+          {([
+            ["notify_disk_percent","磁盘告警阈值（%）","0 关闭；恢复阈值低 5 个百分点",0,100],
+            ["notify_disk_minutes","磁盘持续时间（分钟）","达到阈值并持续 1–120 分钟才提醒",1,120],
+            ["notify_ping_failures","TCP 连续失败次数","最多 20 次，0 关闭；成功后发恢复通知",0,20],
+            ["notify_cooldown","重复告警冷却（分钟）","恢复后再次提醒的间隔，1–1440 分钟",1,1440],
+          ] as const).map(([key,label,hint,min,max]) => <Field key={key} label={label} hint={hint}><Input type="number" required min={min} max={max} value={text(key)} onChange={e => set(key,e.target.value)} /></Field>)}
         </div>
         <div className="flex items-center gap-2 text-sm">
           <Switch aria-labelledby="notify-login-label" checked={s.notify_login !== "off"} onCheckedChange={(v) => set("notify_login", v ? "on" : "off")} />
           <span id="notify-login-label">登录后台时提醒</span>
         </div>
         <div>
-          <Button
-            size="sm"
-            onClick={() =>
-              save({
-                notify_grace: text("notify_grace"),
-                notify_traffic: text("notify_traffic"),
-                notify_expiry: text("notify_expiry"),
-                ...Object.fromEntries(["notify_disk_percent","notify_disk_minutes","notify_ping_failures","notify_cooldown"].map(key => [key,text(key)])),
-                notify_login: s.notify_login === "off" ? "off" : "on",
-              })
-            }
-          >
-            保存事件设置
-          </Button>
+          <Button size="sm" type="submit" disabled={saving || !ruleKeys.length}>保存提醒规则</Button>
         </div>
+        </form>
       </Card>
       <NotificationHistory />
+      {clear && <ConfirmDialog title={clearActions[clear].title + "？"} description={clearActions[clear].description}
+        confirmLabel={saving ? "清除中…" : clearActions[clear].title} busy={saving}
+        onClose={() => { if (!saving) setClear(null) }}
+        onConfirm={async () => { if (await save(clearActions[clear].patch)) setClear(null) }} />}
     </section>
   )
 }
@@ -1685,103 +1838,144 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
 // and the password that works when GitHub does not.
 type Session = { id: string; current: boolean; created_at: number }
 
+type TerminalEvent = { ts: number; actor: string; node_id: number; action: string; correlation: string }
+const TERMINAL_ACTIONS: Record<string, string> = {
+  open_requested: "请求开启", ready: "已连接", agent_error: "节点拒绝", closed: "已关闭",
+  enabled: "允许终端", disabled: "禁用终端",
+}
+
 function TerminalHistory() {
-  const [items, setItems] = useState<{ ts: number; actor: string; node_id: number; action: string; correlation: string }[] | null>(null)
+  const [items, setItems] = useState<TerminalEvent[] | null>(null)
   const [error, setError] = useState("")
-  const load = () => { setError(""); api<{ items: NonNullable<typeof items> }>("/terminal/history").then(d => setItems(d.items ?? [])).catch((e: Error) => setError(e.message)) }
-  useEffect(() => { queueMicrotask(load) }, [])
-  return <Card className="gap-3 p-5"><div className="flex items-center justify-between"><h3 className="text-sm font-medium">终端访问审计</h3><Button size="sm" variant="ghost" onClick={load}>刷新</Button></div>
-    <p className="text-xs text-muted-foreground">最近 100 条访问记录；不记录命令和终端内容。</p>
-    {(error || !items) && <LoadState error={error} retry={load} />}
-    {items?.length === 0 && <p className="text-sm text-muted-foreground">暂无终端访问记录</p>}
-    <div className="max-h-80 space-y-2 overflow-y-auto">{items?.map((item,i) => <p key={i} className="break-words text-xs">{new Date(item.ts*1000).toLocaleString()} · {item.actor} · 节点 {item.node_id} · {({open_requested:"请求开启",ready:"已连接",agent_error:"节点拒绝",closed:"已关闭",enabled:"允许终端",disabled:"禁用终端"} as Record<string,string>)[item.action] ?? item.action}<span className="ml-2 text-muted-foreground">{item.correlation}</span></p>)}</div>
-  </Card>
+  const [loading, setLoading] = useState(true)
+  const [request, setRequest] = useState(0)
+
+  function load() {
+    setLoading(true)
+    setError("")
+    setRequest(n => n + 1)
+  }
+  useEffect(() => {
+    const controller = new AbortController()
+    const { signal } = controller
+    api<{ items: TerminalEvent[] }>("/terminal/history", { signal })
+      .then(data => { if (!signal.aborted) setItems(data.items) })
+      .catch((e: Error) => { if (!signal.aborted) setError(e.message || "网络错误") })
+      .finally(() => { if (!signal.aborted) setLoading(false) })
+    return () => controller.abort()
+  }, [request])
+  return (
+    <Card className="min-w-0 gap-3 p-4 sm:p-5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold">终端访问审计</h2>
+        <Button size="sm" variant="ghost" disabled={loading} onClick={load} aria-label="刷新终端访问审计">{loading ? "刷新中…" : "刷新"}</Button>
+      </div>
+      <p className="text-xs text-muted-foreground">最近 100 条访问记录，不记录命令和终端内容。</p>
+      {(error || !items) && <LoadState error={error} retry={load} />}
+      {!error && items?.length === 0 && <p className="text-sm text-muted-foreground">暂无终端访问记录</p>}
+      {!!items?.length && <ul aria-label="终端访问记录" className="max-h-80 divide-y overflow-y-auto">
+        {items.map((item, i) => (
+          <li key={i} className="space-y-1 py-2.5 text-xs first:pt-0 last:pb-0 [overflow-wrap:anywhere]">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+              <span className="text-sm font-medium">节点 {item.node_id} · {TERMINAL_ACTIONS[item.action] ?? item.action}</span>
+              <time className="tnum text-muted-foreground">{new Date(item.ts * 1000).toLocaleString("zh-CN")}</time>
+            </div>
+            <p className="text-muted-foreground">操作者 {item.actor}{item.correlation && <> · 关联 ID <code>{item.correlation}</code></>}</p>
+          </li>
+        ))}
+      </ul>}
+    </Card>
+  )
 }
 
 function Sessions() {
   const [rows, setRows] = useState<Session[] | null>(null)
-  const [busy, setBusy] = useState("")
-
+  const [selected, setSelected] = useState<Session | null>(null)
+  const [busy, setBusy] = useState(false)
   const [error, setError] = useState("")
-  const load = () => { setError(""); return api<Session[]>("/sessions").then(setRows).catch((e: Error) => setError(e.message || "网络错误")) }
-  useEffect(() => { queueMicrotask(load) }, [])
+  const [request, setRequest] = useState(0)
+  function load() {
+    setError("")
+    setRequest(n => n + 1)
+  }
+  useEffect(() => {
+    const controller = new AbortController()
+    const { signal } = controller
+    api<Session[]>("/sessions", { signal })
+      .then(data => { if (!signal.aborted) setRows(data) })
+      .catch((e: Error) => { if (!signal.aborted) setError(e.message || "网络错误") })
+    return () => controller.abort()
+  }, [request])
 
-  async function remove(id: string) {
-    setBusy(id)
+  async function revoke() {
+    if (!selected || busy) return
+    setBusy(true)
     try {
-      await api(`/sessions/${id}`, { method: "DELETE" })
-      toast.success("已删除会话")
-      load()
+      await api(`/sessions/${selected.id}`, { method: "DELETE" })
+      setRows(old => old?.filter(row => row.id !== selected.id) ?? null)
+      setSelected(null)
+      toast.success("该登录会话已撤销")
     } catch (e) {
-      toast.error((e as Error).message)
+      toast.error((e as Error).message || "撤销失败，请重试")
     } finally {
-      setBusy("")
+      setBusy(false)
     }
   }
 
-  if (!rows) return <LoadState error={error} retry={load} />
   return (
-    <Card className="gap-4 p-5">
-      {error && <LoadState error={error} retry={load} />}
+    <Card className="min-w-0 gap-4 p-4 sm:p-5">
       <div>
-        <h3 className="text-sm font-medium">登录会话</h3>
-        <p className="mt-1 text-xs text-muted-foreground">
-          每次登录一条，14 天后过期。删除后该设备下一次请求就被登出。
-        </p>
+        <h2 className="text-sm font-semibold">登录会话</h2>
+        <p className="mt-1 text-xs text-muted-foreground">每次登录保留 14 天。撤销会话后，对应设备需要重新登录。</p>
       </div>
-      <div className="divide-y">
-        {rows.map((s) => (
-          <div key={s.id} className="flex items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0">
-            <div className="flex min-w-0 items-center gap-2 text-sm">
-              <span className="tnum">{new Date(s.created_at * 1000).toLocaleString()}</span>
-              {s.current && <Badge variant="secondary">当前设备</Badge>}
-            </div>
-            {/* 当前会话没有删除按钮：右上角的退出登录做的就是这件事，而在这里删
-                只会让已经渲染好的面板以为自己还登着。 */}
-            {!s.current && (
-              <Button size="icon" variant="ghost" aria-label={`删除 ${new Date(s.created_at * 1000).toLocaleString()} 的会话`} disabled={!!busy} onClick={() => remove(s.id)}>
-                <Trash2 />
-              </Button>
-            )}
-          </div>
-        ))}
-      </div>
+      {(error || !rows) && <LoadState error={error} retry={load} />}
+      {rows?.length === 0 && <p className="text-sm text-muted-foreground">暂无有效登录会话</p>}
+      {!!rows?.length && <ul className="max-h-80 divide-y overflow-y-auto">
+        {rows.map(session => {
+          const time = new Date(session.created_at * 1000).toLocaleString("zh-CN")
+          return <li key={session.id} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 py-2.5 first:pt-0 last:pb-0">
+            <time className="tnum text-sm">{time}</time>
+            {session.current ? <Badge variant="secondary">当前会话</Badge> :
+              <Button size="sm" variant="outline" disabled={busy} onClick={() => setSelected(session)} aria-label={`撤销 ${time} 的会话`}>撤销</Button>}
+          </li>
+        })}
+      </ul>}
+      {selected && <ConfirmDialog title="撤销此登录会话？" description={`会话创建于 ${new Date(selected.created_at * 1000).toLocaleString("zh-CN")}。该设备需要重新登录，当前会话不受影响。`}
+        confirmLabel={busy ? "撤销中…" : "确认撤销"} busy={busy} onClose={() => setSelected(null)} onConfirm={revoke} />}
     </Card>
   )
 }
 
 function Security({ site }: { site: string }) {
-  const { s, set, save, saving, error, load } = useSettings()
+  const { s, set, save, saving, dirty: githubDirty, error, load } = useSettings()
   const [password, setPassword] = useState("")
   useDirtyGuard(password.length > 0)
-  const [githubDirty, setGithubDirty] = useState(false)
-  if (!s) return <LoadState error={error} retry={load} />
-  const passwordEnabled = s.password_login !== "off"
-  const verified = !!s.github_verified && !githubDirty
-  const callback = `${site}/api/auth/github/callback`
+  const [sessionRevision, setSessionRevision] = useState(0)
+  const passwordEnabled = s?.password_login !== "off"
+  const verified = !!s?.github_verified && !githubDirty
+  let passwordHint = "请先保存 GitHub 配置并成功登录验证，才能关闭。"
+  if (!passwordEnabled) passwordHint = "已关闭。重启或升级不会重新开启。"
+  else if (s?.github_status_unknown) passwordHint = "请刷新页面确认 GitHub 登录验证状态，再关闭应急密码。"
+  else if (verified) passwordHint = "关闭后仅允许 GitHub 登录，密码登录的设备会退出。"
+  const callback = `${site.replace(/\/$/, "")}/api/auth/github/callback`
 
   return (
     <section className="@container space-y-4">
       <h1 className="text-2xl font-semibold tracking-tight">安全</h1>
-      <div className="grid items-start gap-4 @4xl:grid-cols-2">
-        <Sessions />
-        <TerminalHistory />
-      </div>
-
-      <div className="grid items-start gap-4 @4xl:grid-cols-2">
-      <Card className="gap-4 p-5">
+      {!s ? <LoadState error={error} retry={load} /> : <div className="grid items-start gap-4 @4xl:grid-cols-2">
+      <Card className="min-w-0 gap-4 p-4 sm:p-5">
         <div>
-          <h3 className="text-sm font-medium">GitHub 单点登录</h3>
+          <h2 className="text-sm font-semibold">GitHub 单点登录</h2>
           <p className="mt-1 text-xs text-muted-foreground">
             OAuth App 回调地址 <code className="rounded bg-muted px-1 [overflow-wrap:anywhere]">{callback}</code>
           </p>
         </div>
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="grid gap-4 min-[600px]:grid-cols-2">
           <Field label="Client ID">
-            <Input disabled={!passwordEnabled || saving} value={String(s.github_client_id ?? "")} onChange={(e) => (setGithubDirty(true), set("github_client_id", e.target.value))} />
+            <Input disabled={!passwordEnabled || saving} value={String(s.github_client_id ?? "")} onChange={(e) => set("github_client_id", e.target.value)} />
           </Field>
           <Field label="Client Secret" hint={s.github_secret_set ? "已设置，留空不变" : "未设置"}>
-            <Input disabled={!passwordEnabled || saving} type="password" placeholder={s.github_secret_set ? "••••••••" : ""} onChange={(e) => (setGithubDirty(true), set("github_client_secret", e.target.value))} />
+            <Input disabled={!passwordEnabled || saving} type="password" autoComplete="off" value={String(s.github_client_secret ?? "")} placeholder={s.github_secret_set ? "••••••••" : ""} onChange={(e) => set("github_client_secret", e.target.value)} />
           </Field>
         </div>
         {String(s.github_client_id ?? "") !== "" && String(s.github_allowed_users ?? "").trim() === "" && (
@@ -1789,13 +1983,13 @@ function Security({ site }: { site: string }) {
             白名单为空，GitHub 登录拒绝所有人。填入用户名并保存后生效。
           </p>
         )}
-        <Field label="允许登录的 GitHub 用户名" hint="逗号分隔。留空 = 拒绝所有人，不是放行所有人">
-          <Input disabled={!passwordEnabled || saving} value={String(s.github_allowed_users ?? "")} onChange={(e) => (setGithubDirty(true), set("github_allowed_users", e.target.value))} placeholder="GitHub 用户名" />
+        <Field label="允许登录的 GitHub 用户名" hint="多个用户名用逗号分隔。保存空名单会拒绝所有 GitHub 登录。">
+          <Input disabled={!passwordEnabled || saving} value={String(s.github_allowed_users ?? "")} onChange={(e) => set("github_allowed_users", e.target.value)} placeholder="GitHub 用户名" />
         </Field>
         <div className="flex flex-wrap items-center gap-3">
           <Button
             size="sm"
-            disabled={!passwordEnabled || saving}
+            disabled={!githubDirty || !passwordEnabled || saving}
             onClick={async () => {
               const patch: Record<string, string> = {
                 github_client_id: String(s.github_client_id ?? ""),
@@ -1804,20 +1998,21 @@ function Security({ site }: { site: string }) {
               if (typeof s.github_client_secret === "string" && s.github_client_secret) {
                 patch.github_client_secret = s.github_client_secret
               }
-              if (await save(patch)) setGithubDirty(false)
+              if (await save(patch)) setSessionRevision(n => n + 1)
             }}
           >
             {saving ? "保存中…" : "保存 GitHub 设置"}
           </Button>
           {!!s.github_ready && !verified && !githubDirty && <Button size="sm" variant="outline" asChild><a href="/api/auth/github">验证 GitHub 登录</a></Button>}
-          <Badge variant={verified ? "secondary" : "outline"}>{githubDirty ? "有未保存的修改" : verified ? "已验证" : s.github_ready ? "待登录验证" : "未配置完整"}</Badge>
+          <Badge variant={verified ? "secondary" : "outline"}>{githubDirty ? "有未保存的修改" : verified ? "已验证" : s.github_status_unknown ? "验证状态待确认" : s.github_ready ? "待登录验证" : "未配置完整"}</Badge>
         </div>
+        {githubDirty && <p className="text-xs text-muted-foreground">更改 GitHub 登录配置后，已有 GitHub 会话将退出，需要重新验证。</p>}
         {!passwordEnabled && <p className="text-sm text-muted-foreground">修改 GitHub 配置前，请先开启应急密码。</p>}
       </Card>
 
-      <Card className="gap-4 p-5">
+      <Card className="min-w-0 gap-4 p-4 sm:p-5">
         <div>
-          <h3 className="text-sm font-medium">应急密码</h3>
+          <h2 className="text-sm font-semibold">应急密码</h2>
           <p className="mt-1 text-xs text-muted-foreground">
             GitHub 不可用时的备用入口。修改后其它设备登录立即失效，当前设备不受影响。
           </p>
@@ -1826,25 +2021,29 @@ function Security({ site }: { site: string }) {
           <div className="space-y-1">
             <Label id="password-login-label">允许应急密码登录</Label>
             <p id="password-login-hint" className="text-sm text-muted-foreground">
-              {passwordEnabled ? verified ? "关闭后仅允许 GitHub 登录，密码登录的设备会退出。" : "请先保存 GitHub 配置并成功登录验证，才能关闭。" : "已关闭。重启或升级不会重新开启。"}
+              {passwordHint}
             </p>
           </div>
-          <Switch aria-labelledby="password-login-label" aria-describedby="password-login-hint" checked={passwordEnabled} disabled={saving || (passwordEnabled && !verified)} onCheckedChange={(enabled) => { save({ password_login: enabled ? "on" : "off" }) }} />
+          <Switch aria-labelledby="password-login-label" aria-describedby="password-login-hint" checked={passwordEnabled} disabled={saving || (passwordEnabled && !verified)} onCheckedChange={async (enabled) => { if (await save({ password_login: enabled ? "on" : "off" })) setSessionRevision(n => n + 1) }} />
         </div>
         {!passwordEnabled && <p className="text-sm text-muted-foreground">GitHub 无法登录时，可在 Hub 服务器执行 <code className="break-all">sudo /opt/monitor/monitor-hub --db /opt/monitor/data/monitor.db --reset-password</code> 恢复。</p>}
         <Field label="新密码" hint="至少 12 位；修改密码不会自动开启密码登录">
-          <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
+          <Input type="password" disabled={saving} value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
         </Field>
         <div>
           <Button
             size="sm"
             disabled={saving || password.length < 12}
-            onClick={async () => { if (await save({ admin_password: password })) setPassword("") }}
+            onClick={async () => { if (await save({ admin_password: password })) { setPassword(""); setSessionRevision(n => n + 1) } }}
           >
             修改密码
           </Button>
         </div>
       </Card>
+      </div>}
+      <div className="grid items-start gap-4 @4xl:grid-cols-2">
+        <Sessions key={sessionRevision} />
+        <TerminalHistory />
       </div>
     </section>
   )
@@ -1885,7 +2084,7 @@ function Data() {
   const [confirm, setConfirm] = useState<"vacuum" | null>(null)
   const [pending, setPending] = useState<File | null>(null)
   const [sent, setSent] = useState(0)
-  const [phase, setPhase] = useState("")
+  const [fileError, setFileError] = useState("")
   const operation = useRestoreOperation()
   // Closing the dialog must stop the upload rather than merely hide it: restore
   // is the one irreversible action here, and it takes minutes on a large
@@ -1912,37 +2111,41 @@ function Data() {
     }
   }
 
-  useDirtyGuard(busy === "restore")
+  useDirtyGuard(false, busy === "restore" && !!pending)
+  useEffect(() => () => abort.current?.abort(), [])
   async function restore(file: File) {
-    setBusy("restore"); setSent(0); setPhase("uploading")
-    abort.current = new AbortController()
+    if (abort.current || operation) return
+    const controller = new AbortController()
+    const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), n => n.toString(16).padStart(2, "0")).join("")
+    abort.current = controller
+    setBusy("restore")
+    setSent(0)
+    setFileError("")
     let submitted = false
-    const id = crypto.randomUUID().replaceAll("-", "")
     try {
-      // Unique staging keeps abandoned uploads separate from a later attempt.
-      await upload("/db/restore", file, setSent, abort.current.signal, { "x-cmonitor-restore-id": id })
-      // Upload cancellation cannot reach the separate apply endpoint.
-      if (abort.current.signal.aborted) throw new DOMException("aborted", "AbortError")
+      // A cancelled upload has no effect on the live database.
+      await upload("/db/restore", file, setSent, controller.signal, { "x-cmonitor-restore-id": id })
+      if (controller.signal.aborted) throw new DOMException("aborted", "AbortError")
       submitted = true
       trackRestore(id)
-      setPhase("validating"); setPending(null)
+      setPending(null)
       await api(`/db/restore/${id}/apply`, { method: "POST", signal: AbortSignal.timeout(15_000) })
     } catch (e) {
       if (submitted) {
-        setPhase("unknown")
         toast.info("恢复结果待确认，正在查询操作状态。请勿重复导入。")
       } else {
-        setBusy(""); setPhase(""); setPending(null)
-        if ((e as Error).name === "AbortError") {
-          api(`/db/restore/${id}`,{method:"DELETE"}).catch(() => {})
-          toast.info("上传已取消，尚未提交恢复")
-        }
-        else toast.error((e as Error).message)
+        void api(`/db/restore/${id}`, { method: "DELETE" }).catch(() => {})
+        setPending(null)
+        if (controller.signal.aborted) toast.info("上传已取消，尚未提交恢复")
+        else setFileError(`上传未完成，尚未提交恢复：${(e as Error).message || "网络错误"}。可重新选择备份文件。`)
       }
-    } finally { setBusy("") }
+    } finally {
+      abort.current = null
+      setBusy("")
+    }
   }
 
-  if (!info) return <LoadState error={error} retry={load} />
+  if (!info) return <section className="space-y-4"><h1 className="text-2xl font-semibold tracking-tight">数据与备份</h1><LoadState error={error} retry={load} /></section>
   const backup = info.scheduled_backup
   const calendar = backup?.scheduler.calendar
   const daily = calendar?.match(/^\*-\*-\* (\d{2}:\d{2}):\d{2}$/)?.[1]
@@ -1951,7 +2154,7 @@ function Data() {
   const stat = (label: string, value: string) => (
     <div key={label} className="min-w-0">
       <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="tnum mt-1 break-words text-sm font-medium">{value}</dd>
+      <dd className="tnum mt-1 text-sm font-medium [overflow-wrap:anywhere]">{value}</dd>
     </div>
   )
 
@@ -1963,17 +2166,17 @@ function Data() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2">
             <h2 id="scheduled-backup-title" className="text-sm font-semibold">自动备份</h2>
-            <Badge variant="secondary" role="status" className="whitespace-normal">{backupState}{backup?.scheduler.state === "active" && !backup.scheduler.boot_enabled ? "（未设置开机启用）" : ""}</Badge>
+            <Badge variant="secondary" role="status" className="whitespace-normal">{backupState}{backup?.scheduler.state === "active" && backup.scheduler.boot_enabled === false ? "（未设置开机启用）" : ""}</Badge>
           </div>
           <Button size="sm" variant="secondary" disabled={refreshing || !!busy || !!operation} onClick={load}>
             <RefreshCw className={refreshing ? "animate-spin" : ""} /> {refreshing ? "刷新中…" : "刷新备份状态"}
           </Button>
         </div>
-        {info.backup_error && <p role="alert" className="break-words rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">最近备份失败：{info.backup_error}</p>}
+        {info.backup_error && <p role="alert" className="rounded-md bg-destructive/10 [overflow-wrap:anywhere] px-3 py-2 text-sm text-destructive">最近备份失败：{info.backup_error}</p>}
         {backup?.stale && <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">备份状态尚未上报或已过期，请检查服务器上的状态上报任务。</p>}
         <dl className="grid gap-4 rounded-lg bg-muted/45 p-3 sm:grid-cols-3 sm:p-4">
-          {stat("最近成功", info.backup_success ? new Date(Number(info.backup_success) * 1000).toLocaleString("zh-CN") : "尚无成功记录")}
-          {stat("下次执行（服务器时间）", backup?.scheduler.next_run?.replace(/^\w+ (\d{4}-\d{2}-\d{2}) /, "$1 ") ?? "暂无下次执行时间")}
+          {stat("最近成功（本地时间）", info.backup_success ? new Date(Number(info.backup_success) * 1000).toLocaleString("zh-CN") : "尚无成功记录")}
+          {stat("下次执行（服务器时间）", (backup?.scheduler.state === "active" ? backup.scheduler.next_run : null)?.replace(/^\w+ (\d{4}-\d{2}-\d{2}) /, "$1 ") ?? "暂无下次执行时间")}
           {stat("已有备份", backup?.copies != null ? `${backup.copies} 份` : "无法读取备份目录")}
         </dl>
         <dl className="grid gap-4 sm:grid-cols-3">
@@ -1984,7 +2187,7 @@ function Data() {
         {backup?.policy && <p className="break-all text-xs text-muted-foreground">备份目录：<code>{backup.policy.directory}</code></p>}
         <p className="text-xs leading-relaxed text-muted-foreground">
           新备份成功后才清理超出的旧备份；保留份数与历史数据保留天数分别计算。保留策略和目录来自最近一次备份任务。
-          {backup?.checked_at != null && <> 服务器时区：{backup.timezone}；最近上报 {new Date(backup.checked_at * 1000).toLocaleTimeString("zh-CN")}。</>} 状态每分钟更新一次。
+          {backup?.checked_at != null && <> {backup.timezone && <>服务器时区：{backup.timezone}。</>} 状态上报于 {new Date(backup.checked_at * 1000).toLocaleString("zh-CN")}。</>} 状态每分钟更新一次。
         </p>
       </Card>
       <Card className="gap-4 p-4 sm:p-5">
@@ -2024,10 +2227,7 @@ function Data() {
           <div>
             <h2 className="text-sm font-semibold">手动备份与恢复</h2>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              导出的是整个数据库，含节点凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，
-              当前节点、设置、历史全部作废，所有设备需要重新登录。
-              <br />
-              请用这里导出的文件恢复：直接复制 <code>monitor.db</code> 会丢掉预写日志里还没落盘的那部分。
+              导出的数据库含节点凭证与密码哈希，请妥善保管。恢复时请选择这里导出的备份，最大 256 MiB。
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -2047,11 +2247,19 @@ function Data() {
               accept=".db,application/octet-stream"
               className="hidden"
               onChange={(e) => {
-                setPending(e.target.files?.[0] ?? null)
+                const file = e.target.files?.[0]
                 e.target.value = ""
+                if (!file) return
+                if (!file.size || file.size > 256 * 1024 * 1024) {
+                  setFileError(!file.size ? "所选文件为空，请重新选择备份。" : "备份超过 256 MiB，请重新选择文件。")
+                  return
+                }
+                setFileError("")
+                setPending(file)
               }}
             />
           </div>
+          {fileError && <p role="alert" className="text-sm text-destructive [overflow-wrap:anywhere]">{fileError}</p>}
         </Card>
       </div>
 
@@ -2068,10 +2276,11 @@ function Data() {
       {pending && (
         <ConfirmDialog
           title="用备份覆盖当前数据？"
-          description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。校验通过后整体覆盖当前数据；应用前自动保存一份恢复前副本。`}
+          description={`校验通过后，${pending.name}（${bytes(pending.size)}）将覆盖当前节点、设置和历史记录，所有设备需重新登录。Hub 会先备份当前数据库。`}
           confirmLabel={busy === "restore" ? `已上传 ${bytes(sent)} / ${bytes(pending.size)}` : "确认恢复"}
           busy={!!busy}
-          onClose={() => { if (!phase || phase === "uploading") { abort.current?.abort(); setPending(null) } }}
+          canCancelWhileBusy={busy === "restore"}
+          onClose={() => { abort.current?.abort(); setPending(null) }}
           onConfirm={() => restore(pending)}
         />
       )}
@@ -2096,17 +2305,54 @@ export function Admin({
   path,
   go,
   nodes,
+  nodeError,
+  staleSince,
   refresh,
   site,
   canProvision,
 }: {
   path: string
   go: (to: string) => void
-  nodes: Node[]
+  nodes: Node[] | null
+  nodeError: string | null
+  staleSince: number | null
   refresh: () => void
   site: string
   canProvision: boolean
 }) {
+  const section = ADMIN_SECTIONS.find(item => item.path === path)
+  const usesNodes = path === "/clara/nodes" || path === "/clara/ping" || path === "/clara/notify"
+  useEffect(() => {
+    const previous = document.title
+    document.title = `${section?.label ?? "页面不存在"} · Monitor 后台`
+    return () => { document.title = previous }
+  }, [section])
+
+  function renderSection() {
+    switch (path) {
+      case "/clara/visitors": return <Visitors />
+      case "/clara/data": return <Data />
+      case "/clara/themes": return <Themes />
+      case "/clara/security": return <Security site={site} />
+      case "/clara/settings": return <SettingsTab />
+    }
+    if (!section) return <Card className="items-start gap-3 p-5">
+      <h1 className="text-xl font-semibold">后台页面不存在</h1>
+      <p className="text-sm text-muted-foreground">请从导航选择页面，或返回节点管理。</p>
+      <Button variant="outline" onClick={() => go("/clara/nodes")}>返回节点管理</Button>
+    </Card>
+    if (!nodes) return <section className="space-y-4">
+      <h1 className="text-2xl font-semibold tracking-tight">{section.label}</h1>
+      <div role={nodeError ? "alert" : "status"} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border bg-card p-4 text-sm">
+        <span className="min-w-0 [overflow-wrap:anywhere]">{nodeError ? `节点列表加载失败：${nodeError}` : "正在加载节点列表…"}</span>
+        {nodeError && <Button variant="outline" size="sm" onClick={refresh}>重新加载节点</Button>}
+      </div>
+    </section>
+    if (path === "/clara/ping") return <Ping nodes={nodes} />
+    if (path === "/clara/notify") return <Notify nodes={nodes} refresh={refresh} />
+    return <Nodes nodes={nodes} refresh={refresh} site={site} canProvision={canProvision} />
+  }
+
   return (
     <div className="flex flex-col gap-5 lg:flex-row lg:gap-6">
       <nav aria-label="后台导航" className="grid grid-cols-4 gap-1 rounded-xl border bg-card p-1.5 shadow-sm backdrop-blur-md min-[800px]:grid-cols-8 lg:sticky lg:top-20 lg:flex lg:max-h-[calc(100dvh-6rem)] lg:w-40 lg:shrink-0 lg:flex-col lg:self-start lg:overflow-y-auto lg:p-2 xl:w-44">
@@ -2133,24 +2379,12 @@ export function Admin({
         })}
       </nav>
 
-      <div className="min-w-0 flex-1">
-        {path === "/clara/visitors" ? (
-          <Visitors />
-        ) : path === "/clara/ping" ? (
-          <Ping nodes={nodes} />
-        ) : path === "/clara/notify" ? (
-          <Notify nodes={nodes} refresh={refresh} />
-        ) : path === "/clara/data" ? (
-          <Data />
-        ) : path === "/clara/themes" ? (
-          <Themes />
-        ) : path === "/clara/security" ? (
-          <Security site={site} />
-        ) : path === "/clara/settings" ? (
-          <SettingsTab />
-        ) : (
-          <Nodes nodes={nodes} refresh={refresh} site={site} canProvision={canProvision} />
-        )}
+      <div className="min-w-0 flex-1 space-y-4">
+        {usesNodes && nodes && staleSince !== null && <div role="status" className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/40 bg-popover px-4 py-2 text-sm">
+          <span>节点数据更新中断。当前显示 {new Date(staleSince).toLocaleTimeString("zh-CN")} 收到的状态。</span>
+          <Button variant="outline" size="sm" onClick={refresh}>重试</Button>
+        </div>}
+        {renderSection()}
       </div>
     </div>
   )

@@ -81,6 +81,8 @@ async function main() {
       else if (pathname === '/api/db') data = {path:'fixture.db',size:1024,wal:0,free:0,oldest:null,retention:7,rows:{},backup_success:'1794280900',backup_error:backupError,scheduled_backup:{scheduler:{state:backupState,boot_enabled:true,calendar:'*-*-* 03:20:00',random_delay:'10min',next_run:backupState==='active'?'Wed 2026-11-11 03:21:27 CST':null},policy:{directory:'/opt/monitor/backups',keep:7,offsite:false},copies:1,checked_at:1794280900,timezone:'UTC+08:00',stale:backupStale}}
       else if (/^\/api\/db\/restore\/[a-f0-9]{32}$/.test(pathname)) data = {phase:restorePhase}
       else if (pathname === '/api/settings') data = settings
+      else if (pathname === '/api/themes') data = {themes:[{name:'默认主题',short:'default',description:'默认公开状态页',version:'1.9.1',author:'Cmonitor',url:'',selected:true,builtin:true}]}
+      else if (pathname === '/api/terminal/history') data = {items:[]}
       else if (pathname.endsWith('/metrics')) {
         historyCalls.push(req.url())
         const now=Math.floor(Date.now()/1000)
@@ -107,6 +109,36 @@ async function main() {
     await page.clock.install()
     page.on('pageerror',e => errors.push(e.message))
     if (mode === 'admin') {
+      // A failed first node request must not take the navigation or independent pages offline.
+      outage = true
+      await page.goto(origin+'/clara/nodes')
+      await page.getByRole('button',{name:'重新加载节点'}).waitFor()
+      await page.getByRole('link',{name:'设置',exact:true}).click()
+      await page.getByLabel('站点名称',{exact:true}).waitFor()
+      assert.equal(await page.title(), '设置 · Monitor 后台')
+      await page.getByRole('link',{name:'数据与备份',exact:true}).click()
+      await page.getByRole('heading',{name:'自动备份',exact:true}).waitFor()
+      await page.goto(origin+'/clara/unknown-page')
+      await page.getByRole('heading',{name:'后台页面不存在'}).waitFor()
+      await page.getByRole('button',{name:'返回节点管理'}).click()
+      await page.getByRole('button',{name:'重新加载节点'}).waitFor()
+      outage = false
+      await page.getByRole('button',{name:'重新加载节点'}).click()
+      await page.getByRole('button',{name:'添加节点',exact:true}).waitFor()
+      const sections = [
+        ['访客', '访问明细'], ['延迟', pingTask.name], ['通知', '提醒规则'],
+        ['数据与备份', '自动备份'], ['主题', '默认主题'], ['安全', '应急密码'], ['设置', '公开状态页'],
+      ]
+      for (const width of [320, 768, 1440]) {
+        await page.setViewportSize({width, height: width < 768 ? 844 : 1000})
+        for (const [label, heading] of sections) {
+          const link = page.getByRole('navigation').getByRole('link',{name:label,exact:true})
+          await link.click()
+          await page.getByRole('heading',{name:heading,exact:true}).waitFor()
+          assert.equal(await link.getAttribute('aria-current'), 'page')
+          assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `${label} fits at ${width}px`)
+        }
+      }
       await page.goto(localOrigin+'/clara/nodes')
       const restrictedInstall = page.getByRole('group', {name: `${nodes[0].name} 操作`, exact:true}).getByRole('button', {name:'安装 Agent'})
       await restrictedInstall.waitFor()

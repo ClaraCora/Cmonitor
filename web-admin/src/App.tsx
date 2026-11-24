@@ -1,5 +1,5 @@
 import { readPreference, savePreference } from "@/lib/storage"
-import { lazy, Suspense, useCallback, useEffect, useState } from "react"
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { ExternalLink, LogOut, Moon, Sun } from "lucide-react"
 import { toast, Toaster } from "sonner"
 
@@ -62,6 +62,7 @@ function AdminApp() {
   const [dark, toggleTheme] = useTheme()
   const [me, setMe] = useState<Me | null>(null)
   const [meError, setMeError] = useState("")
+  const meRequest = useRef(0)
   const { nodes, admin, error, refresh, stale, lastUpdatedAt, connection } = useNodes()
 
   const loadMe = useCallback(() => {
@@ -69,12 +70,25 @@ function AdminApp() {
     // res.statusText, which HTTP/2 and HTTP/3 removed, so a bodiless 502 from a
     // proxy arrives as "". The check below would then take the loading branch and
     // the retry button would never render.
+    const request = ++meRequest.current
     return api<Me>("/me")
-      .then((next) => { setMe(next); setMeError("") })
-      .catch((e: Error) => setMeError(e.message || "网络错误"))
+      .then((next) => { if (meRequest.current === request) { setMe(next); setMeError("") } })
+      .catch((e: Error) => { if (meRequest.current === request) setMeError(e.message || "网络错误") })
   }, [])
   useEffect(() => {
     loadMe()
+    const siteUpdated = () => { void loadMe() }
+    const reauthenticate = () => {
+      setMe(null)
+      setMeError("")
+      void loadMe()
+    }
+    addEventListener("cmonitor:site-updated", siteUpdated)
+    addEventListener("cmonitor:reauth-required", reauthenticate)
+    return () => {
+      removeEventListener("cmonitor:site-updated", siteUpdated)
+      removeEventListener("cmonitor:reauth-required", reauthenticate)
+    }
   }, [loadMe])
   useEffect(() => {
     const restored = () => { loadMe(); refresh() }
@@ -105,13 +119,13 @@ function AdminApp() {
   if (!me.authed) {
     return (
       <>
-        <Login github={me.github} passwordEnabled={me.password_login} onDone={() => { loadMe(); refresh(); go("/clara/nodes") }} />
+        <Login github={me.github} passwordEnabled={me.password_login} onDone={() => { loadMe(); refresh() }} />
         <Toaster position="top-center" theme={dark ? "dark" : "light"} />
       </>
     )
   }
 
-  const sorted = [...(nodes ?? [])].sort((a, b) => a.sort - b.sort || a.id - b.id)
+  const sorted = nodes && admin ? [...nodes].sort((a, b) => a.sort - b.sort || a.id - b.id) : null
 
   async function signOut() {
     if (signingOut || !dispatchEvent(new Event("cmonitor:navigate", { cancelable: true }))) return
@@ -139,7 +153,7 @@ function AdminApp() {
                 {me.hub_version && <span className="font-mono sm:ml-2">Hub v{me.hub_version}</span>}
               </span>
             </div>
-            {lastUpdatedAt && <div className="tnum flex items-center gap-1.5 text-xs text-muted-foreground">
+            {lastUpdatedAt && <div title="节点状态最近更新" className="tnum flex items-center gap-1.5 text-xs text-muted-foreground">
               <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${stale ? "bg-warn" : connection === "live" ? "bg-ok" : "bg-muted-foreground"}`} />
               {stale ? "更新中断" : connection === "live" ? "实时更新" : "轮询更新"}
               <time dateTime={new Date(lastUpdatedAt).toISOString()} title="最近更新">{new Date(lastUpdatedAt).toLocaleTimeString("zh-CN", { hour12: false })}</time>
@@ -160,23 +174,21 @@ function AdminApp() {
       </header>
 
       <main className="mx-auto max-w-[1600px] space-y-4 px-3 py-4 sm:px-6 sm:py-6">
-        {stale && <p role="status" className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/40 bg-popover px-4 py-2 text-sm"><span>数据更新中断。以下为 {lastUpdatedAt ? new Date(lastUpdatedAt).toLocaleTimeString("zh-CN") : "—"} 收到的历史状态，请勿据此判断当前在线情况。</span><Button variant="outline" size="sm" onClick={refresh}>重试</Button></p>}
-        {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-        {!nodes ? (
-          <Skeleton className="h-64" />
-        ) : (
-          <Suspense fallback={<Skeleton className="h-96" />}><Admin
+        <Suspense fallback={<Skeleton role="status" aria-label="正在加载后台" className="h-96" />}>
+          <Admin
             path={path}
             go={go}
             nodes={sorted}
+            nodeError={error}
+            staleSince={stale ? lastUpdatedAt : null}
             refresh={refresh}
             // The hub's own public URL rather than this browser's address: the
             // panel is frequently reached over a loopback port behind a proxy,
             // while the install command and OAuth callback need the real one.
             site={me.site || location.origin}
             canProvision={me.can_provision && !!provisioningSite(location.origin) && !!provisioningSite(me.site || location.origin)}
-          /></Suspense>
-        )}
+          />
+        </Suspense>
       </main>
 
       <Toaster position="top-center" theme={dark ? "dark" : "light"} />

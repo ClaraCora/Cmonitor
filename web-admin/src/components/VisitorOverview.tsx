@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react"
-import { ChevronDown, MapPinOff, X } from "lucide-react"
+import { useMemo, useRef, useState } from "react"
+import { ArrowDown, ChevronDown, MapPinOff, X } from "lucide-react"
 import type { VisitorRow } from "@/lib/api"
 import { getVisitorCountryPoint, normalizeVisitorCountry, WORLD_AREAS, WORLD_VIEW_BOX } from "@/lib/visitor-geography"
 import "./visitor-overview.css"
@@ -80,6 +80,7 @@ function RecordItem({ visit, code }: { visit: VisitorRow; code: string }) {
 export default function VisitorOverview({ rows }: { rows: VisitorRow[] }) {
   const [filter, setFilter] = useState<string | null>(null)
   const [expanded, setExpanded] = useState(false)
+  const detailHeading = useRef<HTMLHeadingElement>(null)
   const { visits, counts, ranked } = useMemo(() => {
     const counts = new Map<string, number>()
     const visits = rows.map(visit => {
@@ -109,7 +110,13 @@ export default function VisitorOverview({ rows }: { rows: VisitorRow[] }) {
         <Atlas counts={counts} selected={selected} choose={choose} />
       </div>
       <div className="va-rank-side">
-        <h3>地区排行</h3>
+        <div className="va-rank-head">
+          <h3>地区排行</h3>
+          {selected && <button type="button" className="va-jump" onClick={() => {
+            detailHeading.current?.focus({ preventScroll: true })
+            detailHeading.current?.scrollIntoView({ block: "start" })
+          }}>查看 {visible.length} 条明细<ArrowDown aria-hidden="true" /></button>}
+        </div>
         {ranked.length > 0 ? <ol aria-label="地区访问次数排行" className={expanded ? "va-all-ranks" : undefined}>
           {shown.map(([code, count]) => <li key={code}>
             <button type="button" className="va-rank" aria-label={`筛选${regionName(code)}，${count} 次访问`}
@@ -127,7 +134,7 @@ export default function VisitorOverview({ rows }: { rows: VisitorRow[] }) {
       </div>
     </section>
     <section className="va-log" aria-label="访问明细">
-      <div className="va-log-title"><h2>访问明细</h2>
+      <div className="va-log-title"><h2 ref={detailHeading} tabIndex={-1}>访问明细</h2>
         <p role="status">{selected ? `${regionName(selected)} · ${visible.length} 条` : `共 ${visible.length} 条`}</p>
         {selected && <button className="va-reset" type="button" onClick={() => setFilter(null)}><X aria-hidden="true" />显示全部</button>}
       </div>
