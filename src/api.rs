@@ -1,5 +1,8 @@
 //! The panel and public-status HTTP surface.
 
+pub(crate) mod live_delta;
+use live_delta::Format;
+
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
@@ -438,32 +441,23 @@ const SNAPSHOT_TTL_MS: i64 = 1_900;
 /// build would make viewer count a multiplier on database work. Two slots,
 /// because the admin view carries fields the public one must never expose.
 fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
-    let now = Utc::now().timestamp_millis();
-    let slot = usize::from(full);
-    let mut cache = app.snapshot.lock().unwrap_or_else(|e| e.into_inner());
-    // A cached frame's age must be non-negative. A wall clock can step backwards
-    // -- NTP correcting a fresh boot -- and against a bare upper bound the
-    // resulting negative reads as young, pinning the panel to a stale frame until
-    // real time catches up.
-    if (0..SNAPSHOT_TTL_MS).contains(&now.saturating_sub(cache[slot].0)) {
-        return cache[slot].1.clone();
+    match live_frame(app, full, Format::Legacy).1 {
+        Some(Message::Text(text)) => text,
+        _ => unreachable!("the legacy format always sends uncompressed JSON"),
     }
-    let nodes = visible_nodes(app, full).unwrap_or_default();
-    // `admin` is included so the panel's first fetch and its stream share one
-    // cached frame.
-    let mut frame = json!({"admin": full});
-    frame["nodes"] = Value::Array(nodes);
-    let payload = Utf8Bytes::from(frame.to_string());
-    cache[slot] = (now, payload.clone());
-    payload
+}
+
+fn live_frame(app: &App, admin: bool, format: Format) -> (u64, Option<Message>) {
+    let mut cache = app.snapshot[usize::from(admin)].lock().unwrap_or_else(|e| e.into_inner());
+    cache.read(admin, Utc::now().timestamp_millis(), format, || visible_nodes(app, admin).unwrap_or_default())
 }
 
 /// Drops the cached frames so the next push rebuilds. Without it a node just
 /// added in the panel would disappear from the list until the frame expires.
 fn invalidate_snapshot(app: &App) {
     *app.weekly.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    for slot in app.snapshot.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
-        slot.0 = 0;
+    for slot in &app.snapshot {
+        slot.lock().unwrap_or_else(|e| e.into_inner()).stamp = 0;
     }
 }
 
@@ -488,10 +482,21 @@ fn stream_audience(app: &App, session: Option<&str>) -> Option<bool> {
     }
 }
 
+#[derive(Deserialize)]
+pub struct LiveOptions {
+    format: Option<String>,
+    gzip: Option<String>,
+}
+
 /// Live stream for the browser. Each connection runs its own timer -- simpler to
 /// reason about than a fan-out channel -- over a shared snapshot, so a timer
 /// costs no more than a send.
-pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+pub async fn live_ws(
+    State(app): State<Shared>,
+    Query(options): Query<LiveOptions>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     if !crate::auth::same_origin(&app, &headers, true) {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -509,7 +514,7 @@ pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
     upgrade.read_buffer_size(SOCKET_BUFFER).max_message_size(MAX_FRAME).max_frame_size(MAX_FRAME).on_upgrade(
         move |socket| async move {
             let _permit = permit;
-            stream_live(app, socket, session).await;
+            stream_live(app, socket, session, options).await;
         },
     )
 }
@@ -518,16 +523,23 @@ static PUBLIC_STREAMS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_ne
 static ADMIN_STREAMS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
 const STREAM_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>) {
+async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>, options: LiveOptions) {
+    let delta = options.format.as_deref() == Some("delta-v1");
+    let gzip = options.gzip.as_deref() == Some("1");
+    let mut after = None;
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let Some(full) = stream_audience(&app, session.as_deref()) else { break };
-                if !matches!(tokio::time::timeout(
-                    STREAM_WRITE_TIMEOUT,
-                    socket.send(Message::Text(live_snapshot(&app, full))),
-                ).await, Ok(Ok(()))) { break; }
+                let format = if delta { Format::Delta { after, gzip } } else { Format::Legacy };
+                let (seq, frame) = live_frame(&app, full, format);
+                if let Some(frame) = frame {
+                    if !matches!(tokio::time::timeout(
+                        STREAM_WRITE_TIMEOUT, socket.send(frame),
+                    ).await, Ok(Ok(()))) { break; }
+                    after = Some(seq);
+                }
             }
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
@@ -2940,6 +2952,41 @@ mod tests {
     }
 
     #[test]
+    fn a_public_delta_removes_a_newly_private_node_without_sending_its_fields() {
+        let app = app();
+        let stays = node(&app, "public", true);
+        let hidden = node(&app, "removed", true);
+        let read = |admin, after| {
+            let (seq, Some(Message::Text(frame))) =
+                live_frame(&app, admin, Format::Delta { after, gzip: false })
+            else {
+                panic!("expected an uncompressed update")
+            };
+            (seq, serde_json::from_str::<Value>(&frame).unwrap())
+        };
+        let (seq, _) = read(false, None);
+        let (admin_seq, _) = read(true, None);
+        app.db
+            .update_node(
+                hidden,
+                &NodePatch { public: Some(false), name: Some("private name".into()), ..Default::default() },
+            )
+            .unwrap();
+        app.db.save_facts(stays, &json!({"hostname":"admin-only-host"}), "192.0.2.44").unwrap();
+        invalidate_snapshot(&app);
+        let (_, public) = read(false, Some(seq));
+        assert_eq!(public["drop"], json!([hidden]));
+        assert_eq!(public["order"], json!([stays]));
+        let text = public.to_string();
+        for private in ["private name", "admin-only-host", "192.0.2.44", "token-of-"] {
+            assert!(!text.contains(private));
+        }
+        let (_, admin) = read(true, Some(admin_seq));
+        assert!(admin.to_string().contains("admin-only-host"));
+        assert!(admin.to_string().contains("private name"));
+    }
+
+    #[test]
     fn a_clock_stepping_backwards_does_not_pin_a_stale_frame() {
         let app = app();
         node(&app, "first", true);
@@ -2947,7 +2994,7 @@ mod tests {
 
         // NTP correcting a fresh boot leaves the cached stamp in the future, which
         // does not constitute a young frame.
-        app.snapshot.lock().unwrap()[0].0 = Utc::now().timestamp_millis() + 60_000;
+        app.snapshot[0].lock().unwrap().stamp = Utc::now().timestamp_millis() + 60_000;
         node(&app, "added-after", true);
         assert!(live_snapshot(&app, false).as_str().contains("added-after"));
     }

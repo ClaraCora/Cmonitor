@@ -52,7 +52,7 @@ pub struct App {
     /// Last rendered node list per audience, `[public, admin]`, with the
     /// millisecond it was built. Shared by every browser stream so viewers do
     /// not multiply the query load. See `api::live_snapshot`.
-    pub snapshot: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
+    pub(crate) snapshot: [Mutex<api::live_delta::Snapshot>; 2],
     weekly: Mutex<Option<weekly::Cache>>,
     pub throttle: auth::Throttle,
     /// Failed agent registrations, counted separately from failed sign-ins: the
@@ -85,7 +85,7 @@ impl App {
         Self {
             db,
             agents: RwLock::default(),
-            snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
+            snapshot: Default::default(),
             weekly: Mutex::default(),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
