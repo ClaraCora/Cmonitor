@@ -10,6 +10,13 @@ use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::io::Write;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Audience {
+    Public,
+    Admin,
+    SignedStatus,
+}
+
 #[derive(Default)]
 pub(crate) struct Snapshot {
     pub(super) stamp: i64,
@@ -19,6 +26,7 @@ pub(crate) struct Snapshot {
     baseline: Option<Encoded>,
     delta: Option<Encoded>,
     last_delta_read: Option<i64>,
+    delta_has_only_public_fields: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -38,11 +46,12 @@ struct Full<'a> {
 impl Snapshot {
     pub(super) fn read(
         &mut self,
-        admin: bool,
+        audience: Audience,
         now: i64,
         format: Format,
         fetch: impl FnOnce() -> Vec<Value>,
     ) -> (u64, Option<Message>) {
+        let admin = audience == Audience::Admin;
         if matches!(format, Format::Delta { .. }) {
             self.last_delta_read = Some(now);
         }
@@ -54,7 +63,13 @@ impl Snapshot {
             let active = self.last_delta_read.is_some_and(|last| (0..10_000).contains(&(now - last)));
             self.delta = if active && self.seq != 0 {
                 let at = nodes.first().and_then(|n| n["valuation_at"].as_i64()).unwrap_or(now / 1000);
-                Some(encode(&changes(&self.nodes, &nodes, self.seq, next, at)))
+                let delta = changes(&self.nodes, &nodes, self.seq, next, at);
+                self.delta_has_only_public_fields = match audience {
+                    Audience::Public => true,
+                    Audience::Admin => false,
+                    Audience::SignedStatus => delta.public_status_metrics_only(),
+                };
+                Some(encode(&delta))
             } else {
                 None
             };
@@ -65,7 +80,7 @@ impl Snapshot {
             self.baseline = None;
         }
 
-        let gzip = !admin && matches!(format, Format::Delta { gzip: true, .. });
+        let gzip = matches!(format, Format::Delta { gzip: true, .. });
         let bytes = match format {
             Format::Legacy => {
                 self.legacy.get_or_insert_with(|| encode(&Full { admin, nodes: &self.nodes, seq: None }))
@@ -76,14 +91,14 @@ impl Snapshot {
                 }
                 if after == Some(self.seq - 1) {
                     if let Some(delta) = &self.delta {
-                        return (self.seq, Some(delta.message(gzip)));
+                        return (self.seq, Some(delta.message(gzip && self.delta_has_only_public_fields)));
                     }
                 }
                 self.baseline
                     .get_or_insert_with(|| encode(&Full { admin, nodes: &self.nodes, seq: Some(self.seq) }))
             }
         };
-        (self.seq, Some(bytes.message(gzip)))
+        (self.seq, Some(bytes.message(gzip && audience == Audience::Public)))
     }
 }
 
@@ -179,6 +194,34 @@ struct Delta<'a> {
     patch: Vec<Fields>,
 }
 
+impl Delta<'_> {
+    // Only compress routine updates for signed-in status pages. Baselines,
+    // replacement rows and edits to operator-only links or notes stay text.
+    // The status view already filters metrics and probe results for public use.
+    fn public_status_metrics_only(&self) -> bool {
+        self.put.is_empty()
+            && self.patch.iter().all(|patch| {
+                patch.get("set").is_none_or(|set| {
+                    set.as_object().is_some_and(|fields| {
+                        fields.keys().all(|field| {
+                            matches!(
+                                field.as_str(),
+                                "online"
+                                    | "last_seen"
+                                    | "day_rx"
+                                    | "day_tx"
+                                    | "month_rx"
+                                    | "month_tx"
+                                    | "total_rx"
+                                    | "total_tx"
+                            )
+                        })
+                    })
+                })
+            })
+    }
+}
+
 fn changes<'a>(old: &[Value], new: &'a [Value], base: u64, seq: u64, at: i64) -> Delta<'a> {
     let id = |row: &Value| row["id"].as_i64().expect("node primary key");
     let mut previous: HashMap<i64, &Value> = old.iter().map(|n| (id(n), n)).collect();
@@ -256,21 +299,49 @@ mod tests {
         let mut slot = Snapshot::default();
         let after = |after| Format::Delta { after, gzip: false };
         let first = vec![row(1, 10)];
-        let (_, frame) = slot.read(false, 10_000, after(None), || first.clone());
+        let (_, frame) = slot.read(Audience::Public, 10_000, after(None), || first.clone());
         assert_eq!(decoded(frame.unwrap()), json!({"admin":false,"seq":1,"nodes":first}));
-        let (_, legacy) = slot.read(false, 10_001, Format::Legacy, || panic!("cached"));
+        let (_, legacy) = slot.read(Audience::Public, 10_001, Format::Legacy, || panic!("cached"));
         assert_eq!(decoded(legacy.unwrap()), json!({"admin":false,"nodes":first}));
-        let (_, frame) = slot.read(false, 12_000, after(Some(1)), || vec![row(1, 12)]);
+        let (_, frame) = slot.read(Audience::Public, 12_000, after(Some(1)), || vec![row(1, 12)]);
         let delta = frame.unwrap();
         let Message::Text(first) = &delta else { panic!("text requested") };
-        let (_, cached) = slot.read(false, 12_001, after(Some(1)), || panic!("cached"));
+        let (_, cached) = slot.read(Audience::Public, 12_001, after(Some(1)), || panic!("cached"));
         let Some(Message::Text(copy)) = cached else { panic!("expected a shared delta") };
         assert_eq!(first.as_ptr(), copy.as_ptr(), "encoded once across viewers");
         assert_eq!(decoded(delta), json!({"base":1,"seq":2,"at":12}));
-        assert!(slot.read(false, 12_002, after(Some(2)), || panic!("cached")).1.is_none());
+        assert!(slot.read(Audience::Public, 12_002, after(Some(2)), || panic!("cached")).1.is_none());
         let latest = vec![row(4, 14)];
-        let (_, full) = slot.read(false, 14_000, after(Some(1)), || latest.clone());
+        let (_, full) = slot.read(Audience::Public, 14_000, after(Some(1)), || latest.clone());
         assert_eq!(decoded(full.unwrap()), json!({"admin":false,"seq":3,"nodes":latest}));
+    }
+
+    #[test]
+    fn signed_status_compresses_metrics_but_never_a_baseline_or_note_edit() {
+        let mut slot = Snapshot::default();
+        let mut nodes: Vec<_> = (1..=40).map(|id| row(id, 10)).collect();
+        for n in &mut nodes {
+            n["remark"] = json!("operator-only test note");
+        }
+        let mut read = |at, after, rows: &[Value]| {
+            slot.read(Audience::SignedStatus, at, Format::Delta { after, gzip: true }, || rows.to_vec())
+                .1
+                .unwrap()
+        };
+        assert!(matches!(read(10_000, None, &nodes), Message::Text(_)));
+        for n in &mut nodes {
+            n["metrics"]["net_tx"] = json!(101);
+        }
+        let metrics = read(12_000, Some(1), &nodes);
+        assert!(matches!(metrics, Message::Binary(_)));
+        assert_eq!(decoded(metrics)["patch"].as_array().unwrap().len(), 40);
+        nodes[0]["remark"] = json!("changed private note".repeat(100));
+        assert!(matches!(read(14_000, Some(2), &nodes), Message::Text(_)));
+        nodes[1]["website"] = json!("https://example.invalid/".repeat(100));
+        assert!(matches!(read(16_000, Some(3), &nodes), Message::Text(_)));
+        nodes.push(nodes[0].clone());
+        nodes.last_mut().unwrap()["id"] = json!(41);
+        assert!(matches!(read(18_000, Some(4), &nodes), Message::Text(_)));
     }
 
     #[test]
@@ -279,20 +350,21 @@ mod tests {
         row["tags"] = json!("large fixture ".repeat(192));
         let mut public = Snapshot::default();
         let format = Format::Delta { after: None, gzip: true };
-        let (_, frame) = public.read(false, 20_000, format, || vec![row.clone()]);
+        let (_, frame) = public.read(Audience::Public, 20_000, format, || vec![row.clone()]);
         let Some(Message::Binary(bytes)) = frame else { panic!("large public frame should compress") };
         let public_data = decoded(Message::Binary(bytes.clone()));
-        let (_, second) = public.read(false, 20_000, format, || panic!("cached"));
+        let (_, second) = public.read(Audience::Public, 20_000, format, || panic!("cached"));
         let Some(Message::Binary(copy)) = second else { panic!("compressed frame expected") };
         assert_eq!(bytes.as_ptr(), copy.as_ptr());
-        let (_, plain) = public.read(false, 20_000, Format::Delta { after: None, gzip: false }, || panic!());
+        let (_, plain) =
+            public.read(Audience::Public, 20_000, Format::Delta { after: None, gzip: false }, || panic!());
         let plain = plain.unwrap();
         assert!(matches!(plain, Message::Text(_)));
         assert_eq!(public_data, decoded(plain));
 
         row["token"] = json!("private fixture");
         let mut admin = Snapshot::default();
-        let (_, frame) = admin.read(true, 20_000, format, || vec![row]);
+        let (_, frame) = admin.read(Audience::Admin, 20_000, format, || vec![row]);
         let Some(Message::Text(frame)) = frame else { panic!("an admin frame must remain plain text") };
         assert!(frame.contains("private fixture"));
         assert!(!public_data.to_string().contains("private fixture"));

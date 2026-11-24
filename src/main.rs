@@ -52,7 +52,7 @@ pub struct App {
     /// Last rendered node list per audience, `[public, admin]`, with the
     /// millisecond it was built. Shared by every browser stream so viewers do
     /// not multiply the query load. See `api::live_snapshot`.
-    pub(crate) snapshot: [Mutex<api::live_delta::Snapshot>; 2],
+    pub(crate) snapshot: [Mutex<api::live_delta::Snapshot>; 3],
     weekly: Mutex<Option<weekly::Cache>>,
     pub throttle: auth::Throttle,
     /// Failed agent registrations, counted separately from failed sign-ins: the

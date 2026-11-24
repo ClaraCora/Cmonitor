@@ -989,8 +989,13 @@ impl Db {
         for (id, since) in down {
             tx.execute("UPDATE node SET down_since=?2 WHERE id=?1", params![id, since])?;
         }
-        for (key, value) in state {
-            tx.execute("INSERT INTO alert_state(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key,value])?;
+        if !state.is_empty() {
+            let mut upsert = tx.prepare_cached(
+                "INSERT INTO alert_state(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            )?;
+            for (key, value) in state {
+                upsert.execute((key, value))?;
+            }
         }
         if let Some(date) = digest {
             tx.execute("INSERT OR REPLACE INTO setting(key,value) VALUES('notify_expiry_sent',?1)", [date])?;
@@ -1035,10 +1040,9 @@ impl Db {
 
     pub fn alert_value(&self, key: &str) -> Option<i64> {
         self.conn()
-            .query_row("SELECT value FROM alert_state WHERE key=?1", [key], |r| r.get(0))
-            .optional()
+            .prepare_cached("SELECT value FROM alert_state WHERE key=?1")
             .ok()
-            .flatten()
+            .and_then(|mut query| query.query_row([key], |r| r.get(0)).ok())
     }
 
     pub fn renew_node(&self, id: i64, expected: &str) -> Result<bool> {

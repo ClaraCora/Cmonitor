@@ -363,6 +363,27 @@ fn process(app: &App, node: i64, input: Poll, now: i64) -> rusqlite::Result<Valu
         .map(|r| r.expect("test worker is paired"))
 }
 fn process_key(app: &App, key_hash: &str, input: Poll, now: i64) -> rusqlite::Result<Option<Value>> {
+    if input.action == "poll" && input.batch.is_none() {
+        // Ordinarily there is no rollout. Check both the current credential and
+        // absence of a running batch in the same statement as the heartbeat.
+        // If a batch has started, let the normal transaction decide the claim.
+        let idle_node = app
+            .db
+            .conn()
+            .prepare_cached(
+                "INSERT INTO upgrade_worker(node,protocol,last_seen)
+             SELECT node,?2,?3 FROM node_maintenance WHERE key_hash=?1 AND offline_only=0
+             AND NOT EXISTS (SELECT 1 FROM upgrade_batch WHERE status='running')
+             ON CONFLICT(node) DO UPDATE SET protocol=excluded.protocol,last_seen=excluded.last_seen
+             RETURNING node",
+            )?
+            .query_one((key_hash, input.protocol.unwrap_or(1), now), |r| r.get(0))
+            .optional()?;
+        if let Some(node) = idle_node {
+            mark_worker_seen(app, node, now);
+            return Ok(Some(Value::Null));
+        }
+    }
     // Check the credential in the same transaction that records or grants the
     // operation, so a concurrent revocation takes effect on every subsequent call.
     let mut f = fleet(app);
@@ -519,12 +540,15 @@ fn process_key(app: &App, key_hash: &str, input: Poll, now: i64) -> rusqlite::Re
     }
     tx.commit()?;
     drop(conn);
+    mark_worker_seen(app, node, now);
+    Ok(Some(reply))
+}
+fn mark_worker_seen(app: &App, node: i64, now: i64) {
     if let Some(a) =
         app.agents.write().unwrap_or_else(|e| e.into_inner()).get_mut(&node).filter(|a| a.rollout.tls)
     {
         a.rollout.seen = now;
     }
-    Ok(Some(reply))
 }
 pub async fn poll(State(app): State<Shared>, headers: HeaderMap, Json(input): Json<Poll>) -> Response {
     tokio::task::block_in_place(|| {
@@ -568,16 +592,29 @@ pub async fn poll(State(app): State<Shared>, headers: HeaderMap, Json(input): Js
             .unwrap_or_else(db_error)
     })
 }
+fn advance_running(app: &App) -> rusqlite::Result<()> {
+    // The partial index contains at most one row. An empty queue requires
+    // neither a write transaction nor a snapshot of every reporting agent.
+    let running = app
+        .db
+        .conn()
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM upgrade_batch WHERE status='running')")?
+        .query_row([], |r| r.get::<_, bool>(0))?;
+    if !running {
+        return Ok(());
+    }
+    // Keep the existing lock order. advance rechecks the active batch in the
+    // transaction in case it finished while we were taking the snapshot.
+    let f = fleet(app);
+    let mut conn = app.db.conn();
+    let tx = conn.transaction()?;
+    advance(&tx, &f, Utc::now().timestamp())?;
+    tx.commit()
+}
 pub async fn watch(app: Shared) {
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let f = fleet(&app);
-        let result = tokio::task::block_in_place(|| {
-            let mut conn = app.db.conn();
-            let tx = conn.transaction()?;
-            advance(&tx, &f, Utc::now().timestamp())?;
-            tx.commit()
-        });
+        let result = tokio::task::block_in_place(|| advance_running(&app));
         if let Err(e) = result {
             tracing::error!("advancing upgrade batch: {e}");
         }
@@ -628,6 +665,37 @@ mod tests {
             now,
         )
         .unwrap()
+    }
+    #[test]
+    fn idle_worker_heartbeats_require_current_pairing_and_stop_when_a_batch_starts() {
+        let app = fixture();
+        let request =
+            || Poll { action: "poll".into(), batch: None, protocol: Some(2), attempt: None, error: None };
+        let key = crate::auth::sha256("fixture-maint-1");
+        assert_eq!(process_key(&app, &key, request(), NOW + 3).unwrap(), Some(Value::Null));
+        let seen = || {
+            app.db
+                .conn()
+                .query_row("SELECT last_seen FROM upgrade_worker WHERE node=1", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        assert_eq!(seen(), NOW + 3);
+        assert_eq!(app.agents.read().unwrap()[&1].rollout.seen, NOW + 3);
+        assert_eq!(process_key(&app, "unknown", request(), NOW + 4).unwrap(), None);
+        app.db
+            .conn()
+            .execute("UPDATE node_maintenance SET key_hash=NULL,offline_only=1 WHERE node=1", [])
+            .unwrap();
+        assert_eq!(process_key(&app, &key, request(), NOW + 4).unwrap(), None);
+        assert_eq!(seen(), NOW + 3);
+        assert_eq!(app.agents.read().unwrap()[&1].rollout.seen, NOW + 3);
+
+        advance_running(&app).unwrap();
+        assert_eq!(create(&app, &[2], &fleet(&app), NOW).unwrap().status(), 200);
+        assert_eq!(process(&app, 2, request(), NOW + 5).unwrap()["batch"], 1);
+        app.db.conn().execute("UPDATE upgrade_item SET deadline=0", []).unwrap();
+        advance_running(&app).unwrap();
+        assert_eq!(snapshot(&app), ("stopped".to_owned(), vec!["failed".to_owned()]));
     }
     #[test]
     fn canary_needs_same_identity_new_session_target_hello_and_report() {

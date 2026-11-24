@@ -1,7 +1,7 @@
 //! The panel and public-status HTTP surface.
 
 pub(crate) mod live_delta;
-use live_delta::Format;
+use live_delta::{Audience, Format};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
@@ -236,7 +236,8 @@ fn billing_boundary(date: Option<&str>, months: u32) -> Option<i64> {
     Local.from_local_datetime(&date.and_hms_opt(0, 0, 0)?).earliest().map(|v| v.timestamp())
 }
 
-fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
+fn visible_nodes(app: &App, audience: Audience) -> Result<Vec<Value>, anyhow::Error> {
+    let full = audience == Audience::Admin;
     let nodes = app.db.nodes()?;
     let traffic = app.db.all_traffic();
     let tasks = app.db.ping_tasks()?;
@@ -283,6 +284,11 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
                     &timezone,
                 )
             };
+            if audience == Audience::SignedStatus {
+                // These are the only additional fields the signed-in theme renders.
+                view["website"] = json!(n.website);
+                view["remark"] = json!(n.remark);
+            }
             if full {
                 let offline = disabled.get(&n.id) == Some(&true);
                 view["offline_only"] = json!(offline);
@@ -297,15 +303,22 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
         .collect())
 }
 
-pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
-    let full = authed(&app, &headers);
-    if !full && !app.public_page() {
+pub async fn nodes(
+    State(app): State<Shared>,
+    Query(options): Query<LiveOptions>,
+    headers: HeaderMap,
+) -> Response {
+    let authenticated = authed(&app, &headers);
+    if !authenticated && !app.public_page() {
         return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
     }
     // The same rendered frame the browser streams receive, for the same reason:
     // otherwise every visitor would rebuild every node's row against the
     // connection the agents write through.
-    ([(header::CONTENT_TYPE, "application/json")], axum::body::Bytes::from(live_snapshot(&app, full)))
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        axum::body::Bytes::from(live_snapshot(&app, options.audience(authenticated))),
+    )
         .into_response()
 }
 
@@ -438,18 +451,20 @@ const SNAPSHOT_TTL_MS: i64 = 1_900;
 
 /// The payload every browser stream sends, built at most once per tick however
 /// many tabs are watching: the public page is anonymous, so a per-connection
-/// build would make viewer count a multiplier on database work. Two slots,
-/// because the admin view carries fields the public one must never expose.
-fn live_snapshot(app: &App, full: bool) -> Utf8Bytes {
-    match live_frame(app, full, Format::Legacy).1 {
+/// build would make viewer count a multiplier on database work. Keep a separate
+/// slot for each audience so cached private fields cannot cross views.
+fn live_snapshot(app: &App, audience: Audience) -> Utf8Bytes {
+    match live_frame(app, audience, Format::Legacy).1 {
         Some(Message::Text(text)) => text,
         _ => unreachable!("the legacy format always sends uncompressed JSON"),
     }
 }
 
-fn live_frame(app: &App, admin: bool, format: Format) -> (u64, Option<Message>) {
-    let mut cache = app.snapshot[usize::from(admin)].lock().unwrap_or_else(|e| e.into_inner());
-    cache.read(admin, Utc::now().timestamp_millis(), format, || visible_nodes(app, admin).unwrap_or_default())
+fn live_frame(app: &App, audience: Audience, format: Format) -> (u64, Option<Message>) {
+    let mut cache = app.snapshot[audience as usize].lock().unwrap_or_else(|e| e.into_inner());
+    cache.read(audience, Utc::now().timestamp_millis(), format, || {
+        visible_nodes(app, audience).unwrap_or_default()
+    })
 }
 
 /// Drops the cached frames so the next push rebuilds. Without it a node just
@@ -482,10 +497,23 @@ fn stream_audience(app: &App, session: Option<&str>) -> Option<bool> {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct LiveOptions {
     format: Option<String>,
     gzip: Option<String>,
+    view: Option<String>,
+}
+
+impl LiveOptions {
+    // The status theme displays public nodes even when the operator is signed in.
+    // Keep its operator-only notes separate from both anonymous and panel frames.
+    fn audience(&self, authenticated: bool) -> Audience {
+        match (authenticated, self.view.as_deref()) {
+            (false, _) => Audience::Public,
+            (true, Some("public")) => Audience::SignedStatus,
+            (true, _) => Audience::Admin,
+        }
+    }
 }
 
 /// Live stream for the browser. Each connection runs its own timer -- simpler to
@@ -531,9 +559,9 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let Some(full) = stream_audience(&app, session.as_deref()) else { break };
+                let Some(authenticated) = stream_audience(&app, session.as_deref()) else { break };
                 let format = if delta { Format::Delta { after, gzip } } else { Format::Legacy };
-                let (seq, frame) = live_frame(&app, full, format);
+                let (seq, frame) = live_frame(&app, options.audience(authenticated), format);
                 if let Some(frame) = frame {
                     if !matches!(tokio::time::timeout(
                         STREAM_WRITE_TIMEOUT, socket.send(frame),
@@ -2123,6 +2151,9 @@ mod tests {
     use crate::auth::sha256;
     use crate::db::Db;
 
+    // The two restore integration tests share the process-wide restore permit.
+    static RESTORE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn domain_headers() -> HeaderMap {
         HeaderMap::from_iter([
             (header::HOST, "monitor.example.com".parse().unwrap()),
@@ -2346,6 +2377,7 @@ mod tests {
     /// could silently drop.
     #[tokio::test]
     async fn a_finished_restore_leaves_no_scratch_file_behind() {
+        let _restore = RESTORE_TESTS.lock().await;
         let dir = std::env::temp_dir().join(format!("monitor-restore-{}", &random_token()[..16]));
         std::fs::create_dir_all(&dir).unwrap();
         let live = dir.join("live.db").to_string_lossy().into_owned();
@@ -2384,6 +2416,7 @@ mod tests {
 
     #[tokio::test]
     async fn staged_restore_never_applies_until_commit_and_exposes_a_durable_result() {
+        let _restore = RESTORE_TESTS.lock().await;
         let dir = std::env::temp_dir().join(format!("monitor-staged-{}", random_token()));
         std::fs::create_dir_all(&dir).unwrap();
         let live = dir.join("live.db").to_string_lossy().into_owned();
@@ -2669,7 +2702,7 @@ mod tests {
         let unassigned = task(&app, vec![]);
         assert!(app.db.ping_tasks().unwrap().iter().any(|t| t.id == unassigned && t.nodes.is_empty()));
 
-        let views = visible_nodes(&app, true).unwrap();
+        let views = visible_nodes(&app, Audience::Admin).unwrap();
         assert_eq!(views[0]["terminal_enabled"], true);
         assert_eq!(views[1]["terminal_enabled"], false);
         assert_eq!(views[1]["offline_only"], false);
@@ -2683,7 +2716,7 @@ mod tests {
         assert_eq!(tasks(&views[0]), vec![shared, only_normal]);
         assert_eq!(tasks(&views[1]), vec![shared]);
         assert!(tasks(&views[2]).is_empty());
-        for view in visible_nodes(&app, false).unwrap() {
+        for view in visible_nodes(&app, Audience::Public).unwrap() {
             for field in ["offline_only", "terminal_enabled", "terminal_capable", "terminal_reason"] {
                 assert!(view.get(field).is_none());
             }
@@ -2725,7 +2758,7 @@ mod tests {
             .pings
             .insert(probe, crate::agent_ws::PingReading::new(7, Utc::now().timestamp()));
 
-        let public = visible_nodes(&app, false).unwrap();
+        let public = visible_nodes(&app, Audience::Public).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
         assert_eq!(public[0]["name"], "open");
         assert_eq!(public[0]["tags"], "二网精品;1Gbps<green>");
@@ -2748,7 +2781,7 @@ mod tests {
         }
         assert_eq!(public[0]["metrics"]["cpu"], 1.0, "the rest of the report still goes out");
 
-        let admin = visible_nodes(&app, true).unwrap();
+        let admin = visible_nodes(&app, Audience::Admin).unwrap();
         assert_eq!(admin.len(), 2);
         assert_eq!(admin[0]["ip"], "198.51.100.9");
         assert_eq!(admin[0]["remark"], "secret note");
@@ -2768,12 +2801,12 @@ mod tests {
             )
         };
         // Warm the same snapshots the HTTP and WebSocket paths send.
-        let _ = live_snapshot(&app, true);
+        let _ = live_snapshot(&app, Audience::Admin);
         assert_eq!(patch("  https://provider.example/plans?ref=monitor  ").await.status(), StatusCode::OK);
         let website = "https://provider.example/plans?ref=monitor";
         assert_eq!(app.db.node(id).unwrap().unwrap().website, website);
-        assert!(live_snapshot(&app, true).contains(website));
-        assert!(!live_snapshot(&app, false).contains(website));
+        assert!(live_snapshot(&app, Audience::Admin).contains(website));
+        assert!(!live_snapshot(&app, Audience::Public).contains(website));
 
         for bad in [
             "javascript:alert(1)",
@@ -2795,7 +2828,7 @@ mod tests {
         assert_eq!(patch("http://provider.example/").await.status(), StatusCode::OK);
         assert_eq!(patch("  ").await.status(), StatusCode::OK);
         assert_eq!(app.db.node(id).unwrap().unwrap().website, "");
-        assert!(!live_snapshot(&app, true).contains("provider.example"));
+        assert!(!live_snapshot(&app, Audience::Admin).contains("provider.example"));
     }
 
     #[test]
@@ -2865,7 +2898,7 @@ mod tests {
         // SQLite reuses the id; nothing of the old machine may accompany it.
         let fresh = node(&app, "fresh", true);
         assert_eq!(fresh, old, "the fixture only means anything if the id is reused");
-        let nodes = visible_nodes(&app, true).unwrap();
+        let nodes = visible_nodes(&app, Audience::Admin).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0]["online"], json!(false), "a node nobody deployed is not online");
         assert_eq!(nodes[0]["metrics"], Value::Null, "and it has nobody else's metrics");
@@ -2938,8 +2971,8 @@ mod tests {
         node(&app, "hidden", false);
         app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
 
-        let public = live_snapshot(&app, false);
-        let admin = live_snapshot(&app, true);
+        let public = live_snapshot(&app, Audience::Public);
+        let admin = live_snapshot(&app, Audience::Admin);
         // Caching must never let one audience's payload reach the other.
         assert!(!public.as_str().contains("198.51.100.9"), "the public frame must carry no address");
         assert!(!public.as_str().contains("hidden"), "the public frame must carry no private node");
@@ -2948,7 +2981,57 @@ mod tests {
         // Two reads over unchanged data prove nothing, since a rebuild returns the
         // same bytes, so the data is modified first.
         node(&app, "late", true);
-        assert_eq!(live_snapshot(&app, false), public, "the frame is reused, not rebuilt per viewer");
+        assert_eq!(
+            live_snapshot(&app, Audience::Public),
+            public,
+            "the frame is reused, not rebuilt per viewer"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_in_status_page_uses_public_fields_even_when_sign_in_is_required() {
+        let app = std::sync::Arc::new(app());
+        let shown = node(&app, "visible", true);
+        node(&app, "hidden", false);
+        app.db.conn().execute(
+            "UPDATE node SET website = 'https://provider.example', remark = 'operator note' WHERE id = ?1",
+            [shown],
+        ).unwrap();
+        app.db.set("public_page", "off").unwrap();
+        app.db.create_session(&sha256("test-session"), Utc::now().timestamp() + 3600).unwrap();
+        let cookie =
+            HeaderMap::from_iter([(header::COOKIE, "monitor_session=test-session".parse().unwrap())]);
+        let public = || LiveOptions { view: Some("public".into()), ..Default::default() };
+
+        let list = |options, headers| nodes(State(app.clone()), Query(options), headers);
+        let read = |res: Response| async move {
+            assert_eq!(res.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(res.into_body(), 128 * 1024).await.unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        };
+        let frame = read(list(public(), cookie.clone()).await).await;
+        assert_eq!(frame["admin"], false);
+        assert_eq!(frame["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(frame["nodes"][0]["id"], shown);
+        assert!(frame["nodes"][0].get("token").is_none());
+        assert!(frame["nodes"][0].get("ip").is_none());
+        assert_eq!(frame["nodes"][0]["website"], "https://provider.example");
+        assert_eq!(frame["nodes"][0]["remark"], "operator note");
+        let panel = read(list(LiveOptions::default(), cookie.clone()).await).await;
+        assert_eq!(panel["admin"], true);
+        assert_eq!(panel["nodes"].as_array().unwrap().len(), 2);
+        let session = current_session(&cookie);
+        assert_eq!(
+            stream_audience(&app, session.as_deref()).map(|signed| public().audience(signed)),
+            Some(Audience::SignedStatus)
+        );
+        app.db.drop_session(&sha256("test-session")).unwrap();
+        assert_eq!(stream_audience(&app, session.as_deref()), None);
+        assert_eq!(list(public(), cookie).await.status(), StatusCode::UNAUTHORIZED);
+        app.db.set("public_page", "on").unwrap();
+        let anonymous = read(list(public(), HeaderMap::new()).await).await;
+        assert!(anonymous["nodes"][0].get("website").is_none());
+        assert!(anonymous["nodes"][0].get("remark").is_none());
     }
 
     #[test]
@@ -2957,9 +3040,11 @@ mod tests {
         let stays = node(&app, "public", true);
         let hidden = node(&app, "removed", true);
         let read = |admin, after| {
-            let (seq, Some(Message::Text(frame))) =
-                live_frame(&app, admin, Format::Delta { after, gzip: false })
-            else {
+            let (seq, Some(Message::Text(frame))) = live_frame(
+                &app,
+                if admin { Audience::Admin } else { Audience::Public },
+                Format::Delta { after, gzip: false },
+            ) else {
                 panic!("expected an uncompressed update")
             };
             (seq, serde_json::from_str::<Value>(&frame).unwrap())
@@ -2990,13 +3075,13 @@ mod tests {
     fn a_clock_stepping_backwards_does_not_pin_a_stale_frame() {
         let app = app();
         node(&app, "first", true);
-        live_snapshot(&app, false);
+        live_snapshot(&app, Audience::Public);
 
         // NTP correcting a fresh boot leaves the cached stamp in the future, which
         // does not constitute a young frame.
         app.snapshot[0].lock().unwrap().stamp = Utc::now().timestamp_millis() + 60_000;
         node(&app, "added-after", true);
-        assert!(live_snapshot(&app, false).as_str().contains("added-after"));
+        assert!(live_snapshot(&app, Audience::Public).as_str().contains("added-after"));
     }
 
     /// The panel sends only a name, and expects the node just added to appear in
@@ -3005,7 +3090,7 @@ mod tests {
     async fn a_node_added_from_the_panel_needs_only_a_name_and_shows_up_at_once() {
         let app = std::sync::Arc::new(app());
         node(&app, "existing", true);
-        assert!(!live_snapshot(&app, true).as_str().contains("added"));
+        assert!(!live_snapshot(&app, Audience::Admin).as_str().contains("added"));
 
         let added: Node = serde_json::from_value(json!({"name": "added"})).unwrap();
         // The defaults the panel relies on by omitting them, `public` above all:
@@ -3018,7 +3103,7 @@ mod tests {
         assert_eq!(created.status(), StatusCode::OK);
         // Frames are cached for nearly two seconds, so without dropping the cache
         // the node just added would disappear from the list.
-        assert!(live_snapshot(&app, true).as_str().contains("added"));
+        assert!(live_snapshot(&app, Audience::Admin).as_str().contains("added"));
 
         // A name consisting only of spaces is refused and leaves no node behind.
         let blank = Json(serde_json::from_value::<Node>(json!({"name": "   "})).unwrap());
@@ -3112,7 +3197,7 @@ mod tests {
         app.db.accumulate(id, "b", Some((900, 500))).unwrap();
         app.db.touch_seen(id, 1_700_000_000).unwrap();
 
-        let view = &visible_nodes(&app, true).unwrap()[0];
+        let view = &visible_nodes(&app, Audience::Admin).unwrap()[0];
         assert_eq!(view["online"], false);
         assert_eq!(view["metrics"], Value::Null);
         assert_eq!(view["total_rx"], 800, "traffic is stored, not derived from the live state");
@@ -3140,7 +3225,7 @@ mod tests {
             )
             .unwrap();
 
-        let offline = &visible_nodes(&app, true).unwrap()[0];
+        let offline = &visible_nodes(&app, Audience::Admin).unwrap()[0];
         assert_eq!(
             offline["disk_total"],
             30i64 << 30,
@@ -3154,7 +3239,7 @@ mod tests {
             id,
             json!({"mem_total": 1_000, "swap_total": 0, "disk_total": 35i64 << 30, "cpu": 1.0}),
         );
-        let live = &visible_nodes(&app, true).unwrap()[0];
+        let live = &visible_nodes(&app, Audience::Admin).unwrap()[0];
         assert_eq!(live["disk_total"], 35i64 << 30, "the report is the truth while the agent is connected");
         assert_eq!(live["swap_total"], 0, "swapoff means zero, not the gigabyte that was there at connect");
         assert_eq!(live["disk_total"], live["metrics"]["disk_total"], "one number, not two");
@@ -3544,7 +3629,7 @@ mod tests {
             .unwrap()
             .pings
             .insert(probe, crate::agent_ws::PingReading::new(7, Utc::now().timestamp() - 3600));
-        let view = visible_nodes(&app, false).unwrap();
+        let view = visible_nodes(&app, Audience::Public).unwrap();
         let p = &view[0]["pings"][0];
         assert_eq!(p["status"], "stale");
         assert!(p["latency"].is_null());

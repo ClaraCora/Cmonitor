@@ -26,19 +26,19 @@ async fn benchmark_live_snapshot() {
                 live.pings.insert(*probe, reading);
             }
         }
-        for full in [false, true] {
-            let size = live_snapshot(&app, full).len();
+        for audience in [Audience::Public, Audience::Admin] {
+            let size = live_snapshot(&app, audience).len();
             let rounds = if count == 23 { 30 } else { 12 };
             let mut micros = Vec::with_capacity(rounds);
             for _ in 0..rounds {
                 invalidate_snapshot(&app);
                 let start = Instant::now();
-                std::hint::black_box(live_snapshot(&app, full));
+                std::hint::black_box(live_snapshot(&app, audience));
                 micros.push(start.elapsed().as_micros());
             }
             micros.sort_unstable();
             println!(
-                "nodes={count} admin={full} frame_bytes={size} rebuild_median_us={}",
+                "nodes={count} audience={audience:?} frame_bytes={size} rebuild_median_us={}",
                 micros[rounds / 2]
             );
         }
@@ -46,10 +46,10 @@ async fn benchmark_live_snapshot() {
         let mut hits = Vec::new();
         for _ in 0..9 {
             invalidate_snapshot(&app);
-            let size = live_snapshot(&app, false).len();
+            let size = live_snapshot(&app, Audience::Public).len();
             let start = Instant::now();
             for _ in 0..200 {
-                let r = nodes(State(app.clone()), HeaderMap::new()).await;
+                let r = nodes(State(app.clone()), Query(LiveOptions::default()), HeaderMap::new()).await;
                 assert_eq!(r.status(), StatusCode::OK);
                 let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
                 assert_eq!(std::hint::black_box(bytes).len(), size);

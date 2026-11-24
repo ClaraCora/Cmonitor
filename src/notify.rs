@@ -781,15 +781,20 @@ fn sweep_inner(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
     // Resource and probe rules share the node's opt-in and maintenance pause.
     // Persisted alarm state and deliveries commit in the same transaction below.
     if armed {
+        // Rules apply to the whole pass. Read them before locking the live
+        // agents so a large fleet doesn't repeat the same settings queries.
+        let threshold = number(app, "notify_disk_percent");
+        let disk_minutes = number(app, "notify_disk_minutes");
+        let failures = number(app, "notify_ping_failures") as usize;
+        let cooldown = number(app, "notify_cooldown") * 60;
+        let tasks = if failures > 0 { app.db.ping_tasks()? } else { Vec::new() };
         let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
-        let tasks = app.db.ping_tasks()?;
         for node in &nodes {
             if !node.notify || node.muted_until > now || !agents.contains_key(&node.id) {
                 state_changes.push((format!("disk:{}", node.id), 0));
                 continue;
             }
             let Some(agent) = agents.get(&node.id) else { continue };
-            let threshold = number(app, "notify_disk_percent");
             let total = agent.metrics["disk_total"].as_f64().unwrap_or(0.0);
             let used = agent.metrics["disk_used"].as_f64().unwrap_or(0.0);
             if threshold > 0 && total > 0.0 && now - agent.last_seen <= 120 {
@@ -805,17 +810,13 @@ fn sweep_inner(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
                 };
                 if percent >= threshold as f64 {
                     state_changes.push((key, since));
-                    let cooled = now - app.db.alert_value(&last_key).unwrap_or(0)
-                        >= number(app, "notify_cooldown") * 60;
-                    if !active && cooled && now - since >= number(app, "notify_disk_minutes") * 60 {
+                    let cooled = now - app.db.alert_value(&last_key).unwrap_or(0) >= cooldown;
+                    if !active && cooled && now - since >= disk_minutes * 60 {
                         notes.push(Note {
                             event: "disk".into(),
                             node: node.name.clone(),
                             title: format!("磁盘空间告警 · {}", node.name),
-                            message: format!(
-                                "磁盘已用 {percent:.1}%，持续 {} 分钟",
-                                number(app, "notify_disk_minutes")
-                            ),
+                            message: format!("磁盘已用 {percent:.1}%，持续 {disk_minutes} 分钟"),
                             ..Default::default()
                         });
                         state_changes.push((active_key, 1));
@@ -838,7 +839,6 @@ fn sweep_inner(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
                 // Missing or stale observations cannot prove a continuous breach.
                 state_changes.push((format!("disk:{}", node.id), 0));
             }
-            let failures = number(app, "notify_ping_failures") as usize;
             if failures == 0 {
                 continue;
             }
@@ -880,8 +880,7 @@ fn sweep_inner(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
                 let active = app.db.alert_value(&key).unwrap_or(0) != 0;
                 let bad = reading.samples.len() >= failures
                     && reading.samples.iter().rev().take(failures).all(|v| *v < 0);
-                let cooled =
-                    now - app.db.alert_value(&last_key).unwrap_or(0) >= number(app, "notify_cooldown") * 60;
+                let cooled = now - app.db.alert_value(&last_key).unwrap_or(0) >= cooldown;
                 if bad && !active && cooled {
                     notes.push(Note {
                         event: "probe".into(),
@@ -916,7 +915,7 @@ fn sweep_inner(app: &App, watch: &mut Watch, now: i64) -> Result<Vec<Note>> {
     for note in &mut notes {
         stamp(note, now);
     }
-    let configured = channels(app);
+    let configured = if notes.is_empty() { Vec::new() } else { channels(app) };
     app.db.queue_notifications(
         &notes,
         &configured.iter().map(Channel::name).collect::<Vec<_>>(),
