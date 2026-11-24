@@ -1,7 +1,5 @@
 name: sync-theme
 on:
-  schedule:
-    - cron: "23 */6 * * *"
   workflow_dispatch:
 permissions:
   contents: write
@@ -38,13 +36,22 @@ jobs:
           PY
           read -r tag digest < web-theme.pin
           branch="automation/theme-$tag"
-          if gh pr list --head "$branch" --json number --jq 'length' | grep -qv '^0$'; then exit 0; fi
-          git switch -c "$branch"
+          if gh pr list --head "$branch" --state open --json number --jq 'length' | grep -qv '^0$'; then exit 0; fi
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add web-theme.pin
-          git commit -m "Embed default theme $tag"
-          git push --set-upstream origin "$branch"
-          gh pr create --title "Embed default theme $tag" --body 'Update the built-in theme to the published archive and SHA256. Integration CI must pass before merging. Independent disk theme updates remain supported.'
+          if git fetch origin "$branch" 2>/dev/null; then
+            if git show "origin/$branch:web-theme.pin" 2>/dev/null | cmp -s - web-theme.pin; then
+              echo "reusing existing theme proposal branch $branch"
+            else
+              echo "theme proposal branch $branch exists with a different pin" >&2
+              exit 1
+            fi
+          else
+            git switch -c "$branch"
+            git add web-theme.pin
+            git commit -m "Embed default theme $tag"
+            git push --set-upstream origin "$branch"
+          fi
+          gh pr create --head "$branch" --title "Embed default theme $tag" --body 'Update the built-in theme to the published archive and SHA256. Integration CI must pass before merging. Independent disk theme updates remain supported.'
           # Token-generated pushes do not recursively trigger workflows.
           gh workflow run ci.yml --ref "$branch"
