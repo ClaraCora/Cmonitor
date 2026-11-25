@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState } from "react"
 import { ArrowDown, ChevronDown, MapPinOff, X } from "lucide-react"
+import { Button } from "@/components/ui/button"
 import type { VisitorRow } from "@/lib/api"
 import { getVisitorCountryPoint, normalizeVisitorCountry, WORLD_AREAS, WORLD_VIEW_BOX } from "@/lib/visitor-geography"
 import "./visitor-overview.css"
@@ -112,31 +113,31 @@ export default function VisitorOverview({ rows }: { rows: VisitorRow[] }) {
       <div className="va-rank-side">
         <div className="va-rank-head">
           <h3>地区排行</h3>
-          {selected && <button type="button" className="va-jump" onClick={() => {
+          {selected && <Button type="button" variant="ghost" size="sm" className="min-h-10" onClick={() => {
             detailHeading.current?.focus({ preventScroll: true })
             detailHeading.current?.scrollIntoView({ block: "start" })
-          }}>查看 {visible.length} 条明细<ArrowDown aria-hidden="true" /></button>}
+          }}>查看 {visible.length} 条明细<ArrowDown aria-hidden="true" /></Button>}
         </div>
-        {ranked.length > 0 ? <ol aria-label="地区访问次数排行" className={expanded ? "va-all-ranks" : undefined}>
+        {ranked.length > 0 ? <ol aria-label="地区访问次数排行" className="va-ranks" data-expanded={expanded || undefined}>
           {shown.map(([code, count]) => <li key={code}>
-            <button type="button" className="va-rank" aria-label={`筛选${regionName(code)}，${count} 次访问`}
+            <Button type="button" variant="choice" size="sm" className="va-rank" aria-label={`筛选${regionName(code)}，${count} 次访问`}
               aria-pressed={selected === code} onClick={() => choose(code)}>
               <span className="va-rank-name">{regionName(code)}</span><span className="va-count">{count} <small>次</small></span>
               <span aria-hidden="true" className="va-bar"><i style={{ width: `${count / leader * 100}%` }} /></span>
-            </button>
+            </Button>
           </li>)}
         </ol> : <p className="va-no-geo">{visits.length ? "当前记录暂无可定位的国家或地区。" : "收到可定位的访问后，这里会显示地区排行。"}</p>}
-        {ranked.length > rankLimit && <button type="button" aria-expanded={expanded} className="va-expand" onClick={() => setExpanded(!expanded)}>
-          {expanded ? "收起排行" : `查看全部 ${ranked.length} 个地区`}<ChevronDown aria-hidden="true" /></button>}
-        {unknown > 0 && <button type="button" className="va-unknown" aria-label={`筛选未定位，${unknown} 次访问`} aria-pressed={selected === UNKNOWN} onClick={() => choose(UNKNOWN)}>
+        {ranked.length > rankLimit && <Button type="button" variant="ghost" size="sm" aria-expanded={expanded} className="va-expand min-h-9" onClick={() => setExpanded(!expanded)}>
+          {expanded ? "收起排行" : `查看全部 ${ranked.length} 个地区`}<ChevronDown aria-hidden="true" /></Button>}
+        {unknown > 0 && <Button type="button" variant="choice" size="sm" className="va-unknown" aria-label={`筛选未定位，${unknown} 次访问`} aria-pressed={selected === UNKNOWN} onClick={() => choose(UNKNOWN)}>
           <span><MapPinOff aria-hidden="true" />未定位</span><span className="va-count">{unknown} <small>次</small></span>
-        </button>}
+        </Button>}
       </div>
     </section>
     <section className="va-log" aria-label="访问明细">
       <div className="va-log-title"><h2 ref={detailHeading} tabIndex={-1}>访问明细</h2>
         <p role="status">{selected ? `${regionName(selected)} · ${visible.length} 条` : `共 ${visible.length} 条`}</p>
-        {selected && <button className="va-reset" type="button" onClick={() => setFilter(null)}><X aria-hidden="true" />显示全部</button>}
+        {selected && <Button variant="ghost" size="sm" className="ml-auto min-h-10" type="button" onClick={() => setFilter(null)}><X aria-hidden="true" />显示全部</Button>}
       </div>
       <div className="va-table">
         {visits.length > 0 && <div className="va-columns" aria-hidden="true"><span>访问时间</span><span>IP 与归属地</span><span>服务商与 ASN</span><span>客户端</span></div>}

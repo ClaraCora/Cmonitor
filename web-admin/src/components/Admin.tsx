@@ -2362,22 +2362,17 @@ export function Admin({
         {ADMIN_SECTIONS.map(({ path: to, label, icon: Icon }) => {
           const active = path === to
           return (
-            <a
-              key={to}
-              href={to}
-              onClick={(e) => {
+            <Button key={to} asChild variant="choice" size="sm"
+              className="min-h-10 min-w-0 rounded-lg px-1 text-xs has-[>svg]:px-1 min-[460px]:text-sm lg:justify-start lg:gap-2.5 lg:px-3 lg:has-[>svg]:px-3">
+              <a href={to} aria-current={active ? "page" : undefined} onClick={(e) => {
                 if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return
                 e.preventDefault()
                 if (!active) go(to)
-              }}
-              aria-current={active ? "page" : undefined}
-              className={`flex min-h-10 items-center justify-center gap-1.5 rounded-lg px-1 text-xs whitespace-nowrap transition-colors focus-visible:outline-2 focus-visible:outline-ring min-[460px]:text-sm lg:justify-start lg:gap-2.5 lg:px-3 ${
-                active ? "bg-primary/10 font-semibold text-primary ring-1 ring-inset ring-primary/25 dark:text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground"
-              }`}
-            >
-              <Icon aria-hidden="true" className="hidden size-4 shrink-0 min-[460px]:block min-[800px]:hidden lg:block" />
-              {label}
-            </a>
+              }}>
+                <Icon aria-hidden="true" className="hidden size-4 shrink-0 min-[460px]:block min-[800px]:hidden lg:block" />
+                {label}
+              </a>
+            </Button>
           )
         })}
       </nav>

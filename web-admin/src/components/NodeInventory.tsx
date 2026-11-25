@@ -35,7 +35,7 @@ function NodeAddresses({ node, copy }: { node: Node; copy: (value: string) => vo
   return <div className="min-w-0 space-y-1">
     {values.length ? values.map(value => (
       <button key={value} type="button" title="点击复制地址" aria-label={`复制地址 ${value}`}
-        className="node-address group flex min-h-6 max-w-full items-center gap-1 rounded text-left text-xs leading-relaxed focus-visible:outline-2 focus-visible:outline-ring"
+        className="node-address group flex min-h-6 max-w-full cursor-pointer items-center gap-1 rounded text-left text-xs leading-relaxed focus-visible:outline-2 focus-visible:outline-ring"
         onClick={() => copy(value)}>
         <span className="font-mono break-all">{value}</span>
         <Copy aria-hidden="true" className="size-3 shrink-0 text-muted-foreground opacity-60 group-hover:opacity-100 group-focus-visible:opacity-100" />

@@ -56,21 +56,14 @@
   border-radius: .65rem;
 }
 
-.node-toolbar-actions button[data-variant="outline"],
 .node-search input {
   border-color: var(--node-edge);
   background: var(--node-control);
+  border-radius: .65rem;
 }
 
-.node-toolbar-actions button[data-variant="outline"]:not(:focus-visible),
 .node-search input:not(:focus-visible) { box-shadow: none; }
 .node-search input:focus-visible { border-color: var(--ring); }
-
-.node-toolbar-actions button[data-variant="outline"]:hover {
-  background-color: var(--node-hover);
-}
-
-.node-search input { border-radius: .65rem; }
 
 @container nodes (width >= 28rem) and (width < 49rem) {
   .node-toolbar { grid-template-columns: auto minmax(0, 16rem); }
@@ -194,7 +187,10 @@
   box-shadow: none;
 }
 
-.node-action[data-action="terminal"]:not(:disabled) { color: var(--node-blue); }
+.node-action:is([data-action="terminal"], [data-action="edit"]):enabled {
+  color: var(--node-blue);
+  font-weight: 600;
+}
 
 .node-action[data-policy-closed] {
   border-color: color-mix(in oklab, var(--node-blue) 22%, transparent);
@@ -226,18 +222,14 @@
   min-height: 2.75rem;
   flex-direction: row;
   gap: .375rem;
-  border-color: var(--node-line);
-  background-color: var(--node-control);
-  color: var(--foreground);
+  font-size: .75rem;
 }
-.node-actions[data-layout="mobile"] .node-action:where([data-action="terminal"]:not(:disabled), [data-policy-closed]) {
-  color: var(--node-blue);
-}
-.node-actions[data-layout="mobile"] .node-action[data-policy-closed] {
+.node-actions[data-layout="mobile"] .node-action:is([data-action="terminal"], [data-action="edit"]):enabled {
   background-color: color-mix(in oklab, var(--node-blue) 8%, transparent);
 }
-.node-actions[data-layout="mobile"] .node-action[data-action="delete"] { color: var(--node-red); }
-.node-actions[data-layout="mobile"] .node-action:not(:disabled):hover { background-color: var(--node-hover); }
+.node-actions[data-layout="mobile"] .node-action:is([data-action="terminal"], [data-action="edit"]):enabled:hover {
+  background-color: color-mix(in oklab, var(--node-blue) 15%, transparent);
+}
 
 @container (width >= 39rem) {
   .node-actions[data-layout="mobile"] .node-action-grid { grid-template-columns: repeat(9, minmax(0, 1fr)); }

@@ -41,6 +41,17 @@
   --chart-5: oklch(0.79 0.11 225);
   --ok: oklch(0.72 0.18 149);
   --warn: oklch(0.75 0.17 70);
+  --control-fill: oklch(1 0 0 / 45%);
+  --control-edge: oklch(0.51 0.04 256 / 22%);
+  --control-hover: oklch(0.50 0.045 256 / 8%);
+  --control-primary: oklch(0.51 0.19 257);
+  --control-primary-hover: oklch(0.46 0.18 257);
+  --control-danger: oklch(0.51 0.19 26);
+  --control-danger-hover: oklch(0.46 0.18 26);
+  --control-accent: oklch(0.41 0.16 256);
+  --control-selection: oklch(0.62 0.19 256 / 12%);
+  --control-selection-hover: oklch(0.62 0.19 256 / 17%);
+  --control-selection-edge: oklch(0.55 0.16 256 / 23%);
 }
 
 .dark {
@@ -69,6 +80,17 @@
   --chart-5: oklch(0.80 0.11 220);
   --ok: oklch(0.75 0.18 149);
   --warn: oklch(0.77 0.16 72);
+  --control-fill: oklch(0.87 0.028 253 / 8%);
+  --control-edge: oklch(0.87 0.034 249 / 18%);
+  --control-hover: oklch(0.87 0.034 249 / 13%);
+  --control-primary: oklch(0.49 0.18 257);
+  --control-primary-hover: oklch(0.54 0.18 257);
+  --control-danger: oklch(0.50 0.17 26);
+  --control-danger-hover: oklch(0.54 0.17 26);
+  --control-accent: oklch(0.84 0.095 249);
+  --control-selection: oklch(0.66 0.16 252 / 19%);
+  --control-selection-hover: oklch(0.66 0.16 252 / 26%);
+  --control-selection-edge: oklch(0.71 0.13 249 / 31%);
 }
 
 @theme inline {
@@ -129,6 +151,32 @@
 
 /* Tabular figures keep live numbers from shifting as they update. */
 .tnum { font-variant-numeric: tabular-nums; }
+
+/* The same visual selection for in-page buttons and navigation links. */
+.admin-choice {
+  color: var(--muted-foreground);
+}
+
+@media (hover: hover) {
+  .admin-choice:not(:disabled):hover {
+    background: var(--control-hover);
+    color: var(--foreground);
+  }
+
+  .admin-choice:is([aria-pressed="true"], [aria-current="page"]):not(:disabled):hover {
+    background: var(--control-selection-hover);
+    color: var(--control-accent);
+  }
+}
+
+.admin-choice:is([aria-pressed="true"], [aria-current="page"]) {
+  border-color: var(--control-selection-edge);
+  background: var(--control-selection);
+  color: var(--control-accent);
+  font-weight: 600;
+}
+
+.admin-choice:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; box-shadow: none; }
 
 .terminal-surface .xterm { height: 100%; }
 .terminal-surface .xterm-viewport { background: #0d1117 !important; }
