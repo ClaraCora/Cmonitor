@@ -1,5 +1,5 @@
 import { lazy, Suspense, Children, cloneElement, isValidElement, useEffect, useId, useRef, useState } from "react"
-import { Bell, ChevronRight, Copy, Database, Download, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Trash2, Upload, Users } from "lucide-react"
+import { Bell, ChevronRight, Copy, Database, Download, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, Trash2, Upload, Users } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -702,12 +702,15 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   }
 
   return (
-    <div className="@container/nodes min-w-0 space-y-4">
-      <header className="flex flex-wrap items-center justify-end gap-2">
-        <h1 className="sr-only">节点管理</h1>
-        <Input type="search" className="mr-auto w-full @min-[38rem]/nodes:w-64"
-          placeholder="搜索名称或地址" aria-label="搜索节点" value={query} onChange={event => setQuery(event.target.value)} />
-        <div className="flex flex-wrap justify-end gap-2">
+    <div className="nodes-page @container/nodes min-w-0 space-y-3">
+      <header className="node-glass node-toolbar">
+        <h1>节点管理</h1>
+        <div className="node-search relative min-w-0">
+          <Search aria-hidden="true" className="pointer-events-none absolute start-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input type="search" className="ps-9" placeholder="搜索名称或地址" aria-label="搜索节点"
+            value={query} onChange={event => setQuery(event.target.value)} />
+        </div>
+        <div className="node-toolbar-actions">
           <AgentRollout nodes={nodes} site={site} />
           <Button variant="outline" disabled={!canProvision} onClick={() => setRegistering(true)}>
             <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}

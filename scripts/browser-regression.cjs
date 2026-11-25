@@ -20,7 +20,8 @@ const visitor = {
 const pingTask = { id: 1, name: 'IPv6 出口', target: '[2001:0db8:0000:0000:1234:5678:abcd:ef01]:443', interval: 60, nodes: [1] }
 if (mode === 'admin') {
   Object.assign(nodes[0], {ipv4: nodes[0].ip, ipv6: '2001:0db8:0000:0000:1234:5678:abcd:ef01'})
-  Object.assign(nodes[1], {name: 'Singapore-Production-Monitoring-Node-Long-Name', terminal_reason: 'plaintext', offline_only: true})
+  Object.assign(nodes[1], {name: 'Singapore-Production-Monitoring-Node-Long-Name', terminal_reason: 'plaintext', offline_only: true, price: 1188, currency: 'CNY', billing_cycle: 'yearly'})
+  Object.assign(nodes[2], {terminal_enabled: false})
 }
 
 async function main() {
@@ -148,7 +149,8 @@ async function main() {
       const firstActions = page.getByRole('group', {name: `${nodes[0].name} 操作`, exact: true})
       const inventoryTable = page.getByRole('table', {name: '节点列表'})
       const httpActions = page.getByRole('group', {name: `${nodes[1].name} 操作`, exact: true})
-      for (const width of [320, 390, 767, 768, 1024, 1280, 1440]) {
+      const blockedActions = page.getByRole('group', {name: `${nodes[2].name} 操作`, exact: true})
+      for (const width of [320, 390, 767, 768, 1024, 1086, 1280, 1440]) {
         await page.setViewportSize({width, height: width < 768 ? 844 : 1000})
         await firstActions.waitFor()
         if (width >= 768) {
@@ -170,6 +172,12 @@ async function main() {
         }
         assert(await httpActions.getByRole('button', {name: /HTTP/}).isDisabled())
         await httpActions.getByRole('button', {name:'上移', exact:true}).click({trial:true})
+        const blockedTerminal = blockedActions.getByRole('button', {name:'管理员已禁用终端', exact:true})
+        assert(await blockedTerminal.isVisible() && await blockedTerminal.isDisabled())
+        assert.equal(await blockedTerminal.evaluate(button => document.getElementById(button.getAttribute('aria-describedby'))?.textContent),
+          '终端不可用：管理员已禁用终端')
+        assert.equal(await blockedActions.getByRole('button').count(), 9, 'a disabled terminal keeps all nine actions in view')
+        await blockedActions.getByRole('button', {name:'允许节点终端', exact:true}).click({trial:true})
         await page.getByRole('button', {name:'复制升级命令', exact:true}).click({trial:true})
         const clipped = await firstActions.evaluate(group => {
           const bounds = group.getBoundingClientRect()
@@ -182,9 +190,17 @@ async function main() {
         })
         assert.equal(clipped, false, `node actions fit their row and viewport at ${width}px`)
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `nodes fit at ${width}px`)
-        if ([390, 768, 1440].includes(width)) {
+        if ([390, 768, 1086, 1440].includes(width)) {
+          await page.mouse.move(0, 0)
           await page.evaluate(() => window.scrollTo(0, 0))
           await page.screenshot({animations:'disabled', path:path.join(output, `nodes-${width}.png`)})
+          if (width === 1086) {
+            const themeToggle = page.getByRole('button', {name:'切换主题', exact:true})
+            await themeToggle.click()
+            await page.locator('html.dark').waitFor()
+            await page.screenshot({animations:'disabled', path:path.join(output, 'nodes-1086-dark.png')})
+            await themeToggle.click()
+          }
         }
       }
       await page.getByRole('button',{name:'升级 Agent',exact:true}).click()

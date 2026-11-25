@@ -7,7 +7,7 @@ import { api, type Node } from "@/lib/api"
 
 type Command = { command: string; version: string }
 
-export function OfflineUpgradeButton({ node }: { node: Node }) {
+export function OfflineUpgradeButton({ node, className = "" }: { node: Node; className?: string }) {
   const [busy, setBusy] = useState(false)
   const [manual, setManual] = useState<Command | null>(null)
   const trigger = useRef<HTMLButtonElement>(null)
@@ -54,7 +54,7 @@ export function OfflineUpgradeButton({ node }: { node: Node }) {
   }
 
   return <>
-    <Button ref={trigger} type="button" size="sm" variant="outline" className="text-foreground" disabled={busy} onClick={copyCommand}
+    <Button ref={trigger} type="button" size="sm" variant="outline" className={`text-foreground ${className}`} disabled={busy} onClick={copyCommand}
       title={`复制 ${node.name} 的离线升级命令，在独立 SSH 中执行`}>
       <Copy aria-hidden="true" />{busy ? "正在获取…" : "复制升级命令"}
     </Button>
