@@ -122,7 +122,7 @@ async function main() {
       await page.getByRole('heading',{name:'自动备份',exact:true}).waitFor()
       await page.goto(origin+'/clara/unknown-page')
       await page.getByRole('heading',{name:'后台页面不存在'}).waitFor()
-      await page.getByRole('button',{name:'返回节点管理'}).click()
+      await page.getByRole('link',{name:'返回节点管理'}).click()
       await page.getByRole('button',{name:'重新加载节点'}).waitFor()
       outage = false
       await page.getByRole('button',{name:'重新加载节点'}).click()

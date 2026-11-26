@@ -53,7 +53,7 @@ export function Login({ github, passwordEnabled, onDone }: { github: boolean; pa
         </div>
 
         {error && (
-          <p role="alert" className="break-words rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>
+          <p role="alert" data-tone="error" className="admin-notice px-3 py-2 text-sm">{error}</p>
         )}
 
         {github && (
@@ -63,7 +63,7 @@ export function Login({ github, passwordEnabled, onDone }: { github: boolean; pa
                 <GithubMark /> 使用 GitHub 登录
               </a>
             </Button>
-            {passwordEnabled && <div aria-hidden="true" className="border-t" />}
+            {passwordEnabled && <div aria-hidden="true" className="border-t border-(--admin-divider)" />}
           </>
         )}
 

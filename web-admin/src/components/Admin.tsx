@@ -8,7 +8,7 @@ import { Card } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { NativeSelect, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { api, changes, GIB, needsInventory, provisioningSite, trafficCorrection, upload, type Node, type PingTask, type VisitorRow } from "@/lib/api"
 import { bytes, CYCLES } from "@/lib/format"
@@ -48,7 +48,7 @@ function Field({ label, hint, className = "", children }: { label: string; hint?
     const result: React.ReactNode[] = []
     for (const child of Children.toArray(content)) {
       if (!isValidElement<Record<string, unknown>>(child)) { result.push(child); continue }
-      if (!linked && (child.type === Input || child.type === SelectTrigger || child.type === "textarea" || child.type === "select")) {
+      if (!linked && (child.type === Input || child.type === SelectTrigger || child.type === "textarea" || child.type === NativeSelect)) {
         const description = [child.props["aria-describedby"], hint ? `${id}-hint` : null].filter(Boolean).join(" ")
         result.push(cloneElement(child, { id, "aria-describedby": description || undefined }))
         linked = true
@@ -67,6 +67,20 @@ function Field({ label, hint, className = "", children }: { label: string; hint?
       {hint && <p id={`${id}-hint`} className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
     </div>
   )
+}
+
+function PageHeader({ title, description, children }: {
+  title: string
+  description?: React.ReactNode
+  children?: React.ReactNode
+}) {
+  return <header className="admin-page-header">
+    <div>
+      <h1>{title}</h1>
+      {description}
+    </div>
+    {children}
+  </header>
 }
 
 function LoadState({ error, retry }: { error: string; retry: () => void }) {
@@ -287,23 +301,25 @@ function NodeForm({ node, onClose, onSaved }: {
             </Field>
           </div>
           {node.traffic_incomplete && <p role="status" className="text-sm text-muted-foreground">本期流量历史不完整，当前仅包含已记录的用量。请同时校正本期上下行以确认完整计数。</p>}
-          <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
-            <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
-            <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-              按 GB 填入需要校正的值，未修改的计数器继续正常累计。
-            </p>
-            <label className="mt-3 flex items-center gap-3 text-sm"><Switch checked={calibrate} onCheckedChange={setCalibrate} />确认本期上下行是完整用量</label>
-            <div className="mt-3 grid gap-4 sm:grid-cols-2">
-              {TRAFFIC_FIELDS.map(([key, label]) => (
-                <Field key={key} label={`${label} (GB)`}>
-                  <Input
-                    type="number"
-                    step="0.001"
-                    value={traffic[key]}
-                    onChange={(e) => setTraffic((t) => ({ ...t, [key]: e.target.value }))}
-                  />
-                </Field>
-              ))}
+          <details className="admin-disclosure text-sm">
+            <summary className="font-medium"><ChevronRight aria-hidden="true" className="disclosure-arrow size-4" />流量校正</summary>
+            <div className="border-t p-3">
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                按 GB 填入需要校正的值，未修改的计数器继续正常累计。
+              </p>
+              <label className="mt-3 flex items-center gap-3 text-sm"><Switch checked={calibrate} onCheckedChange={setCalibrate} />确认本期上下行是完整用量</label>
+              <div className="mt-3 grid gap-4 sm:grid-cols-2">
+                {TRAFFIC_FIELDS.map(([key, label]) => (
+                  <Field key={key} label={`${label} (GB)`}>
+                    <Input
+                      type="number"
+                      step="0.001"
+                      value={traffic[key]}
+                      onChange={(e) => setTraffic((t) => ({ ...t, [key]: e.target.value }))}
+                    />
+                  </Field>
+                ))}
+              </div>
             </div>
           </details>
           <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
@@ -331,7 +347,7 @@ function NodeForm({ node, onClose, onSaved }: {
             <Switch checked={!!form.notify} onCheckedChange={(v) => set("notify", v)} />
           </label>
         </div>
-        <DialogFooter className="sticky -bottom-6 border-t bg-background py-3">
+        <DialogFooter className="border-t pt-4">
           <Button variant="ghost" onClick={close}>取消</Button>
           <Button onClick={save} disabled={saving}>保存</Button>
         </DialogFooter>
@@ -442,8 +458,8 @@ function BillingForm({ node, onClose, onSaved }: {
             </Field>
           </div>
         </div>
-        {history.length > 0 && <details className="text-sm"><summary className="cursor-pointer">最近续费记录</summary><ul className="mt-2 space-y-1 text-xs text-muted-foreground">{history.map((item, index) => <li key={index}>{new Date(item.created_at * 1000).toLocaleString("zh-CN")} · {item.old_date} → {item.new_date}</li>)}</ul></details>}
-        <DialogFooter className="sticky -bottom-6 border-t bg-background py-3">
+        {history.length > 0 && <details className="admin-disclosure text-sm"><summary><ChevronRight aria-hidden="true" className="disclosure-arrow size-4" />最近续费记录</summary><ul className="tnum space-y-1 border-t p-3 text-xs text-muted-foreground">{history.map((item, index) => <li key={index}>{new Date(item.created_at * 1000).toLocaleString("zh-CN")} · {item.old_date} → {item.new_date}</li>)}</ul></details>}
+        <DialogFooter className="border-t pt-4">
           <Button variant="secondary" onClick={renew} disabled={saving || dirty || !node.expires_at || ["once", "free"].includes(node.billing_cycle)}>确认已续费</Button>
           <Button variant="ghost" onClick={close}>取消</Button>
           <Button onClick={save} disabled={saving}>保存</Button>
@@ -730,14 +746,14 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
         <div className="node-toolbar-actions">
           <AgentRollout nodes={nodes} site={site} />
           <Button variant="outline" disabled={!canProvision} onClick={() => setRegistering(true)}>
-            <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
+            <Server aria-hidden="true" /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
           </Button>
           <Button disabled={!canProvision} onClick={() => setCreating(true)}>
-            <Plus /> 添加节点
+            <Plus aria-hidden="true" /> 添加节点
           </Button>
         </div>
       </header>
-      {!canProvision && <p className="rounded-lg border bg-muted/50 px-3 py-2 text-sm text-muted-foreground">添加或安装节点需要通过 HTTPS 域名访问面板。</p>}
+      {!canProvision && <p className="admin-notice px-3 py-2 text-sm">添加或安装节点需要通过 HTTPS 域名访问面板。</p>}
       <NodeInventory nodes={nodes} refresh={refresh} canProvision={canProvision} copy={copy} query={query} clearQuery={() => setQuery("")}
         onCreate={() => setCreating(true)}
         actions={{
@@ -830,11 +846,7 @@ function Visitors() {
 
   return (
     <section className="min-w-0 space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="min-w-0">
-          <h1 className="text-2xl font-semibold tracking-tight">访客记录</h1>
-          <p className="mt-1 text-sm text-muted-foreground">状态页最近 100 次访问</p>
-        </div>
+      <PageHeader title="访客记录" description={<p>状态页最近 100 次访问</p>}>
         <div className="flex flex-wrap items-center gap-2">
           <Button variant="outline" disabled={loading || clearing} onClick={load} aria-label="刷新">
             <RefreshCw aria-hidden="true" className={loading ? "motion-safe:animate-spin" : undefined} />
@@ -844,10 +856,10 @@ function Visitors() {
             <Trash2 aria-hidden="true" />清空访客记录
           </Button>
         </div>
-      </div>
+      </PageHeader>
       {rows === null && <LoadState error={error} retry={load} />}
       {rows !== null && <p role="status" className="sr-only">{loading ? "正在刷新访客记录…" : error ? "" : `当前有 ${rows.length} 条访客记录`}</p>}
-      {rows !== null && error && <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card p-3 text-sm">
+      {rows !== null && error && <div data-tone="error" className="admin-notice flex flex-wrap items-center justify-between gap-3 p-3 text-sm">
         <p role="alert" className="min-w-0 [overflow-wrap:anywhere]">刷新失败，仍在显示上次加载的记录。{error}</p>
         <Button variant="outline" size="sm" onClick={load}>重试刷新</Button>
       </div>}
@@ -965,19 +977,17 @@ function Ping({ nodes }: { nodes: Node[] }) {
 
   return (
     <div className="space-y-4">
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <div className="min-w-0">
-          <h1 className="text-2xl font-semibold tracking-tight">延迟监控</h1>
-          <p className="tnum mt-1 text-sm text-muted-foreground">{loaded && tasks.length ? `${tasks.length} 个监控目标，已分配至 ${coveredNodes} 个节点` : "查看节点到指定目标的 TCP 连接耗时"}</p>
-        </div>
+      <PageHeader title="延迟监控" description={
+        <p className="tnum">{loaded && tasks.length ? `${tasks.length} 个监控目标，已分配至 ${coveredNodes} 个节点` : "查看节点到指定目标的 TCP 连接耗时"}</p>
+      }>
         <Button onClick={(event) => openEditor({ name: "", target: "", interval: 60, nodes: [] }, event.currentTarget)}>
           <Plus aria-hidden="true" />添加监控
         </Button>
-      </header>
+      </PageHeader>
       {(error || !loaded) && <LoadState error={error} retry={load} />}
       {tasks.length > 0 && (
         <Card className="gap-0 overflow-hidden p-0">
-          <div aria-hidden="true" className={`hidden items-center gap-4 border-b bg-muted/50 px-5 py-2.5 text-xs font-medium text-muted-foreground lg:grid ${desktopColumns}`}>
+          <div aria-hidden="true" className={`hidden items-center gap-4 border-b bg-(--admin-inset) px-5 py-2.5 text-xs font-medium text-muted-foreground lg:grid ${desktopColumns}`}>
             <span>监控目标</span><span>探测间隔</span><span>运行节点</span><span className="w-28 text-right">操作</span>
           </div>
           <ul aria-label="监控目标" className="divide-y">
@@ -1189,13 +1199,11 @@ function Themes() {
   const sortedThemes = themes?.slice().sort((a, b) => Number(b.selected) - Number(a.selected)) ?? []
   return (
     <div className="space-y-4">
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <div className="min-w-0 max-w-prose">
-          <h1 className="text-2xl font-semibold tracking-tight">主题</h1>
-          <p id="theme-upload-help" className="mt-1 text-sm leading-relaxed text-muted-foreground">
-            上传 <code translate="no">theme.tar.gz</code> 会替换同名主题。主题代码会在访客的浏览器中运行，请使用可信来源的主题包。
-          </p>
-        </div>
+      <PageHeader title="主题" description={
+        <p id="theme-upload-help">
+          上传 <code translate="no">theme.tar.gz</code> 会替换同名主题。主题代码会在访客的浏览器中运行，请使用可信来源的主题包。
+        </p>
+      }>
         <Button disabled={!themes || !!busy || !!error} onClick={() => picker.current?.click()} aria-describedby="theme-upload-help">
           <Upload aria-hidden="true" />{busy === "upload" ? "安装中…" : "上传主题包"}
         </Button>
@@ -1213,7 +1221,7 @@ function Themes() {
           }}
         />
         <span role="status" className="sr-only">{busy === "upload" ? "正在安装主题…" : ""}</span>
-      </header>
+      </PageHeader>
       {(!themes || error) && <LoadState error={error} retry={load} />}
 
       {themes && <section aria-labelledby="installed-themes" className="space-y-3">
@@ -1456,7 +1464,7 @@ function SettingsTab() {
 
   return (
     <div className="space-y-4">
-      <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
+      <PageHeader title="设置" />
       {!s ? <LoadState error={error} retry={load} /> : (
       <Card className="gap-0 overflow-hidden p-0">
         <form onSubmit={event => {
@@ -1552,7 +1560,7 @@ function SettingsTab() {
 }
 
 const TEXTAREA =
-  "w-full min-w-0 rounded-md border border-input bg-transparent px-3 py-2 text-base shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30 md:text-sm"
+  "admin-field block w-full min-w-0 resize-y px-3 py-2 text-base placeholder:text-muted-foreground md:text-sm"
 
 // One offline alert, filled in the way the hub fills a template: in a single pass,
 // JSON-escaped for the webhook body. Previews only; nothing here is sent.
@@ -1577,7 +1585,7 @@ function TemplatePreview({ template, site, json = false }: { template: string; s
       out = JSON.stringify(JSON.parse(out), null, 2)
     } catch {
       return (
-        <p role="status" className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+        <p role="status" data-tone="error" className="admin-notice px-3 py-2 text-xs">
           代入后不是合法 JSON，保存会被拒绝。占位符要写在引号里，例如 "text": "{"{{title}}"}"
         </p>
       )
@@ -1586,7 +1594,7 @@ function TemplatePreview({ template, site, json = false }: { template: string; s
   return (
     <div className="space-y-1">
       <div className="text-xs text-muted-foreground">预览（以一条离线通知为例）</div>
-      <pre className="overflow-x-auto rounded-md bg-muted/50 px-3 py-2 font-mono text-xs whitespace-pre-wrap break-all">{out}</pre>
+      <pre className="admin-inset overflow-x-auto px-3 py-2 font-mono text-xs whitespace-pre-wrap break-all">{out}</pre>
     </div>
   )
 }
@@ -1595,16 +1603,16 @@ function TemplatePreview({ template, site, json = false }: { template: string; s
 // channel is configured, so the closed card still answers the common question.
 function ChannelCard({ title, configured, dirty, children }: { title: string; configured: boolean; dirty: boolean; children: React.ReactNode }) {
   return (
-    <Card className="p-4 sm:p-5">
-      <details className="group/channel">
-        <summary className="flex min-h-9 cursor-pointer list-none items-center justify-between gap-3 rounded-md outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
-          <span className="flex items-center gap-2 text-sm font-medium">
-            <ChevronRight aria-hidden="true" className="size-4 text-muted-foreground transition-transform group-open/channel:rotate-90 motion-reduce:transition-none" />
+    <Card className="gap-0 p-0">
+      <details className="admin-disclosure admin-disclosure-panel">
+        <summary className="justify-between text-sm">
+          <span className="flex items-center gap-2 font-medium">
+            <ChevronRight aria-hidden="true" className="disclosure-arrow size-4" />
             {title}
           </span>
-          <Badge variant={configured ? "secondary" : "outline"} role="status">{dirty ? "待保存" : configured ? "已配置" : "未配置"}</Badge>
+          <Badge variant={configured && !dirty ? "success" : "outline"} role="status">{dirty ? "待保存" : configured ? "已配置" : "未配置"}</Badge>
         </summary>
-        <div className="mt-4 space-y-4">{children}</div>
+        <div className="space-y-4 border-t p-4 sm:p-5">{children}</div>
       </details>
     </Card>
   )
@@ -1706,7 +1714,7 @@ function NotificationHistory() {
       <Button size="sm" variant="ghost" disabled={loading} onClick={load} aria-label="刷新投递记录"><RefreshCw aria-hidden="true" />{loading ? "刷新中…" : "刷新"}</Button>
     </div>
     {(error || !items) && <LoadState error={error} retry={load} />}
-    {items?.length === 0 && !error && <p className="rounded-lg bg-muted/40 px-3 py-2.5 text-sm text-muted-foreground">还没有投递记录。通知送往渠道后，可在这里查看结果。</p>}
+    {items?.length === 0 && !error && <p className="admin-inset px-3 py-2.5 text-sm text-muted-foreground">还没有投递记录。通知送往渠道后，可在这里查看结果。</p>}
     {!!items?.length && <ul aria-label="通知投递记录" className="max-h-96 divide-y overflow-y-auto">
       {items.map((item, index) => {
         const failed = item.status === "failed"
@@ -1732,7 +1740,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
   const { s, set, save, saving, baseline, dirtyKeys, error, load } = useSettings()
   const [testing, setTesting] = useState(false)
   const [clear, setClear] = useState<"telegram" | "webhook" | "headers" | null>(null)
-  if (!s) return <section className="space-y-4"><h1 className="text-2xl font-semibold tracking-tight">通知</h1><LoadState error={error} retry={load} /></section>
+  if (!s) return <section className="space-y-4"><PageHeader title="通知" /><LoadState error={error} retry={load} /></section>
   const text = (k: string) => String(s[k] ?? "")
   // A credential is sent only when something was typed: the field starts empty
   // because the hub never returns the stored value.
@@ -1767,15 +1775,13 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
 
   return (
     <section className="@container space-y-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <h1 className="text-2xl font-semibold tracking-tight">通知</h1>
-          <p id="notify-test-hint" role="status" className="mt-1 text-sm text-muted-foreground">{testHint || "测试通知会发送到所有已配置的渠道。"}</p>
-        </div>
+      <PageHeader title="通知" description={
+        <p id="notify-test-hint" role="status">{testHint || "测试通知会发送到所有已配置的渠道。"}</p>
+      }>
         <Button size="sm" variant="outline" disabled={testing || saving || !!testHint} aria-describedby="notify-test-hint" onClick={test}>
           <Send aria-hidden="true" />{testing ? "发送中…" : "发送测试"}
         </Button>
-      </div>
+      </PageHeader>
       <SectionLinks links={notifyLinks} />
       <div className="grid items-start gap-4 @4xl:grid-cols-2">
       <ChannelCard title="Telegram" configured={telegramReady} dirty={telegramDirty}>
@@ -1824,9 +1830,13 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
 
       <ChannelCard title="Webhook" configured={webhookReady} dirty={webhookDirty}>
         <Field label="接收渠道" hint="自动识别官方域名；自建中转请明确选择渠道。通用 HTTP 仅确认接收端返回成功。">
-          <select name="webhook-kind" className="min-h-9 w-full rounded-md border bg-background px-3 py-2 text-base text-foreground focus-visible:outline-2 focus-visible:outline-ring md:text-sm" value={text("notify_webhook_kind") || "auto"} onChange={e => set("notify_webhook_kind", e.target.value)}>
-            <option value="auto">自动识别</option><option value="http">通用 HTTP</option><option value="wecom">企业微信</option><option value="dingtalk">钉钉</option><option value="feishu">飞书 / Lark</option>
-          </select>
+          <NativeSelect name="webhook-kind" autoComplete="off" value={text("notify_webhook_kind") || "auto"} onChange={e => set("notify_webhook_kind", e.target.value)}>
+            <option value="auto">自动识别</option>
+            <option value="http">通用 HTTP</option>
+            <option value="wecom">企业微信</option>
+            <option value="dingtalk">钉钉</option>
+            <option value="feishu">飞书 / Lark</option>
+          </NativeSelect>
         </Field>
         <Field label="URL" hint={secretHint("notify_webhook_url")}>
           <Input
@@ -1845,9 +1855,9 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           <textarea rows={4} name="webhook-body" autoComplete="off" className={`${TEXTAREA} font-mono`} spellCheck={false} value={text("notify_webhook_body")} onChange={(e) => set("notify_webhook_body", e.target.value)} />
         </Field>
         <TemplatePreview template={text("notify_webhook_body")} site={text("site_name") || "Monitor"} json />
-        <details className="group/advanced rounded-lg border">
-          <summary className="flex min-h-10 cursor-pointer list-none items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
-            <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground transition-transform group-open/advanced:rotate-90 motion-reduce:transition-none" />
+        <details className="admin-disclosure">
+          <summary className="text-sm font-medium">
+            <ChevronRight aria-hidden="true" className="disclosure-arrow size-4" />
             高级请求设置
           </summary>
           <div className="space-y-4 border-t p-3">
@@ -1979,7 +1989,7 @@ function TerminalHistory() {
         <Button size="sm" variant="ghost" disabled={loading} onClick={load} aria-label="刷新终端访问审计"><RefreshCw aria-hidden="true" />{loading ? "刷新中…" : "刷新"}</Button>
       </div>
       {(error || !items) && <LoadState error={error} retry={load} />}
-      {!error && items?.length === 0 && <p className="rounded-lg bg-muted/40 px-3 py-2.5 text-sm text-muted-foreground">暂无终端访问记录</p>}
+      {!error && items?.length === 0 && <p className="admin-inset px-3 py-2.5 text-sm text-muted-foreground">暂无终端访问记录</p>}
       {!!items?.length && <ul aria-label="终端访问记录" className="max-h-80 divide-y overflow-y-auto">
         {items.map((item, i) => (
           <li key={i} className="space-y-1 py-2.5 text-xs first:pt-0 last:pb-0 [contain-intrinsic-block-size:auto_3.5rem] [content-visibility:auto] [overflow-wrap:anywhere]">
@@ -2036,7 +2046,7 @@ function Sessions() {
         <p className="mt-1 text-xs text-muted-foreground">每次登录保留 14 天。撤销会话后，对应设备需要重新登录。</p>
       </div>
       {(error || !rows) && <LoadState error={error} retry={load} />}
-      {!error && rows?.length === 0 && <p className="rounded-lg bg-muted/40 px-3 py-2.5 text-sm text-muted-foreground">暂无有效登录会话</p>}
+      {!error && rows?.length === 0 && <p className="admin-inset px-3 py-2.5 text-sm text-muted-foreground">暂无有效登录会话</p>}
       {!!rows?.length && <ul className="max-h-80 divide-y overflow-y-auto">
         {rows.map(session => {
           const time = new Date(session.created_at * 1000).toLocaleString("zh-CN")
@@ -2081,17 +2091,16 @@ function Security({ site }: { site: string }) {
 
   return (
     <section className="@container space-y-4">
-      <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-        <h1 className="text-2xl font-semibold tracking-tight">安全</h1>
+      <PageHeader title="安全">
         <SectionLinks links={securityLinks} />
-      </header>
+      </PageHeader>
       {!s ? <LoadState error={error} retry={load} /> : <div className="grid items-start gap-4 @4xl:grid-cols-2">
       <Card className="min-w-0 gap-4 p-4 sm:p-5" aria-labelledby="github-login-title">
         <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
           <h2 id="github-login-title" className="text-base font-semibold">GitHub 单点登录</h2>
-          <Badge variant={verified ? "secondary" : "outline"} role="status">{githubDirty ? "有未保存的修改" : verified ? "已验证" : s.github_status_unknown ? "验证状态待确认" : s.github_ready ? "待登录验证" : "未配置完整"}</Badge>
+          <Badge variant={verified && !githubDirty ? "success" : "outline"} role="status">{githubDirty ? "有未保存的修改" : verified ? "已验证" : s.github_status_unknown ? "验证状态待确认" : s.github_ready ? "待登录验证" : "未配置完整"}</Badge>
         </div>
-        <div className="flex flex-wrap items-start justify-between gap-2 rounded-lg bg-muted/40 p-3">
+        <div className="flex flex-wrap items-start justify-between gap-2 admin-inset p-3">
           <div className="min-w-0 space-y-1">
             <p className="text-xs font-medium text-muted-foreground">OAuth App 回调地址</p>
             <code translate="no" className="block text-xs [overflow-wrap:anywhere]">{callback}</code>
@@ -2108,7 +2117,7 @@ function Security({ site }: { site: string }) {
           </Field>
         </div>
         {String(s.github_client_id ?? "") !== "" && String(s.github_allowed_users ?? "").trim() === "" && (
-          <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive" role="status">
+          <p data-tone="warning" className="admin-notice px-3 py-2 text-sm" role="status">
             白名单为空，GitHub 登录拒绝所有人。填入用户名并保存后生效。
           </p>
         )}
@@ -2133,7 +2142,7 @@ function Security({ site }: { site: string }) {
             GitHub 不可用时的备用入口。修改后其它设备登录立即失效，当前设备不受影响。
           </p>
         </div>
-        <div className="flex min-h-11 items-center justify-between gap-4 rounded-lg bg-muted/40 p-3">
+        <div className="flex min-h-11 items-center justify-between gap-4 admin-inset p-3">
           <div className="space-y-1">
             <Label htmlFor="password-login-switch" className="cursor-pointer leading-snug">允许应急密码登录</Label>
             <p id="password-login-hint" className="text-xs leading-relaxed text-muted-foreground">
@@ -2261,7 +2270,7 @@ function Data() {
     }
   }
 
-  if (!info) return <section className="space-y-4"><h1 className="text-2xl font-semibold tracking-tight">数据与备份</h1><LoadState error={error} retry={load} /></section>
+  if (!info) return <section className="space-y-4"><PageHeader title="数据与备份" /><LoadState error={error} retry={load} /></section>
   const backup = info.scheduled_backup
   const calendar = backup?.scheduler.calendar
   const daily = calendar?.match(/^\*-\*-\* (\d{2}:\d{2}):\d{2}$/)?.[1]
@@ -2276,7 +2285,7 @@ function Data() {
 
   return (
     <div className="@container space-y-4">
-      <h1 className="text-2xl font-semibold tracking-tight">数据与备份</h1>
+      <PageHeader title="数据与备份" />
       {error && <div className="admin-load-state flex flex-wrap items-center justify-between gap-3 rounded-xl border p-4 text-sm" data-error="true">
         <p role="alert" className="min-w-0 wrap-anywhere">刷新失败，仍在显示上次读取的备份状态。{error}</p>
         <Button size="sm" variant="outline" disabled={refreshing} onClick={load}>重试刷新</Button>
@@ -2285,7 +2294,7 @@ function Data() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h2 id="scheduled-backup-title" className="text-base font-semibold">自动备份</h2>
-            <Badge variant={backup?.scheduler.state === "active" && !backup.stale ? "secondary" : "outline"} role="status" className="whitespace-normal">
+            <Badge variant={backup?.scheduler.state === "active" && !backup.stale ? "success" : "outline"} role="status" className="whitespace-normal">
               {backupState}{backup?.scheduler.state === "active" && backup.scheduler.boot_enabled === false ? "（未设置开机启用）" : ""}
             </Badge>
           </div>
@@ -2293,9 +2302,9 @@ function Data() {
             <RefreshCw aria-hidden="true" className={refreshing ? "motion-safe:animate-spin" : ""} /> {refreshing ? "刷新中…" : "刷新备份状态"}
           </Button>
         </div>
-        {info.backup_error && <p role="alert" className="rounded-md bg-destructive/10 [overflow-wrap:anywhere] px-3 py-2 text-sm text-destructive">最近备份失败：{info.backup_error}</p>}
-        {backup?.stale && <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">备份状态尚未上报或已过期，请检查服务器上的状态上报任务。</p>}
-        <dl className="grid gap-4 rounded-lg bg-muted/45 p-3 @xl:grid-cols-3 sm:p-4">
+        {info.backup_error && <p role="alert" data-tone="error" className="admin-notice px-3 py-2 text-sm">最近备份失败：{info.backup_error}</p>}
+        {backup?.stale && <p role="alert" data-tone="warning" className="admin-notice px-3 py-2 text-sm">备份状态尚未上报或已过期，请检查服务器上的状态上报任务。</p>}
+        <dl className="grid gap-4 admin-inset p-3 @xl:grid-cols-3 sm:p-4">
           {stat("最近成功（本地时间）", info.backup_success ? new Date(Number(info.backup_success) * 1000).toLocaleString("zh-CN") : "尚无成功记录")}
           {stat("下次执行（服务器时间）", (backup?.scheduler.state === "active" ? backup.scheduler.next_run : null)?.replace(/^\w+ (\d{4}-\d{2}-\d{2}) /, "$1 ") ?? "暂无下次执行时间")}
           {stat("已有备份", backup?.copies != null ? `${backup.copies} 份` : "无法读取备份目录")}
@@ -2465,7 +2474,13 @@ export function Admin({
     if (!section) return <Card className="items-start gap-3 p-5">
       <h1 className="text-xl font-semibold">后台页面不存在</h1>
       <p className="text-sm text-muted-foreground">请从导航选择页面，或返回节点管理。</p>
-      <Button variant="outline" onClick={() => go("/clara/nodes")}>返回节点管理</Button>
+      <Button variant="outline" asChild>
+        <a href="/clara/nodes" onClick={(e) => {
+          if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return
+          e.preventDefault()
+          go("/clara/nodes")
+        }}>返回节点管理</a>
+      </Button>
     </Card>
     if (!nodes) return <section className="space-y-4">
       <h1>{section.path === "/clara/nodes" ? "节点管理" : section.path === "/clara/ping" ? "延迟监控" : section.label}</h1>
@@ -2501,7 +2516,7 @@ export function Admin({
       </nav>
 
       <main id="admin-content" ref={workspace} aria-label={section?.label ?? "页面不存在"} tabIndex={-1} className="admin-workspace min-w-0 flex-1 space-y-4">
-        {usesNodes && nodes && staleSince !== null && <div role="status" className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/40 bg-popover px-4 py-2 text-sm">
+        {usesNodes && nodes && staleSince !== null && <div role="status" data-tone="warning" className="admin-notice flex flex-wrap items-center justify-between gap-2 px-4 py-2 text-sm">
           <span>节点数据更新中断。当前显示 {new Date(staleSince).toLocaleTimeString("zh-CN")} 收到的状态。</span>
           <Button variant="outline" size="sm" onClick={refresh}>重试</Button>
         </div>}

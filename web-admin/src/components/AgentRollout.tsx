@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
-import { Download } from 'lucide-react'
+import { ChevronRight, Download } from 'lucide-react'
 import { api, ApiError, provisioningSite, type Node } from '@/lib/api'
 import { Button } from '@/components/ui/button'
+import { NativeSelect } from '@/components/ui/select'
 import { OfflineUpgradeButton } from './OfflineUpgradeButton'
 import { PairCommand } from './PairCommand'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
@@ -78,14 +79,13 @@ function MaintenanceSettings({ nodes, policies, states, workers, allowPair, refr
       refresh()
     }
   }
-  return <details className="text-sm" onToggle={event => setExpanded(event.currentTarget.open)}>
-    <summary className="cursor-pointer font-medium">管理节点维护凭据</summary>
-    <div className="mt-2 space-y-2">
-      <select aria-label="维护凭据所属节点" value={id} disabled={pending} onChange={event => { setId(event.target.value); setMessage('') }}
-        className="w-full rounded-md border bg-background px-2 py-2">
+  return <details className="admin-disclosure text-sm" onToggle={event => setExpanded(event.currentTarget.open)}>
+    <summary className="font-medium"><ChevronRight aria-hidden="true" className="disclosure-arrow size-4" />管理节点维护凭据</summary>
+    <div className="space-y-2 border-t p-3">
+      <NativeSelect aria-label="维护凭据所属节点" name="maintenance-node" autoComplete="off" value={id} disabled={pending} onChange={event => { setId(event.target.value); setMessage('') }}>
         <option value="">选择节点</option>
         {nodes.map(node => <option key={node.id} value={node.id}>{node.name} · {policyLabel[policies[node.id]] ?? '未知'}</option>)}
-      </select>
+      </NativeSelect>
       {expanded && canPair && <PairCommand key={selected.id} nodeId={selected.id} name={selected.name} />}
       {policy === 'paired' && <div role="status" className="space-y-1 text-sm">
         <p>{recentV2 ? '已收到升级器 v2 心跳' : '已配对，等待升级器 v2 的新心跳'}</p>
@@ -216,22 +216,22 @@ export function AgentRollout({ nodes, site }: { nodes: Node[]; site: string }) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogTrigger asChild><Button variant="outline"><Download />升级 Agent</Button></DialogTrigger>
+      <DialogTrigger asChild><Button variant="outline"><Download aria-hidden="true" />升级 Agent</Button></DialogTrigger>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>批量升级 Agent</DialogTitle>
           <DialogDescription>首台以目标版本恢复上报后，其余已选节点将并行升级。关闭窗口后批次仍会继续。</DialogDescription>
         </DialogHeader>
-        {readError && <div role="alert" className="flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3 text-sm">
+        {readError && <div role="alert" data-tone="error" className="admin-notice flex flex-wrap items-center justify-between gap-2 p-3 text-sm">
           <span>{state ? '刷新失败，显示上次读取的状态。' : '无法读取节点状态。'}{readError}</span>
           <Button size="sm" variant="outline" onClick={() => setRevision(value => value + 1)}>重新读取</Button>
         </div>}
         {!fresh && !busy && !readError && <p role="status" className="text-sm text-muted-foreground">{state ? '正在更新上次读取的状态…' : '正在读取节点状态…'}</p>}
         {submitError && <p role="alert" className="text-sm text-destructive">{submitError}</p>}
         {batch && <BatchProgress batch={batch} name={name} />}
-        {state && !canChoose && <details className="text-sm">
-          <summary className="cursor-pointer font-medium">查看各节点升级器</summary>
-          <ul className="mt-2 max-h-64 divide-y overflow-y-auto">
+        {state && !canChoose && <details className="admin-disclosure text-sm">
+          <summary className="font-medium"><ChevronRight aria-hidden="true" className="disclosure-arrow size-4" />查看各节点升级器</summary>
+          <ul className="max-h-64 divide-y overflow-y-auto overscroll-contain border-t px-3">
             {nodes.map(node => <li key={node.id} className="py-2">
               <span className="[overflow-wrap:anywhere]">{node.name}</span>
               <WorkerInfo heartbeat={state.workers?.[node.id]} />
@@ -252,13 +252,13 @@ export function AgentRollout({ nodes, site }: { nodes: Node[]; site: string }) {
             <Button type="button" variant="ghost" disabled={!chosen.length} onClick={() => select([])}>清空选择</Button>
           </div>
           {selectionStale && <p role="alert" className="text-sm text-destructive">所选节点状态已变化，请重新选择可升级节点。</p>}
-          <div className="max-h-64 overflow-y-auto">
+          <div className="admin-inset max-h-64 overflow-y-auto overscroll-contain px-3">
             {nodes.map(node => {
               const reason = state.nodes[node.id] ?? 'offline'
               const selected = chosen.includes(node.id)
               return <div key={node.id} className="border-b py-2">
-                <label className="grid min-h-7 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-3 text-sm">
-                <input type="checkbox" disabled={!selected && (reason !== 'ready' || chosen.length >= maxBatchSize)} checked={selected}
+                <label className="grid min-h-10 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-3 text-sm">
+                <input type="checkbox" className="size-4 accent-primary" disabled={!selected && (reason !== 'ready' || chosen.length >= maxBatchSize)} checked={selected}
                   onChange={() => select(selected ? chosen.filter(id => id !== node.id) : [...chosen, node.id])} />
                 <span className="min-w-0 font-medium [overflow-wrap:anywhere]">{node.name}</span>
                 <span className="col-start-2 text-xs leading-relaxed text-muted-foreground">Agent v{node.agent_version || '?'} · {labels[reason] ?? '状态未知'}
@@ -273,10 +273,12 @@ export function AgentRollout({ nodes, site }: { nodes: Node[]; site: string }) {
         {updaterSite && canChoose && fresh && state.maintenance && <MaintenanceSettings
           nodes={nodes} policies={state.maintenance} states={state.nodes} workers={state.workers}
           allowPair={provisioningSite(location.origin) === updaterSite} refresh={() => setRevision(value => value + 1)} />}
-        {updaterSite && state && <details className="text-sm">
-          <summary className="cursor-pointer">在已有 HTTPS 节点上启用或修复升级器</summary>
-          <p className="mt-2 text-muted-foreground">先通过 SSH 或 SFTP 将本节点的维护凭据放到位，再以 root 执行。完成后核对升级器的最近心跳。</p>
-          <pre className="mt-2 whitespace-pre-wrap break-all rounded-lg border p-3 text-xs select-all">{`curl --proto '=https' -fsS ${updaterSite}/install.sh | sh -s -- --updater-only`}</pre>
+        {updaterSite && state && <details className="admin-disclosure text-sm">
+          <summary><ChevronRight aria-hidden="true" className="disclosure-arrow size-4" />在已有 HTTPS 节点上启用或修复升级器</summary>
+          <div className="space-y-2 border-t p-3">
+            <p className="text-muted-foreground">先通过 SSH 或 SFTP 将本节点的维护凭据放到位，再以 root 执行。完成后核对升级器的最近心跳。</p>
+            <pre className="admin-inset whitespace-pre-wrap break-all p-3 text-xs select-all">{`curl --proto '=https' -fsS ${updaterSite}/install.sh | sh -s -- --updater-only`}</pre>
+          </div>
         </details>}
         {canChoose && <DialogFooter>
           <span className="mr-auto min-w-0 self-center text-sm [overflow-wrap:anywhere]">{chosen.length ? `首台验证：${name(chosen[0])}` : '先勾选要验证的首台节点'}</span>

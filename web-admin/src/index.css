@@ -31,7 +31,7 @@
   --muted-foreground: oklch(0.46 0.018 260);
   --accent: oklch(0.93 0.005 260);
   --accent-foreground: oklch(0.21 0.01 260);
-  --destructive: oklch(0.62 0.23 27);
+  --destructive: oklch(0.48 0.18 26);
   --border: oklch(0.885 0.008 260);
   --input: oklch(0.885 0.008 260);
   --ring: oklch(0.62 0.19 258);
@@ -57,6 +57,12 @@
   --admin-glass: oklch(0.99 0.007 248 / 74%);
   --admin-divider: oklch(0.52 0.035 253 / 23%);
   --switch-off: oklch(0.55 0.025 252);
+  --admin-inset: oklch(0.51 0.04 256 / 6%);
+  --field-fill: oklch(1 0 0 / 56%);
+  --field-edge: oklch(0.50 0.04 256 / 43%);
+  --notice-warning: oklch(0.43 0.105 65);
+  --notice-success: oklch(0.38 0.092 151);
+  --overlay: oklch(0.20 0.03 256 / 47%);
 }
 
 .dark {
@@ -75,7 +81,7 @@
   --muted-foreground: oklch(0.75 0.014 260);
   --accent: oklch(0.29 0.008 260);
   --accent-foreground: oklch(0.97 0.004 260);
-  --destructive: oklch(0.66 0.22 26);
+  --destructive: oklch(0.77 0.14 24);
   --border: oklch(1 0 0 / 14%);
   --input: oklch(1 0 0 / 18%);
   --ring: oklch(0.64 0.20 256);
@@ -101,6 +107,12 @@
   --admin-glass: oklch(0.235 0.025 256 / 78%);
   --admin-divider: oklch(0.83 0.055 250 / 21%);
   --switch-off: oklch(0.53 0.028 252);
+  --admin-inset: oklch(0.86 0.035 252 / 7%);
+  --field-fill: oklch(0.89 0.037 250 / 6%);
+  --field-edge: oklch(0.81 0.035 250 / 39%);
+  --notice-warning: oklch(0.86 0.104 79);
+  --notice-success: oklch(0.83 0.105 152);
+  --overlay: oklch(0.10 0.02 256 / 65%);
 }
 
 @theme inline {
@@ -175,6 +187,19 @@
 
 .admin-nav { backdrop-filter: blur(12px); }
 
+.admin-page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  column-gap: 1rem;
+  row-gap: .75rem;
+}
+
+.admin-page-header > div:first-child { flex: 1 1 14rem; min-width: 0; }
+.admin-page-header > div:first-child:not(:has(p)) { flex-basis: auto; }
+.admin-page-header p { margin-top: .25rem; max-width: 65ch; color: var(--muted-foreground); font-size: .875rem; line-height: 1.5; }
+
 .admin-workspace h1 {
   font-size: 1.375rem;
   line-height: 1.875rem;
@@ -184,9 +209,84 @@
   text-wrap: balance;
 }
 
-.admin-load-state[data-error="true"] {
-  border-color: color-mix(in oklab, var(--control-danger) 32%, var(--admin-divider));
+/* Notices retain a light tint even on opaque dialog surfaces. */
+.admin-notice {
+  --notice-tint: var(--muted-foreground);
+  border: 1px solid color-mix(in oklab, var(--notice-tint) 25%, var(--admin-divider));
+  border-radius: .625rem;
+  background: color-mix(in oklab, var(--notice-tint) 7%, var(--popover));
+  color: var(--notice-tint);
+  overflow-wrap: anywhere;
 }
+
+.admin-notice[data-tone="error"], .admin-load-state[data-error="true"] { --notice-tint: var(--destructive); }
+.admin-notice[data-tone="warning"] { --notice-tint: var(--notice-warning); }
+.admin-notice[data-tone="success"] { --notice-tint: var(--notice-success); }
+.admin-load-state[data-error="true"] {
+  border-color: color-mix(in oklab, var(--notice-tint) 25%, var(--admin-divider));
+  color: var(--notice-tint);
+}
+
+.admin-inset {
+  border-radius: .625rem;
+  background: var(--admin-inset);
+  overflow-wrap: anywhere;
+}
+
+@layer components {
+  .admin-field {
+    border: 1px solid var(--field-edge);
+    border-radius: .625rem;
+    background-color: var(--field-fill);
+    color: var(--foreground);
+    caret-color: var(--foreground);
+    transition: border-color 120ms ease-out;
+  }
+
+  .admin-field:focus-visible {
+    border-color: var(--ring);
+    outline: 2px solid var(--ring);
+    outline-offset: 1px;
+  }
+
+  .admin-field[aria-invalid="true"] { border-color: var(--destructive); }
+  .admin-field:disabled { opacity: .58; }
+  .admin-field option { background-color: var(--popover); color: var(--foreground); }
+}
+
+.admin-disclosure {
+  border: 1px solid var(--admin-divider);
+  border-radius: .75rem;
+  background: var(--admin-inset);
+}
+
+.admin-disclosure-panel {
+  --disclosure-padding: 1rem;
+  border: 0;
+  border-radius: var(--radius-xl);
+  background: transparent;
+}
+
+.admin-disclosure > summary {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  min-block-size: 2.75rem;
+  padding-block: .625rem;
+  padding-inline: var(--disclosure-padding, .75rem);
+  border-radius: inherit;
+  list-style: none;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+@media (width >= 40rem) { .admin-disclosure-panel { --disclosure-padding: 1.25rem; } }
+.admin-disclosure[open] > summary { border-end-start-radius: 0; border-end-end-radius: 0; }
+.admin-disclosure > summary::-webkit-details-marker { display: none; }
+.admin-disclosure > summary:hover { background: var(--control-hover); }
+.admin-disclosure > summary:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+.admin-disclosure > summary svg { flex: none; color: var(--muted-foreground); }
+.admin-disclosure[open] > summary .disclosure-arrow { rotate: 90deg; }
 
 .admin-skip-link {
   position: fixed;
@@ -208,9 +308,16 @@
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  column-gap: .25rem;
+  gap: .125rem .25rem;
+  width: fit-content;
+  max-width: 100%;
+  padding: .1875rem .25rem;
+  border: 1px solid var(--admin-divider);
+  border-radius: .75rem;
+  background: var(--admin-glass);
   color: var(--control-accent);
 }
+.section-links > svg { margin-inline: .375rem .125rem; }
 .section-links a {
   display: inline-flex;
   align-items: center;
@@ -233,7 +340,7 @@
 }
 .admin-workspace h2[id] { scroll-margin-top: 5.25rem; }
 
-[data-slot="button"], [data-slot="switch"], [data-slot="select-trigger"], .node-address {
+[data-slot="button"], [data-slot="switch"], [data-slot="select-trigger"], .node-address, select.admin-field {
   touch-action: manipulation;
   -webkit-tap-highlight-color: var(--control-selection);
 }
@@ -241,13 +348,13 @@
 @media (pointer: coarse) {
   [data-slot="button"]:is([data-size="default"], [data-size="sm"], [data-size="lg"], [data-size="icon"], [data-size="icon-lg"]),
   [data-slot="input"],
-  [data-slot="select-trigger"] { min-block-size: 2.75rem; }
+  [data-slot="select-trigger"], select.admin-field, [data-slot="select-item"] { min-block-size: 2.75rem; }
   [data-slot="button"]:is([data-size="icon"], [data-size="icon-lg"]) { min-inline-size: 2.75rem; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   [data-slot="dialog-overlay"], [data-slot="dialog-content"], [data-slot="select-content"] { animation: none; }
-  [data-slot="switch"], [data-slot="switch-thumb"] { transition: none; }
+  [data-slot="switch"], [data-slot="switch-thumb"], .admin-field { transition: none; }
 }
 
 /* The same visual selection for in-page buttons and navigation links. */

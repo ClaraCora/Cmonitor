@@ -41,7 +41,7 @@ export function RestoreStatus() {
   if (!operation) return null
   return (
     <div role="status" aria-label="备份恢复结果" className="mx-auto max-w-[1600px] px-4 pt-4">
-      <div className="rounded-lg border bg-background p-4 text-sm">
+      <div data-tone={phase === "complete" ? "success" : phase === "unknown" ? "warning" : terminal(phase) ? "error" : undefined} className="admin-notice p-4 text-sm">
         <p>{LABELS[phase] || "正在查询备份恢复结果…"}</p>
         <div className="mt-2 flex flex-wrap gap-2">
           {!terminal(phase) && <Button size="sm" variant="outline" onClick={check}>查询恢复结果</Button>}

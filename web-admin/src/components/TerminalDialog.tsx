@@ -195,7 +195,7 @@ export function TerminalDialog({ node, onClose }: { node: Node; onClose: () => v
       <DialogDescription>终端命令在目标节点上以 root 权限执行。</DialogDescription>
     </DialogHeader>
     {!access && !error && <p role="status">正在检查终端访问权限…</p>}
-    {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+    {error && <p role="alert" data-tone="error" className="admin-notice px-3 py-2 text-sm">{error}</p>}
     {access?.github && <Button asChild variant="outline"><a href="/api/auth/github">使用 GitHub 管理员账号登录</a></Button>}
     {access?.password_login && <form className="space-y-3" onSubmit={async e => {
       e.preventDefault(); setBusy(true); setError("")
@@ -206,7 +206,7 @@ export function TerminalDialog({ node, onClose }: { node: Node; onClose: () => v
         <label htmlFor="terminal-reauth-password" className="text-sm">应急密码</label>
         <p id="terminal-password-hint" className="text-xs text-muted-foreground">使用密码打开终端，需要在最近 10 分钟内验证过密码。</p>
       </div>
-      <Input id="terminal-reauth-password" type="password" aria-describedby="terminal-password-hint" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} />
+      <Input id="terminal-reauth-password" name="password" type="password" aria-describedby="terminal-password-hint" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} />
       <Button disabled={busy || !password} type="submit">{busy ? "认证中…" : "认证并打开终端"}</Button>
     </form>}
     {!access && error && <Button onClick={() => { setError(""); void load() }}>重试</Button>}
