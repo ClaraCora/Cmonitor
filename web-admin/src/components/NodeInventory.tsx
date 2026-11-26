@@ -1,4 +1,4 @@
-import { useId, useState } from "react"
+import { useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { ArrowDown, ArrowUp, CalendarClock, Copy, Download, Eye, EyeOff, GripVertical, LockKeyhole, Pencil, Search, Server, ShieldCheck, ShieldOff, Terminal, Trash2 } from "lucide-react"
 import { toast } from "sonner"
@@ -101,6 +101,14 @@ function RowActions({ node, actions, canProvision, canMoveUp, canMoveDown, onMov
   </div>
 }
 
+const statusLabels = { all: "全部", online: "在线", offline: "离线" } as const
+type InventoryStatus = keyof typeof statusLabels
+
+function readStatus(): InventoryStatus {
+  const value = new URLSearchParams(location.search).get("status")
+  return value === "online" || value === "offline" ? value : "all"
+}
+
 export function NodeInventory({ nodes, refresh, copy, actions, canProvision, onCreate, query, clearQuery }: {
   nodes: Node[]; refresh: () => void; copy: (value: string) => void; actions: NodeActions; canProvision: boolean; onCreate: () => void; query: string; clearQuery: () => void
 }) {
@@ -114,10 +122,28 @@ export function NodeInventory({ nodes, refresh, copy, actions, canProvision, onC
     ...manualOrder.map(id => byId.get(id)).filter((node): node is Node => !!node),
     ...nodes.filter(node => !manualIds.has(node.id)),
   ]
+  const [status, setStatus] = useState(readStatus)
+  const allFilter = useRef<HTMLButtonElement>(null)
+  useEffect(() => {
+    const sync = () => setStatus(readStatus())
+    window.addEventListener("popstate", sync)
+    return () => window.removeEventListener("popstate", sync)
+  }, [])
+  function chooseStatus(next: InventoryStatus) {
+    const url = new URL(location.href)
+    if (next === "all") url.searchParams.delete("status")
+    else url.searchParams.set("status", next)
+    history.replaceState(history.state, "", url)
+    setStatus(next)
+  }
+
+  const online = nodes.filter(node => node.online).length
+  const counts = { all: nodes.length, online, offline: nodes.length - online }
   const needle = query.trim().toLowerCase()
-  const filtered = !!needle
+  const filtered = !!needle || status !== "all"
   const visible = filtered
-    ? ordered.filter(node => [node.name, node.ip, node.ipv4, node.ipv6].some(value => value?.toLowerCase().includes(needle)))
+    ? ordered.filter(node => (status === "all" || node.online === (status === "online")) &&
+      (!needle || [node.name, node.ip, node.ipv4, node.ipv6].some(value => value?.toLowerCase().includes(needle))))
     : ordered
   const canSort = !filtered && !savingOrder
 
@@ -153,11 +179,21 @@ export function NodeInventory({ nodes, refresh, copy, actions, canProvision, onC
   }
 
   return <Card className="node-glass node-inventory @container gap-0 overflow-hidden p-0">
+    <div className="node-list-tools">
+      <div role="group" aria-label="按节点状态筛选" className="node-status-filters">
+        {(Object.keys(statusLabels) as InventoryStatus[]).map(key => (
+          <Button key={key} ref={key === "all" ? allFilter : undefined} size="sm" variant="choice" aria-pressed={status === key} onClick={() => chooseStatus(key)}>
+            {statusLabels[key]} <span className="tnum">{counts[key]}</span>
+          </Button>
+        ))}
+      </div>
+      {filtered && <span role="status" className="tnum text-xs text-muted-foreground">显示 {visible.length} 台</span>}
+    </div>
     {!visible.length ? <div className="flex flex-col items-center gap-2 px-4 py-10 text-center">
       {filtered ? <Search aria-hidden="true" className="size-6 text-muted-foreground" /> : <Server aria-hidden="true" className="size-6 text-muted-foreground" />}
-      <p role="status" className="text-sm font-medium">{filtered ? "没有匹配的节点" : "还没有节点"}</p>
+      <p role="status" className="text-sm font-medium">{!needle && status === "offline" && nodes.length ? "当前没有离线节点" : filtered ? "没有匹配的节点" : "还没有节点"}</p>
       {filtered
-        ? <Button size="sm" variant="outline" onClick={clearQuery}>清除搜索</Button>
+        ? <Button size="sm" variant="outline" onClick={() => { clearQuery(); chooseStatus("all"); allFilter.current?.focus() }}>清除筛选</Button>
         : <Button size="sm" variant="outline" disabled={!canProvision} onClick={onCreate}>添加首个节点</Button>}
     </div> : <>
       <ul className="node-mobile-list divide-y md:hidden">

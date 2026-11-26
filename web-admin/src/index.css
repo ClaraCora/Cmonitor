@@ -204,6 +204,35 @@
 .admin-workspace { scroll-margin-top: 5rem; }
 .admin-workspace:focus { outline: none; }
 
+.section-links {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  column-gap: .25rem;
+  color: var(--control-accent);
+}
+.section-links a {
+  display: inline-flex;
+  align-items: center;
+  min-block-size: 2.5rem;
+  padding-inline: .625rem;
+  border-radius: .5rem;
+  font-size: .8125rem;
+  font-weight: 500;
+  touch-action: manipulation;
+}
+@media (hover: hover) {
+  .section-links a:hover { background: var(--control-hover); text-decoration: underline; }
+}
+@media (pointer: coarse) {
+  .section-links a { min-block-size: 2.75rem; }
+}
+.section-links a:focus-visible, .admin-workspace h2[tabindex]:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.admin-workspace h2[id] { scroll-margin-top: 5.25rem; }
+
 [data-slot="button"], [data-slot="switch"], [data-slot="select-trigger"], .node-address {
   touch-action: manipulation;
   -webkit-tap-highlight-color: var(--control-selection);

@@ -52,6 +52,20 @@
   border-radius: .65rem;
 }
 
+.node-list-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: .25rem .75rem;
+  padding: .4rem .75rem;
+  border-bottom: 1px solid var(--node-line);
+}
+
+.node-status-filters { display: flex; flex-wrap: wrap; gap: .25rem; }
+.node-status-filters button { gap: .4rem; }
+.node-status-filters .tnum { font-size: .75rem; }
+
 .node-search input {
   border-color: var(--node-edge);
   background: var(--node-control);

@@ -21,11 +21,12 @@ function normalise(p: string) {
 function usePath() {
   const [path, setPath] = useState(() => {
     const start = normalise(location.pathname)
-    if (start !== location.pathname) history.replaceState({}, "", start + location.search)
+    if (start !== location.pathname) history.replaceState({}, "", start + location.search + location.hash)
     return start
   })
   useEffect(() => {
     const sync = () => {
+      if (normalise(location.pathname) === path) return // A section link stays in the same form.
       if (!dispatchEvent(new Event("cmonitor:navigate", {cancelable:true}))) { history.pushState({},"",path); return }
       setPath(normalise(location.pathname))
     }

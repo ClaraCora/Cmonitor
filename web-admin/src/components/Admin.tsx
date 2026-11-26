@@ -1,5 +1,5 @@
 import { lazy, Suspense, Children, cloneElement, isValidElement, useEffect, useId, useRef, useState } from "react"
-import { Bell, ChevronRight, Copy, Database, Download, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, Trash2, Upload, Users } from "lucide-react"
+import { ArrowDownToLine, Bell, ChevronRight, Copy, Database, Download, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, Trash2, Upload, Users } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -721,11 +721,10 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
       <header className="node-glass node-toolbar">
         <div className="node-toolbar-title min-w-0">
           <h1>节点管理</h1>
-          <p className="tnum text-xs text-muted-foreground">{nodes.filter(node => node.online).length} / {nodes.length} 台在线</p>
         </div>
         <div className="node-search relative min-w-0">
           <Search aria-hidden="true" className="pointer-events-none absolute start-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input type="search" name="node-search" autoComplete="off" spellCheck={false} className="ps-9" placeholder="搜索名称或地址" aria-label="搜索节点"
+          <Input type="search" name="node-search" autoComplete="off" spellCheck={false} className="ps-9" placeholder="搜索名称或地址…" aria-label="搜索节点"
             value={query} onChange={event => setQuery(event.target.value)} />
         </div>
         <div className="node-toolbar-actions">
@@ -1428,8 +1427,32 @@ function useSettings() {
   }
 }
 
+const notifyLinks = [
+  ["offline-notify-title", "离线通知"], ["notify-rules-title", "提醒规则"], ["notification-history-title", "投递记录"],
+] as const
+const securityLinks = [["sessions-title", "登录会话"], ["terminal-history-title", "终端审计"]] as const
+
+function SectionLinks({ links }: { links: readonly (readonly [string, string])[] }) {
+  useEffect(() => {
+    const id = location.hash.slice(1)
+    if (links.some(([target]) => target === id)) document.getElementById(id)?.focus()
+  }, [links])
+  return <div className="section-links" role="group" aria-label="页内跳转">
+    <ArrowDownToLine aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+    {links.map(([id, label]) => <a key={id} href={`#${id}`}>{label}</a>)}
+  </div>
+}
+
 function SettingsTab() {
   const { s, set, save, saving, dirty, dirtyKeys, error, load } = useSettings()
+  const tagInput = useRef<HTMLTextAreaElement>(null)
+  const tagErrorId = useId()
+  const tags = [...new Set(String(s?.preset_tag ?? "").split(/[;；\r\n]/).map(tag => tag.trim()).filter(Boolean))]
+  const invalidTag = tags.find(tag => [...tag].length > 32 || /\p{Cc}/u.test(tag))
+  const tagError = invalidTag ? "每个标签最多 32 个字符，请移除标签中的控制字符或缩短名称。" :
+    tags.length > 12 ? `当前有 ${tags.length} 个不同标签，最多可设置 12 个。` : ""
+  useEffect(() => { tagInput.current?.setCustomValidity(tagError) }, [tagError])
+
 
   return (
     <div className="space-y-4">
@@ -1450,13 +1473,18 @@ function SettingsTab() {
             <Field label="预设筛选标签" hint="每行一个，也可用分号分隔。最多 12 个，每个不超过 32 字。状态页按填写顺序显示，重复项自动合并，留空隐藏。">
               <textarea
                 rows={3}
+                ref={tagInput}
                 name="preset-tags"
+                spellCheck={false}
+                aria-invalid={!!tagError || undefined}
+                aria-describedby={tagError ? tagErrorId : undefined}
                 autoComplete="off"
                 className={TEXTAREA}
                 value={String(s.preset_tag ?? "")}
                 onChange={(e) => set("preset_tag", e.target.value)}
                 placeholder={"例如：游走\n主力\n备用"}
               />
+              {tagError && <p id={tagErrorId} className="text-sm text-destructive" role="status">{tagError}</p>}
             </Field>
             <div className="divide-y border-y">
               <div className="flex min-h-11 items-center justify-between gap-4 py-2.5">
@@ -1615,7 +1643,7 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
     <Card className="gap-4 p-4 sm:p-5" aria-labelledby="offline-notify-title">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 flex-1">
-          <h2 id="offline-notify-title" className="text-base font-semibold">离线通知</h2>
+          <h2 id="offline-notify-title" tabIndex={-1} className="text-base font-semibold">离线通知</h2>
           <p className="mt-1 text-xs text-muted-foreground" role="status">{busy ? "正在更新离线通知…" : nodes.length ? `已开启 ${enabled} / ${nodes.length} 台，开关立即生效。` : "添加节点后，可在这里开启离线通知。"}</p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -1674,7 +1702,7 @@ function NotificationHistory() {
   }
   return <Card className="gap-3 p-4 sm:p-5" aria-labelledby="notification-history-title">
     <div className="flex flex-wrap items-center justify-between gap-3">
-      <h2 id="notification-history-title" className="text-base font-semibold">最近投递记录</h2>
+      <h2 id="notification-history-title" tabIndex={-1} className="text-base font-semibold">最近投递记录</h2>
       <Button size="sm" variant="ghost" disabled={loading} onClick={load} aria-label="刷新投递记录"><RefreshCw aria-hidden="true" />{loading ? "刷新中…" : "刷新"}</Button>
     </div>
     {(error || !items) && <LoadState error={error} retry={load} />}
@@ -1748,6 +1776,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           <Send aria-hidden="true" />{testing ? "发送中…" : "发送测试"}
         </Button>
       </div>
+      <SectionLinks links={notifyLinks} />
       <div className="grid items-start gap-4 @4xl:grid-cols-2">
       <ChannelCard title="Telegram" configured={telegramReady} dirty={telegramDirty}>
         <div className="grid gap-4 @2xl:grid-cols-2">
@@ -1871,7 +1900,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           event.preventDefault()
           if (ruleKeys.length && !saving) void save(Object.fromEntries(ruleKeys.map(key => [key,text(key)])))
         }}>
-        <h2 className="text-base font-semibold">提醒规则</h2>
+        <h2 id="notify-rules-title" tabIndex={-1} className="text-base font-semibold">提醒规则</h2>
         <div className="grid gap-4 @xl:grid-cols-3">
           <Field label="离线宽限期（分钟）" hint="断开超过这么久才算离线，1–30">
             <Input name="notify_grace" type="number" required min={1} max={30} value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
@@ -1944,7 +1973,7 @@ function TerminalHistory() {
     <Card className="min-w-0 gap-3 p-4 sm:p-5" aria-labelledby="terminal-history-title">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
-          <h2 id="terminal-history-title" className="text-base font-semibold">终端访问审计</h2>
+          <h2 id="terminal-history-title" tabIndex={-1} className="text-base font-semibold">终端访问审计</h2>
           <p className="mt-1 text-xs text-muted-foreground">最近 100 条访问记录，不记录命令和终端内容。</p>
         </div>
         <Button size="sm" variant="ghost" disabled={loading} onClick={load} aria-label="刷新终端访问审计"><RefreshCw aria-hidden="true" />{loading ? "刷新中…" : "刷新"}</Button>
@@ -2003,7 +2032,7 @@ function Sessions() {
   return (
     <Card className="min-w-0 gap-4 p-4 sm:p-5" aria-labelledby="sessions-title">
       <div>
-        <h2 id="sessions-title" className="text-base font-semibold">登录会话</h2>
+        <h2 id="sessions-title" tabIndex={-1} className="text-base font-semibold">登录会话</h2>
         <p className="mt-1 text-xs text-muted-foreground">每次登录保留 14 天。撤销会话后，对应设备需要重新登录。</p>
       </div>
       {(error || !rows) && <LoadState error={error} retry={load} />}
@@ -2052,7 +2081,10 @@ function Security({ site }: { site: string }) {
 
   return (
     <section className="@container space-y-4">
-      <h1 className="text-2xl font-semibold tracking-tight">安全</h1>
+      <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <h1 className="text-2xl font-semibold tracking-tight">安全</h1>
+        <SectionLinks links={securityLinks} />
+      </header>
       {!s ? <LoadState error={error} retry={load} /> : <div className="grid items-start gap-4 @4xl:grid-cols-2">
       <Card className="min-w-0 gap-4 p-4 sm:p-5" aria-labelledby="github-login-title">
         <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
@@ -2245,7 +2277,10 @@ function Data() {
   return (
     <div className="@container space-y-4">
       <h1 className="text-2xl font-semibold tracking-tight">数据与备份</h1>
-      {error && <LoadState error={error} retry={load} />}
+      {error && <div className="admin-load-state flex flex-wrap items-center justify-between gap-3 rounded-xl border p-4 text-sm" data-error="true">
+        <p role="alert" className="min-w-0 wrap-anywhere">刷新失败，仍在显示上次读取的备份状态。{error}</p>
+        <Button size="sm" variant="outline" disabled={refreshing} onClick={load}>重试刷新</Button>
+      </div>}
       <Card className="gap-4 p-4 sm:p-5" aria-labelledby="scheduled-backup-title">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -2267,12 +2302,12 @@ function Data() {
         </dl>
         <dl className="grid gap-4 @xl:grid-cols-3">
           {stat("执行时间（服务器时间）", calendar ? `${daily ? `每天 ${daily}` : calendar}${delay && delay !== "0" ? `，最多延后 ${delay}` : ""}` : "暂无计划信息")}
-          {stat("保留策略", backup?.policy ? `最近 ${backup.policy.keep} 份及最近 ${backup.policy.keep} 个备份日期的每日副本` : "等待备份任务上报")}
+          {stat("保留目标", backup?.policy ? `${backup.policy.keep} 份` : "等待备份任务上报")}
           {stat("异机复制", backup?.policy ? backup.policy.offsite ? "已配置" : "未配置，目前仅保存在本机" : "等待备份任务上报")}
         </dl>
         <div className="space-y-1.5 border-t pt-3 text-xs leading-relaxed text-muted-foreground">
           {backup?.policy && <p className="[overflow-wrap:anywhere]">备份目录：<code translate="no">{backup.policy.directory}</code></p>}
-          <p>新备份成功后才会清理旧备份。备份份数与历史数据保留天数分别计算。</p>
+          <p>备份成功后按服务器配置轮换。历史数据保留天数单独设置。</p>
           {backup?.checked_at != null && <p>上次上报（本地时间）：<time dateTime={new Date(backup.checked_at * 1000).toISOString()}>{new Date(backup.checked_at * 1000).toLocaleString("zh-CN")}</time>{backup.timezone && <>。服务器时区：{backup.timezone}</>}</p>}
         </div>
       </Card>

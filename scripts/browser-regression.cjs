@@ -214,6 +214,18 @@ async function main() {
           }
         }
       }
+      const filters = page.getByRole('group', {name:'按节点状态筛选'})
+      await filters.getByRole('button', {name:'离线 0'}).click()
+      await page.getByText('当前没有离线节点', {exact:true}).waitFor()
+      await page.reload()
+      await page.getByRole('button', {name:'离线 0', pressed:true}).waitFor()
+      await page.getByRole('button', {name:'清除筛选', exact:true}).click()
+      await filters.getByRole('button', {name:'在线 4'}).click()
+      await page.getByRole('searchbox', {name:'搜索节点'}).fill('198.51.100.1')
+      await page.getByText('显示 1 台', {exact:true}).waitFor()
+      assert(await firstActions.getByRole('button', {name:'下移', exact:true}).isDisabled())
+      await page.getByRole('searchbox', {name:'搜索节点'}).fill('')
+      await filters.getByRole('button', {name:'全部 4'}).click()
       await page.getByRole('button',{name:'升级 Agent',exact:true}).click()
       const picker=page.getByRole('dialog'); await picker.getByRole('checkbox').first().waitFor()
       assert(await picker.getByRole('checkbox').nth(1).isDisabled(),'HTTP node cannot be selected')
@@ -282,6 +294,12 @@ async function main() {
       settingsFail=false
       await page.getByRole('button',{name:'重新加载',exact:true}).click()
       await page.getByLabel('站点名称',{exact:true}).waitFor()
+      const tags = page.getByLabel('预设筛选标签',{exact:true})
+      await tags.fill(Array.from({length:13},(_,i)=>'标签'+i).join('；'))
+      const beforeInvalid = writes.filter(w => w.pathname === '/api/settings').length
+      await page.getByRole('button',{name:'保存站点设置',exact:true}).click()
+      assert(await tags.evaluate(input=>!input.validity.valid && document.activeElement === input))
+      assert.equal(writes.filter(w => w.pathname === '/api/settings').length,beforeInvalid)
       await page.getByLabel('预设筛选标签',{exact:true}).fill(' 游走 ')
       await page.getByRole('button',{name:'保存站点设置',exact:true}).click()
       await page.getByText('已保存',{exact:true}).waitFor()
@@ -320,9 +338,36 @@ async function main() {
       await pingEditor.getByRole('button', {name:'取消',exact:true}).click()
       await pingEditor.waitFor({state:'hidden'})
 
+      await page.setViewportSize({width:390,height:844})
+      for (const [route, name, id] of [
+        ['notify','投递记录','notification-history-title'], ['security','登录会话','sessions-title'],
+      ]) {
+        await page.goto(origin+'/clara/'+route)
+        const jump=page.getByRole('group',{name:'页内跳转'}).getByRole('link',{name,exact:true})
+        await jump.focus()
+        await page.keyboard.press('Enter')
+        const target=page.locator('#'+id)
+        await page.waitForFunction(id => document.activeElement.id === id,id)
+        assert((await target.boundingBox()).y >= 64, 'section is below the sticky header')
+        assert(page.url().endsWith('#'+id))
+        await page.reload()
+        await page.waitForFunction(id => document.activeElement.id === id,id)
+      }
+      for (const width of [390,1440]) {
+        await page.setViewportSize({width,height:width===390?844:1000})
+        for (const route of ['notify','security']) {
+          await page.goto(origin+'/clara/'+route)
+          const group = page.getByRole('group',{name:'页内跳转'})
+          await group.waitFor()
+          if (width===1440) await page.getByRole('button',{name:'切换主题',exact:true}).click()
+          await page.screenshot({animations:'disabled',path:path.join(output,`${route}-${width}-shortcuts.png`)})
+          if (width===1440) await page.getByRole('button',{name:'切换主题',exact:true}).click()
+        }
+      }
+      await page.setViewportSize({width:390,height:844})
       await page.goto(origin+'/clara/data')
       await page.getByRole('heading',{name:'自动备份',exact:true}).waitFor()
-      await page.getByText('最近 7 份及最近 7 个备份日期的每日副本',{exact:true}).waitFor()
+      await page.getByText('7 份',{exact:true}).waitFor()
       await page.getByText('每天 03:20，最多延后 10 分钟',{exact:true}).waitFor()
       await page.getByText('2026-11-11 03:21:27 CST',{exact:true}).waitFor()
       await page.getByText('未配置，目前仅保存在本机',{exact:true}).waitFor()
@@ -336,8 +381,8 @@ async function main() {
       assert.equal(await page.getByText('2026-11-11 03:21:27 CST',{exact:true}).count(),0,'stopped timer cannot retain a stale next run')
       backupFail=true
       await page.getByRole('button',{name:'刷新备份状态',exact:true}).click()
-      await page.getByText('加载失败：模拟备份状态加载失败').waitFor()
-      await page.getByText('最近 7 份及最近 7 个备份日期的每日副本',{exact:true}).waitFor()
+      await page.getByText('刷新失败，仍在显示上次读取的备份状态。模拟备份状态加载失败').waitFor()
+      await page.getByText('7 份',{exact:true}).waitFor()
       backupFail=false; backupState='unavailable'; backupError='模拟备份失败'; backupStale=true
       await page.getByRole('button',{name:'刷新备份状态',exact:true}).click()
       await page.getByText('无法确认定时任务状态',{exact:true}).waitFor()
