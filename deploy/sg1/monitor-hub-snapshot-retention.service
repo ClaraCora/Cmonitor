@@ -1,0 +1,15 @@
+[Unit]
+Description=Keep the three newest Cmonitor Hub rollback snapshots
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/bin/flock -n -E 75 /run/lock/cmonitor-hub-deployment.lock /usr/bin/python3 -I /usr/local/lib/cmonitor/retention.py snapshots
+SuccessExitStatus=75
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/cmonitor /run/lock

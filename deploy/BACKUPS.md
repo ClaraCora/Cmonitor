@@ -19,6 +19,25 @@ journalctl -u monitor-backup.service --since today
 
 异机副本通过服务覆盖配置增加 `--offsite backup@host:/srv/monitor/`，预先配置专用 SSH 密钥、主机指纹与远端目录；脚本不会自行建立信任或开放权限。异机复制使用 rsync 参数调用，不解释 shell 文本。远端保留策略由备份主机管理。备份含凭证，建议备份介质加密，并限制恢复权限。
 
+## SG1 的保留规则
+
+SG1 每次备份成功后保留最新 7 份，即使同一天生成多份也逐份计算。删除旧副本前会核对留下的 7 份数据库与校验清单的 SHA-256。每小时整点，独立定时器检查 `/var/backups/cmonitor` 下的 Hub 部署快照，核对最近 3 个回滚点的程序和数据库，再删除更早的快照。部署占用锁时会跳过本轮。手工归档单独保存。
+
+正常运行 `install-hub.sh` 升级 Hub 后，systemd 会继续使用已安装的备份服务覆盖配置和快照定时器，无需重新安装规则。重建 SG1 时，在 Hub 和上文的基础备份服务安装完成后，用 root 在包含本策略的仓库版本中执行：
+
+```sh
+install -d -m 0755 /usr/local/lib/cmonitor /etc/systemd/system/monitor-backup.service.d
+install -d -m 0700 /var/backups/cmonitor
+install -m 0644 deploy/sg1/retention.py /usr/local/lib/cmonitor/retention.py
+install -m 0644 deploy/sg1/monitor-backup-retention.conf /etc/systemd/system/monitor-backup.service.d/80-retention.conf
+install -m 0644 deploy/sg1/monitor-hub-snapshot-retention.service deploy/sg1/monitor-hub-snapshot-retention.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now monitor-backup.timer monitor-hub-snapshot-retention.timer
+systemctl list-timers --all monitor-backup.timer monitor-hub-snapshot-retention.timer
+```
+
+可用 `journalctl -u monitor-backup.service -u monitor-hub-snapshot-retention.service` 查看轮换记录。快照规则针对 SG1 部署流程生成的持久回滚点，通用安装器的临时回滚目录单独管理。
+
 每月用一份异机副本在隔离目录运行 `monitor-hub --db /isolated/monitor.db --check-db`，再按需要使用隔离实例和测试 Agent 检查历史与通知。`--check-db` 不启动监听、不发送通知；它会迁移指定文件，因此必须对副本操作。不要把生产数据库交给旧版本。
 
 恢复入口先上传、再独立提交；提交后根据操作 ID 查询校验、应用和完成状态。应用前保存 `monitor.db.before-restore-<操作ID>.db`。这些安全副本不会自动删除，请在确认恢复正确并已有异机副本后按运维策略清理。网络中断或服务重启时，页面会提示结果待确认，不会声称已回滚。

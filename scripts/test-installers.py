@@ -454,18 +454,52 @@ esac''')
         self.assertEqual(observed, ['bytes=32-'])
         self.assertTrue(Path(self.env['MARKER']).exists())
 
-    def hub_failure(self, old_healthy):
+    def hub_upgrade(self, old_healthy=True, new_healthy=False):
         import sqlite3
         data = self.root/'data'; data.mkdir()
         with sqlite3.connect(data/'monitor.db') as db:
             db.execute('CREATE TABLE setting(key TEXT)')
         previous = self.root/'monitor-hub'; previous.write_text('old'); previous.chmod(0o755)
+        units = self.base / 'etc/systemd/system'
+        lib = self.base / 'usr/local/lib'
+        self.unit = units / 'monitor-hub.service'
+        sg1 = ROOT / 'deploy/sg1'
+        policy = {
+            self.root / 'backup.py': ROOT / 'scripts/backup.py',
+            lib / 'cmonitor/retention.py': sg1 / 'retention.py',
+            units / 'monitor-backup.service.d/80-retention.conf': sg1 / 'monitor-backup-retention.conf',
+            units / 'monitor-hub-snapshot-retention.service': sg1 / 'monitor-hub-snapshot-retention.service',
+            units / 'monitor-hub-snapshot-retention.timer': sg1 / 'monitor-hub-snapshot-retention.timer',
+        }
+        for target, source in policy.items():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        active = self.base / 'active'
+        enabled = units / 'timers.target.wants'
+        active.mkdir()
+        enabled.mkdir()
+        timers = ('monitor-backup.timer', 'monitor-backup-status.timer', 'monitor-hub-snapshot-retention.timer')
+        for timer in timers:
+            if timer not in {path.name for path in policy}:
+                shutil.copyfile(ROOT / 'deploy' / timer, units / timer)
+            (active / timer).touch()
+            (enabled / timer).symlink_to(units / timer)
         old_unit = 'ExecStart=/unused --listen 127.0.0.1:5000 --db unused\n'
         self.unit.write_text(old_unit)
         self.stub('flock', ':'); self.stub('ss', ':')
         self.stub('install', '''if [ "$1" = -d ]; then for value in "$@"; do path=$value; done; mkdir -p "$path"; else /usr/bin/install "$@"; fi''')
-        self.stub('systemctl', f'''case "$*" in *timer*|*backup*) exit 3;; esac
-if [ "$1" = start ] && ! grep -qx old '{previous}'; then touch '{data}/new-schema'; fi
+        self.stub('systemctl', f'''action=$1; shift
+for unit in "$@"; do
+  case "$unit" in
+    *.timer) case "$action" in
+      is-active) test -f '{active}'/"$unit" || exit 3;;
+      start) touch '{active}'/"$unit";; stop) rm -f '{active}'/"$unit";;
+      disable) rm -f '{enabled}'/"$unit";;
+    esac;;
+    *backup*.service) [ "$action" != is-active ] || exit 3;;
+    monitor-hub) if [ "$action" = start ] && ! grep -qx old '{previous}'; then touch '{data}/new-schema'; fi;;
+  esac
+done
 exit 0''')
         candidate = self.base/'candidate'; candidate.write_text('#!/bin/sh\nexit 0\n')
         digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
@@ -474,16 +508,33 @@ exit 0''')
  *redirect_url*) echo 'https://example.invalid/download/v1/mock';;
  *sha256sums*) for arg in "$@"; do out=$arg; done; echo '{digest}  monitor-hub-x86_64-unknown-linux-musl' > "$out";;
  *download/*/monitor*) for arg in "$@"; do out=$arg; done; cp '{candidate}' "$out";;
+ *127.0.0.1:5001*) {'true' if new_healthy else 'false'} || exit 22; echo '{{"authed":false}}';;
  *127.0.0.1:5000*) grep -qx old '{previous}' && {old_healthy_code} || exit 22; echo '{{"authed":false}}';;
  *) exit 22;; esac''')
-        result = self.installer('install-hub.sh', [('/opt/monitor',self.root),('/etc/systemd/system/monitor-hub.service',self.unit)], ['--port','5001'])
+        edits = [('/opt/monitor', self.root), ('/etc/systemd/system', units)]
+        # The current installer has no /usr/local/lib payload. Redirect it too
+        # if a later installer starts managing files alongside the local policy.
+        if '/usr/local/lib' in (ROOT / 'install-hub.sh').read_text():
+            edits.append(('/usr/local/lib', lib))
+        result = self.installer('install-hub.sh', edits, ['--port','5001'])
+        for target, source in policy.items():
+            self.assertEqual(target.read_bytes(), source.read_bytes(), str(target))
+        for timer in timers:
+            self.assertTrue((active / timer).is_file(), timer)
+            self.assertEqual((enabled / timer).readlink(), units / timer)
+            self.assertTrue((enabled / timer).is_file(), timer)
+        if new_healthy:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(previous.read_bytes(), candidate.read_bytes())
+            return
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('已验证原运行状态' if old_healthy else '原服务未通过恢复检查', result.stderr)
         self.assertEqual(previous.read_text(),'old'); self.assertEqual(self.unit.read_text(),old_unit)
         self.assertFalse((data/'new-schema').exists()); self.assertTrue((data/'monitor.db').exists())
 
-    def test_unhealthy_hub_restores_unit_data_and_original_port(self): self.hub_failure(True)
-    def test_unhealthy_rollback_is_reported(self): self.hub_failure(False)
+    def test_hub_upgrade_preserves_sg1_retention_and_timers(self): self.hub_upgrade(new_healthy=True)
+    def test_unhealthy_hub_restores_unit_data_and_original_port(self): self.hub_upgrade()
+    def test_unhealthy_rollback_is_reported(self): self.hub_upgrade(old_healthy=False)
 
     def test_systemd_offline(self): self.offline()
     def test_openrc_offline(self): self.offline(openrc=True)

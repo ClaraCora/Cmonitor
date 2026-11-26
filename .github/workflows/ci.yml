@@ -78,6 +78,8 @@ jobs:
         run: python3 scripts/test-agent-pair.py
       - name: Verify backups with the real Hub and isolated databases
         run: python3 scripts/test-backup.py
+      - name: Verify SG1 backup and rollback retention
+        run: python3 scripts/test-sg1-retention.py
       - name: Build isolated Agent with a temporary test CA
         run: |
           python3 scripts/security-smoke-tls.py prepare .ci-agent "$RUNNER_TEMP/cmonitor-smoke-tls"

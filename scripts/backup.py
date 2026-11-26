@@ -128,9 +128,11 @@ def backup(source, directory, keep=7, offsite=None, hub=None):
             # Configured by the server operator, never a shell command. A failure
             # retains every existing local generation and is visible in the panel.
             subprocess.run(["rsync", "-a", "--protect-args", "--", str(target), str(manifest), offsite], check=True, timeout=300, capture_output=True)
-        for expired in expired_generations(directory, keep):
-            expired.unlink()
-            expired.with_suffix(".json").unlink(missing_ok=True)
+        # A host can delegate retention to a verified systemd ExecStartPost.
+        if os.environ.get("CMONITOR_BACKUP_RETENTION") != "post-success":
+            for expired in expired_generations(directory, keep):
+                expired.unlink()
+                expired.with_suffix(".json").unlink(missing_ok=True)
         record(source, "backup_last_success", int(time.time()))
         record(source, "backup_last_error", "")
         return {"file": str(target), "sha256": digest, "nodes": nodes}
