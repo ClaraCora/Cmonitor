@@ -39,11 +39,7 @@
   padding: .75rem;
 }
 
-.node-toolbar h1 {
-  font-size: 1.1875rem;
-  font-weight: 650;
-  letter-spacing: -.02em;
-}
+.node-toolbar-title { display: grid; gap: .125rem; }
 
 .node-toolbar-actions {
   display: flex;
@@ -120,6 +116,11 @@
 .node-status-pill[data-online="true"] {
   background: color-mix(in oklab, var(--node-green) 10%, transparent);
   color: var(--node-green);
+}
+
+.node-status-pill[data-online="false"] {
+  background: color-mix(in oklab, var(--node-red) 9%, transparent);
+  color: var(--node-red);
 }
 
 .node-table .node-status { flex-direction: column; align-items: flex-start; }

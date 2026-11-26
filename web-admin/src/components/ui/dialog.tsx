@@ -49,20 +49,42 @@ function DialogContent({
   className,
   children,
   showCloseButton = true,
+  onOpenAutoFocus,
+  onCloseAutoFocus,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean
 }) {
+  const returnFocus = React.useRef<HTMLElement | null>(null)
+
   return (
     <DialogPortal data-slot="dialog-portal">
       <DialogOverlay />
       <DialogPrimitive.Content
         data-slot="dialog-content"
         className={cn(
-          "fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border bg-background p-6 shadow-lg duration-200 outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 sm:max-w-lg",
-          "max-h-[calc(100dvh-2rem)] overflow-y-auto transition-none",
+          "fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-xl border bg-popover p-4 text-popover-foreground shadow-lg duration-200 outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 sm:max-w-lg sm:p-6",
+          "max-h-[calc(100dvh-2rem)] overflow-y-auto overscroll-contain transition-none",
           className
         )}
+        onOpenAutoFocus={event => {
+          returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+          onOpenAutoFocus?.(event)
+          const dialog = event.target
+          if (dialog instanceof HTMLElement && !dialog.contains(document.activeElement) &&
+              (event.defaultPrevented || matchMedia("(pointer: coarse)").matches)) {
+            event.preventDefault()
+            dialog.focus({ preventScroll: true })
+          }
+        }}
+        onCloseAutoFocus={event => {
+          onCloseAutoFocus?.(event)
+          const opener = returnFocus.current
+          if (!event.defaultPrevented && opener?.isConnected && opener !== document.body && !opener.matches(":disabled")) {
+            event.preventDefault()
+            opener.focus({ preventScroll: true })
+          }
+        }}
         {...props}
       >
         {children}
@@ -82,7 +104,7 @@ function DialogHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="dialog-header"
-      className={cn("min-w-0 flex flex-col gap-2 text-left [overflow-wrap:anywhere] [&_[data-slot=dialog-title]]:pe-7", className)}
+      className={cn("min-w-0 flex flex-col gap-2 text-left [overflow-wrap:anywhere] [&_[data-slot=dialog-title]]:pe-9", className)}
       {...props}
     />
   )
@@ -100,7 +122,7 @@ function DialogFooter({
     <div
       data-slot="dialog-footer"
       className={cn(
-        "flex flex-col-reverse gap-2 sm:flex-row sm:justify-end",
+        "flex flex-col gap-2 sm:flex-row sm:justify-end",
         className
       )}
       {...props}
@@ -122,7 +144,7 @@ function DialogTitle({
   return (
     <DialogPrimitive.Title
       data-slot="dialog-title"
-      className={cn("text-lg leading-none font-semibold", className)}
+      className={cn("text-lg leading-snug font-semibold", className)}
       {...props}
     />
   )

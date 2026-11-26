@@ -127,6 +127,17 @@ async function main() {
       outage = false
       await page.getByRole('button',{name:'重新加载节点'}).click()
       await page.getByRole('button',{name:'添加节点',exact:true}).waitFor()
+      await page.reload()
+      const skipLink = page.getByRole('link', {name: '跳转到后台内容'})
+      const main = page.getByRole('main', {name: '节点', exact: true})
+      await skipLink.waitFor()
+      await main.waitFor()
+      await page.keyboard.press('Tab')
+      assert(await skipLink.evaluate(link => document.activeElement === link), 'first tab reaches the main-content skip link')
+      await page.keyboard.press('Enter')
+      assert(await main.evaluate(element => document.activeElement === element), 'skip link moves keyboard focus to main')
+      await page.keyboard.press('Tab')
+      assert(await main.evaluate(element => element.contains(document.activeElement)), 'the next tab stays in page content and skips the navigation')
       const sections = [
         ['访客', '访问明细'], ['延迟', pingTask.name], ['通知', '提醒规则'],
         ['数据与备份', '自动备份'], ['主题', '默认主题'], ['安全', '应急密码'], ['设置', '公开状态页'],
@@ -216,7 +227,9 @@ async function main() {
       await picker.getByRole('button',{name:'开始升级（3 台）'}).click()
       assert.deepEqual(JSON.parse(writes.find(w=>w.pathname==='/api/agent-upgrades').body),{nodes:[4,1,3]})
       await page.keyboard.press('Escape');await page.setViewportSize({width:1440,height:1000})
-      await page.getByRole('button',{name:'编辑节点',exact:true}).first().click()
+      const editButton = page.getByRole('button',{name:'编辑节点',exact:true}).first()
+      await editButton.focus()
+      await page.keyboard.press('Enter')
       const dialog=page.getByRole('dialog')
       await dialog.getByLabel('流量计算方式',{exact:true}).waitFor()
       await dialog.getByLabel('名称',{exact:true}).fill('未保存修改')
@@ -228,6 +241,7 @@ async function main() {
       await dialog.getByLabel('名称',{exact:true}).fill(nodes[0].name+' 已编辑')
       await dialog.getByRole('button',{name:'保存',exact:true}).click()
       await dialog.waitFor({state:'hidden'})
+      await page.waitForFunction(() => document.activeElement?.getAttribute('aria-label') === '编辑节点')
       const saves=writes.filter(w=>w.pathname===`/api/nodes/${nodes[0].id}`)
       assert.equal(saves.length,1)
       assert.equal(writes.filter(w=>w.pathname.endsWith('/traffic')).length,0,'one atomic save request')

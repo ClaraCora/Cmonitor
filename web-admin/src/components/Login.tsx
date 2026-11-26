@@ -4,7 +4,6 @@ import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Separator } from "@/components/ui/separator"
 import { api } from "@/lib/api"
 
 /** lucide removed brand marks in v1, and the GitHub logo is what makes this
@@ -32,6 +31,7 @@ export function Login({ github, passwordEnabled, onDone }: { github: boolean; pa
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
+    if (busy) return
     setBusy(true)
     setError("")
     try {
@@ -45,9 +45,12 @@ export function Login({ github, passwordEnabled, onDone }: { github: boolean; pa
   }
 
   return (
-    <div className="grid min-h-svh place-items-center p-6">
+    <main className="grid min-h-svh place-items-center p-4 sm:p-6">
       <Card className="w-full max-w-sm gap-5 p-6">
-        <h1 className="text-lg font-semibold">登录后台</h1>
+        <div className="flex items-center gap-3">
+          <img src={`${import.meta.env.BASE_URL}favicon.svg`} alt="" width={36} height={36} className="size-9 shrink-0 rounded-lg" />
+          <h1 className="text-xl font-semibold tracking-tight">登录后台</h1>
+        </div>
 
         {error && (
           <p role="alert" className="break-words rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>
@@ -60,12 +63,7 @@ export function Login({ github, passwordEnabled, onDone }: { github: boolean; pa
                 <GithubMark /> 使用 GitHub 登录
               </a>
             </Button>
-            {passwordEnabled && <div className="relative">
-              <Separator />
-              <span className="absolute inset-0 -top-2 mx-auto w-fit bg-card px-2 text-xs text-muted-foreground">
-                或使用应急密码
-              </span>
-            </div>}
+            {passwordEnabled && <div aria-hidden="true" className="border-t" />}
           </>
         )}
 
@@ -75,18 +73,19 @@ export function Login({ github, passwordEnabled, onDone }: { github: boolean; pa
             <Input
               id="password"
               type="password"
+              name="password"
+              required
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               autoComplete="current-password"
-              autoFocus={!github}
             />
           </div>
-          <Button type="submit" className="w-full" disabled={busy || !password}>
+          <Button type="submit" className="w-full" disabled={busy}>
             {busy ? "登录中…" : "登录"}
           </Button>
         </form>}
         {!passwordEnabled && <p className="text-sm text-muted-foreground">应急密码登录已关闭。{github ? "请使用 GitHub 登录。" : "请由服务器管理员恢复登录配置。"}</p>}
       </Card>
-    </div>
+    </main>
   )
 }

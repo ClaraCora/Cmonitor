@@ -24,7 +24,7 @@ function NodeStatus({ node }: { node: Node }) {
   const unseen = Date.now() / 1000 - node.last_seen
   return <div className="node-status flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
     <span className="node-status-pill" data-online={node.online}><span aria-hidden="true" className="size-1.5 rounded-full bg-current" />{node.online ? "在线" : "离线"}</span>
-    {!node.public && <span className="inline-flex items-center gap-1"><EyeOff className="size-3" />不公开</span>}
+    {!node.public && <span className="inline-flex items-center gap-1"><EyeOff aria-hidden="true" className="size-3" />不公开</span>}
     {node.agent_version && <span className="tnum wrap-anywhere">Cagent {node.agent_version}</span>}
     {!node.online && node.last_seen > 0 && unseen >= 60 && <span className="tnum">上次上报于 {uptime(unseen)}前</span>}
   </div>
@@ -37,7 +37,7 @@ function NodeAddresses({ node, copy }: { node: Node; copy: (value: string) => vo
       <button key={value} type="button" title="点击复制地址" aria-label={`复制地址 ${value}`}
         className="node-address group flex min-h-6 max-w-full cursor-pointer items-center gap-1 rounded text-left text-xs leading-relaxed focus-visible:outline-2 focus-visible:outline-ring"
         onClick={() => copy(value)}>
-        <span className="font-mono break-all">{value}</span>
+        <span translate="no" className="font-mono break-all">{value}</span>
         <Copy aria-hidden="true" className="size-3 shrink-0 text-muted-foreground opacity-60 group-hover:opacity-100 group-focus-visible:opacity-100" />
       </button>
     )) : <span className="text-xs text-muted-foreground">暂无地址</span>}

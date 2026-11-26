@@ -15,6 +15,7 @@
 /* The same iOS palette as the public theme: one product, one look. Cards are
    translucent and frost the wallpaper; popovers and dialogs stay opaque. */
 :root {
+  color-scheme: light;
   --radius: 0.75rem;
   --background: oklch(0.96 0.005 260);
   --foreground: oklch(0.21 0.01 260);
@@ -52,9 +53,14 @@
   --control-selection: oklch(0.62 0.19 256 / 12%);
   --control-selection-hover: oklch(0.62 0.19 256 / 17%);
   --control-selection-edge: oklch(0.55 0.16 256 / 23%);
+  --admin-chrome: oklch(0.975 0.012 248 / 88%);
+  --admin-glass: oklch(0.99 0.007 248 / 74%);
+  --admin-divider: oklch(0.52 0.035 253 / 23%);
+  --switch-off: oklch(0.55 0.025 252);
 }
 
 .dark {
+  color-scheme: dark;
   --background: oklch(0.155 0.005 260);
   --foreground: oklch(0.97 0.004 260);
   --card: oklch(0.235 0.007 260 / 55%);
@@ -91,6 +97,10 @@
   --control-selection: oklch(0.66 0.16 252 / 19%);
   --control-selection-hover: oklch(0.66 0.16 252 / 26%);
   --control-selection-edge: oklch(0.71 0.13 249 / 31%);
+  --admin-chrome: oklch(0.19 0.024 256 / 92%);
+  --admin-glass: oklch(0.235 0.025 256 / 78%);
+  --admin-divider: oklch(0.83 0.055 250 / 21%);
+  --switch-off: oklch(0.53 0.028 252);
 }
 
 @theme inline {
@@ -129,8 +139,9 @@
   * { @apply border-border outline-ring/50; }
   /* Reserve the scrollbar's width on every page: without it, leaving a route
      whose content exceeds the fold widens the page. */
-  html { scrollbar-gutter: stable; }
+  html { scrollbar-gutter: stable; scroll-padding-top: 5rem; }
   body { @apply bg-background text-foreground; }
+  ::selection { background: var(--control-selection); color: var(--foreground); }
   /* The same wallpapers the status page sits on, under this app's /clara/
      base rather than the theme's root. */
   body {
@@ -151,6 +162,64 @@
 
 /* Tabular figures keep live numbers from shifting as they update. */
 .tnum { font-variant-numeric: tabular-nums; }
+
+.admin-topbar {
+  background-color: var(--admin-chrome);
+  border-color: var(--admin-divider);
+}
+
+.admin-nav, .admin-load-state {
+  background-color: var(--admin-glass);
+  border-color: var(--admin-divider);
+}
+
+.admin-nav { backdrop-filter: blur(12px); }
+
+.admin-workspace h1 {
+  font-size: 1.375rem;
+  line-height: 1.875rem;
+  font-weight: 650;
+  letter-spacing: -.025em;
+  overflow-wrap: anywhere;
+  text-wrap: balance;
+}
+
+.admin-load-state[data-error="true"] {
+  border-color: color-mix(in oklab, var(--control-danger) 32%, var(--admin-divider));
+}
+
+.admin-skip-link {
+  position: fixed;
+  inset: .5rem auto auto 1rem;
+  z-index: 30;
+  padding: .625rem 1rem;
+  border-radius: var(--radius);
+  background-color: var(--control-primary);
+  color: white;
+  translate: 0 -150%;
+}
+
+.admin-skip-link:focus { translate: none; outline: 2px solid var(--ring); }
+
+.admin-workspace { scroll-margin-top: 5rem; }
+.admin-workspace:focus { outline: none; }
+
+[data-slot="button"], [data-slot="switch"], [data-slot="select-trigger"], .node-address {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: var(--control-selection);
+}
+
+@media (pointer: coarse) {
+  [data-slot="button"]:is([data-size="default"], [data-size="sm"], [data-size="lg"], [data-size="icon"], [data-size="icon-lg"]),
+  [data-slot="input"],
+  [data-slot="select-trigger"] { min-block-size: 2.75rem; }
+  [data-slot="button"]:is([data-size="icon"], [data-size="icon-lg"]) { min-inline-size: 2.75rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-slot="dialog-overlay"], [data-slot="dialog-content"], [data-slot="select-content"] { animation: none; }
+  [data-slot="switch"], [data-slot="switch-thumb"] { transition: none; }
+}
 
 /* The same visual selection for in-page buttons and navigation links. */
 .admin-choice {

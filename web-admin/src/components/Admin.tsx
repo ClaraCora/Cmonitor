@@ -32,6 +32,10 @@ const TRAFFIC_MODES: Record<string, string> = {
 }
 
 function copy(text: string) {
+  if (!navigator.clipboard) {
+    toast.error("当前浏览器无法访问剪贴板，请手动复制")
+    return
+  }
   navigator.clipboard.writeText(text).then(
     () => toast.success("已复制"),
     () => toast.error("复制失败"),
@@ -45,7 +49,9 @@ function Field({ label, hint, className = "", children }: { label: string; hint?
     for (const child of Children.toArray(content)) {
       if (!isValidElement<Record<string, unknown>>(child)) { result.push(child); continue }
       if (!linked && (child.type === Input || child.type === SelectTrigger || child.type === "textarea" || child.type === "select")) {
-        result.push(cloneElement(child, { id, "aria-describedby": hint ? `${id}-hint` : undefined })); linked = true
+        const description = [child.props["aria-describedby"], hint ? `${id}-hint` : null].filter(Boolean).join(" ")
+        result.push(cloneElement(child, { id, "aria-describedby": description || undefined }))
+        linked = true
       } else if (child.props.children) {
         const [children, found] = link(child.props.children as React.ReactNode, linked)
         result.push(cloneElement(child, {}, children)); linked = found
@@ -64,8 +70,8 @@ function Field({ label, hint, className = "", children }: { label: string; hint?
 }
 
 function LoadState({ error, retry }: { error: string; retry: () => void }) {
-  return <div role={error ? "alert" : "status"} className="flex flex-wrap items-center gap-3 rounded-lg border p-4 text-sm">
-    <span>{error ? `加载失败：${error}` : "正在加载…"}</span>
+  return <div className="admin-load-state flex flex-wrap items-center justify-between gap-3 rounded-xl border p-4 text-sm" data-error={!!error}>
+    <span role={error ? "alert" : "status"} className="min-w-0 wrap-anywhere">{error ? `加载失败：${error}` : "正在加载…"}</span>
     {error && <Button size="sm" variant="outline" onClick={retry}>重新加载</Button>}
   </div>
 }
@@ -119,14 +125,22 @@ function CreateNode({ onClose, onSaved }: {
 }) {
   const [name, setName] = useState("")
   const [saving, setSaving] = useState(false)
+  const [error, setError] = useState("")
+  const nameInput = useRef<HTMLInputElement>(null)
 
   const canClose = useDirtyGuard(!!name, saving)
   const close = () => { if (canClose()) onClose() }
 
   async function save(e: React.FormEvent) {
     e.preventDefault()
-    if (!name.trim()) return toast.error("请填写节点名称")
+    if (saving) return
+    if (!name.trim()) {
+      setError("请填写节点名称")
+      nameInput.current?.focus()
+      return
+    }
     setSaving(true)
+    setError("")
     try {
       await api("/nodes", {
         method: "POST",
@@ -136,7 +150,7 @@ function CreateNode({ onClose, onSaved }: {
       onClose()
       onSaved()
     } catch (e) {
-      toast.error((e as Error).message)
+      setError((e as Error).message || "添加节点失败，请重试。")
     } finally {
       setSaving(false)
     }
@@ -150,12 +164,13 @@ function CreateNode({ onClose, onSaved }: {
           <DialogDescription>添加后，在节点的「安装 Agent」中复制命令。使用注册窗口安装的 HTTPS 节点会自动配对升级器。单节点使用上报 Token 安装后，须另行配对维护凭据。</DialogDescription>
         </DialogHeader>
         <form className="space-y-4" onSubmit={save}>
-          <Field label="名称">
-            <Input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="香港 · 甲商家" />
+          <Field label="名称" hint={error && <span role="alert" className="text-destructive wrap-anywhere">{error}</span>}>
+            <Input ref={nameInput} required name="node-name" autoComplete="off" aria-invalid={!!error} value={name}
+              onChange={(e) => { setName(e.target.value); setError("") }} placeholder="例如香港节点" />
           </Field>
           <DialogFooter className="border-t pt-4">
             <Button type="button" variant="ghost" onClick={close}>取消</Button>
-            <Button type="submit" disabled={saving}>添加</Button>
+            <Button type="submit" disabled={saving}>{saving ? "正在添加…" : "添加节点"}</Button>
           </DialogFooter>
         </form>
       </DialogContent>
@@ -704,10 +719,13 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   return (
     <div className="nodes-page @container/nodes min-w-0 space-y-3">
       <header className="node-glass node-toolbar">
-        <h1>节点管理</h1>
+        <div className="node-toolbar-title min-w-0">
+          <h1>节点管理</h1>
+          <p className="tnum text-xs text-muted-foreground">{nodes.filter(node => node.online).length} / {nodes.length} 台在线</p>
+        </div>
         <div className="node-search relative min-w-0">
           <Search aria-hidden="true" className="pointer-events-none absolute start-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input type="search" className="ps-9" placeholder="搜索名称或地址" aria-label="搜索节点"
+          <Input type="search" name="node-search" autoComplete="off" spellCheck={false} className="ps-9" placeholder="搜索名称或地址" aria-label="搜索节点"
             value={query} onChange={event => setQuery(event.target.value)} />
         </div>
         <div className="node-toolbar-actions">
@@ -814,24 +832,26 @@ function Visitors() {
   return (
     <section className="min-w-0 space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
+        <div className="min-w-0">
           <h1 className="text-2xl font-semibold tracking-tight">访客记录</h1>
           <p className="mt-1 text-sm text-muted-foreground">状态页最近 100 次访问</p>
         </div>
-        <div className="flex items-center gap-1">
-          <Button variant="outline" size="sm" disabled={loading || clearing} onClick={load} title="刷新" aria-label="刷新">
-            <RefreshCw aria-hidden="true" />刷新
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="outline" disabled={loading || clearing} onClick={load} aria-label="刷新">
+            <RefreshCw aria-hidden="true" className={loading ? "motion-safe:animate-spin" : undefined} />
+            {loading ? "刷新中…" : "刷新"}
           </Button>
-          <Button variant="ghost" size="icon" disabled={!rows?.length || clearing} onClick={() => setConfirmClear(true)} title="清空访客记录" aria-label="清空访客记录">
-            <Trash2 aria-hidden="true" className="text-destructive" />
+          <Button variant="ghost" disabled={!rows?.length || clearing} onClick={() => setConfirmClear(true)} className="text-destructive not-disabled:hover:bg-destructive/10 not-disabled:hover:text-destructive">
+            <Trash2 aria-hidden="true" />清空访客记录
           </Button>
         </div>
       </div>
       {rows === null && <LoadState error={error} retry={load} />}
-      {rows !== null && loading && <p role="status" className="text-sm text-muted-foreground">正在刷新访客记录…</p>}
-      {rows !== null && error && <p role="alert" className="rounded-lg border p-3 text-sm [overflow-wrap:anywhere]">
-        刷新失败，当前显示上次加载的记录。{error}
-      </p>}
+      {rows !== null && <p role="status" className="sr-only">{loading ? "正在刷新访客记录…" : error ? "" : `当前有 ${rows.length} 条访客记录`}</p>}
+      {rows !== null && error && <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card p-3 text-sm">
+        <p role="alert" className="min-w-0 [overflow-wrap:anywhere]">刷新失败，仍在显示上次加载的记录。{error}</p>
+        <Button variant="outline" size="sm" onClick={load}>重试刷新</Button>
+      </div>}
       {rows && <Suspense fallback={<p role="status" className="text-sm text-muted-foreground">正在加载访客分布…</p>}>
         <VisitorOverview rows={rows} />
       </Suspense>}
@@ -845,12 +865,15 @@ function Ping({ nodes }: { nodes: Node[] }) {
   const [editing, setEditing] = useState<Partial<PingTask> | null>(null)
   const [initialEditing, setInitialEditing] = useState<Partial<PingTask> | null>(null)
   const [nodeQuery, setNodeQuery] = useState("")
-  const [saveError, setSaveError] = useState("")
+  const [saveError, setSaveError] = useState<{ field?: "name" | "target"; message: string } | null>(null)
+  const editorTitle = useRef<HTMLHeadingElement>(null)
+  const editorTrigger = useRef<HTMLButtonElement>(null)
   const nameInput = useRef<HTMLInputElement>(null)
   const targetInput = useRef<HTMLInputElement>(null)
-  const openEditor = (value: Partial<PingTask>) => {
+  const openEditor = (value: Partial<PingTask>, trigger: HTMLButtonElement) => {
+    editorTrigger.current = trigger
     setNodeQuery("")
-    setSaveError("")
+    setSaveError(null)
     setInitialEditing(value)
     setEditing(value)
   }
@@ -878,26 +901,26 @@ function Ping({ nodes }: { nodes: Node[] }) {
   async function save() {
     if (!editing) return
     if (!editing.name?.trim()) {
-      setSaveError("请输入监控名称。")
+      setSaveError({ field: "name", message: "请输入监控名称。" })
       nameInput.current?.focus()
       return
     }
     const target = editing.target?.trim() ?? ""
     const match = /^(?:\[[^\]\s]+\]|[^:[\]\s/]+):(\d+)$/.exec(target)
     if (!match || Number(match[1]) < 1 || Number(match[1]) > 65535) {
-      setSaveError("请输入主机和 1–65535 之间的端口，例如 example.com:443。IPv6 地址请用方括号包裹。")
+      setSaveError({ field: "target", message: "请输入主机和 1–65535 之间的端口。IPv6 地址请用方括号包裹。" })
       targetInput.current?.focus()
       return
     }
-    setSaveError("")
+    setSaveError(null)
     setSaving(true)
     try {
-      await api("/ping-tasks", { method: "POST", body: JSON.stringify(editing) })
+      await api("/ping-tasks", { method: "POST", body: JSON.stringify({ ...editing, name: editing.name.trim(), target }) })
       toast.success(editing.nodes?.length ? "已保存监控分配" : "监控已保存，尚未分配运行节点")
       setEditing(null)
       load()
     } catch (e) {
-      setSaveError((e as Error).message || "保存失败，请重试")
+      setSaveError({ message: (e as Error).message || "保存失败，请重试。" })
     } finally {
       setSaving(false)
     }
@@ -926,7 +949,8 @@ function Ping({ nodes }: { nodes: Node[] }) {
     })
 
   const coveredNodes = new Set(tasks.flatMap((task) => task.nodes)).size
-  const selectedCount = editing?.nodes?.length ?? 0
+  const selectedIds = new Set(editing?.nodes)
+  const selectedCount = nodes.filter(node => selectedIds.has(node.id)).length
   const query = nodeQuery.trim().toLowerCase()
   const visibleNodes = query ? nodes.filter((node) => node.name.toLowerCase().includes(query)) : nodes
   const visibleIds = new Set(visibleNodes.map(node => node.id))
@@ -943,14 +967,12 @@ function Ping({ nodes }: { nodes: Node[] }) {
   return (
     <div className="space-y-4">
       <header className="flex flex-wrap items-center justify-between gap-3">
-        <div>
+        <div className="min-w-0">
           <h1 className="text-2xl font-semibold tracking-tight">延迟监控</h1>
-          {loaded && !error && (
-            <p className="tnum mt-1 text-sm text-muted-foreground">{tasks.length} 个监控目标 · 已分配至 {coveredNodes} 个节点</p>
-          )}
+          <p className="tnum mt-1 text-sm text-muted-foreground">{loaded && tasks.length ? `${tasks.length} 个监控目标，已分配至 ${coveredNodes} 个节点` : "查看节点到指定目标的 TCP 连接耗时"}</p>
         </div>
-        <Button onClick={() => openEditor({ name: "", target: "", interval: 60, nodes: [] })}>
-          <Plus /> 添加监控
+        <Button onClick={(event) => openEditor({ name: "", target: "", interval: 60, nodes: [] }, event.currentTarget)}>
+          <Plus aria-hidden="true" />添加监控
         </Button>
       </header>
       {(error || !loaded) && <LoadState error={error} retry={load} />}
@@ -964,20 +986,18 @@ function Ping({ nodes }: { nodes: Node[] }) {
               <li key={task.id} className={`grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 px-4 py-3 sm:px-5 lg:gap-x-4 ${desktopColumns}`}>
                 <div className="col-span-2 min-w-0 space-y-1 lg:col-auto">
                   <h2 className="text-sm font-semibold [overflow-wrap:anywhere]">{task.name}</h2>
-                  <p className="font-mono text-xs leading-relaxed text-muted-foreground [overflow-wrap:anywhere]">{task.target}</p>
+                  <p translate="no" className="font-mono text-xs leading-relaxed text-muted-foreground [overflow-wrap:anywhere]">{task.target}</p>
                 </div>
-                <div className="tnum flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground lg:contents lg:text-sm">
-                  <span><span className="lg:sr-only">每 </span>{task.interval} 秒</span>
-                  <span className={task.nodes.length ? "lg:text-foreground" : "font-medium"}>
-                    {task.nodes.length ? <>{task.nodes.length} 个节点</> : "未分配节点"}
-                  </span>
-                </div>
+                <dl className="tnum flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground lg:contents lg:text-sm">
+                  <div><dt className="sr-only">探测间隔</dt><dd><span aria-hidden="true" className="lg:hidden">每 </span>{task.interval} 秒</dd></div>
+                  <div><dt className="sr-only">运行节点</dt><dd className={task.nodes.length ? "lg:text-foreground" : "font-medium"}>{task.nodes.length ? `${task.nodes.length} 个节点` : "未分配节点"}</dd></div>
+                </dl>
                 <div className="flex items-center justify-end gap-1 lg:w-28">
-                  <Button variant="ghost" size="sm" className="h-10" onClick={() => openEditor(task)} aria-label={`编辑监控：${task.name}`}>
-                    <Pencil /> 编辑
+                  <Button variant="ghost" size="sm" onClick={(event) => openEditor(task, event.currentTarget)} aria-label={`编辑监控：${task.name}`}>
+                    <Pencil aria-hidden="true" />编辑
                   </Button>
-                  <Button variant="ghost" size="icon" className="size-10 text-muted-foreground hover:bg-destructive/10 hover:text-destructive" onClick={() => setDeleting(task)} title="删除监控" aria-label={`删除监控：${task.name}`}>
-                    <Trash2 />
+                  <Button variant="ghost" size="icon" className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive" onClick={() => setDeleting(task)} title="删除监控" aria-label={`删除监控：${task.name}`}>
+                    <Trash2 aria-hidden="true" />
                   </Button>
                 </div>
               </li>
@@ -995,34 +1015,36 @@ function Ping({ nodes }: { nodes: Node[] }) {
 
       {editing && (
         <Dialog open onOpenChange={(open) => !open && closeEditor()}>
-          <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="flex flex-col gap-0 overflow-hidden p-0 sm:max-w-xl">
+          <DialogContent onOpenAutoFocus={(event) => { event.preventDefault(); editorTitle.current?.focus() }}
+            onCloseAutoFocus={(event) => { event.preventDefault(); editorTrigger.current?.focus() }}
+            className="flex flex-col gap-0 overflow-hidden p-0 sm:max-w-xl sm:p-0">
             <DialogHeader className="shrink-0 px-5 pt-5 pr-12 pb-4 text-left">
-              <DialogTitle>{editing.id ? "编辑监控" : "添加监控"}</DialogTitle>
+              <DialogTitle ref={editorTitle} tabIndex={-1}>{editing.id ? "编辑监控" : "添加监控"}</DialogTitle>
               <DialogDescription>设置 TCP 探测目标，并指定哪些节点负责上报。</DialogDescription>
             </DialogHeader>
             <form onSubmit={(event) => { event.preventDefault(); if (!saving) void save() }} className="flex min-h-0 flex-col">
-              <div className="min-h-0 overflow-y-auto px-5 pb-4">
+              <div className="min-h-0 overflow-y-auto overscroll-contain px-5 pb-4">
                 <fieldset disabled={saving} className="min-w-0 space-y-4">
                 <div className="grid grid-cols-[minmax(0,1fr)_6.5rem] gap-4 sm:grid-cols-[minmax(0,1fr)_9rem]">
-                  <Field label="名称">
-                    <Input ref={nameInput} required autoFocus={!editing.id} value={editing.name ?? ""} onChange={(e) => { setSaveError(""); setEditing({ ...editing, name: e.target.value }) }} placeholder="Cloudflare" />
+                  <Field label="名称" hint={saveError?.field === "name" ? <span role="alert" className="text-destructive">{saveError.message}</span> : undefined}>
+                    <Input ref={nameInput} name="name" autoComplete="off" required aria-invalid={saveError?.field === "name"} value={editing.name ?? ""} onChange={(e) => { setSaveError(null); setEditing({ ...editing, name: e.target.value }) }} placeholder="例如 Cloudflare" />
                   </Field>
                   <Field label="间隔（秒）" hint="5–3600 秒">
-                    <Input required type="number" min="5" max="3600" value={editing.interval ?? ""} onChange={(e) => setEditing({ ...editing, interval: e.target.value === "" ? undefined : Number(e.target.value) })} />
+                    <Input required name="interval" type="number" min="5" max="3600" autoComplete="off" value={editing.interval ?? ""} onChange={(e) => setEditing({ ...editing, interval: e.target.value === "" ? undefined : Number(e.target.value) })} />
                   </Field>
                 </div>
-                <Field label="目标地址" hint="填写主机和端口。IPv6 示例：[2001:db8::1]:443">
-                  <Input ref={targetInput} required autoCapitalize="none" spellCheck={false} value={editing.target ?? ""} onChange={(e) => { setSaveError(""); setEditing({ ...editing, target: e.target.value }) }} placeholder="1.1.1.1:443" />
+                <Field label="目标地址" hint={saveError?.field === "target" ? <span role="alert" className="text-destructive">{saveError.message}</span> : "填写主机和端口。IPv6 示例：[2001:db8::1]:443"}>
+                  <Input ref={targetInput} required name="target" autoComplete="off" autoCapitalize="none" spellCheck={false} aria-invalid={saveError?.field === "target"} value={editing.target ?? ""} onChange={(e) => { setSaveError(null); setEditing({ ...editing, target: e.target.value }) }} placeholder="例如 1.1.1.1:443" />
                 </Field>
                 <fieldset className="min-w-0 border-t pt-3">
                   <legend className="float-left w-full text-sm font-medium">运行节点</legend>
                   {nodes.length > 8 && <div className="clear-both pt-2">
-                    <Input type="search" value={nodeQuery} aria-label="查找运行节点" placeholder="按节点名称查找"
+                    <Input type="search" name="node-search" autoComplete="off" value={nodeQuery} aria-label="查找运行节点" placeholder="按节点名称查找…"
                       onChange={event => setNodeQuery(event.target.value)}
                       onKeyDown={event => { if (event.key === "Enter") event.preventDefault() }} />
                   </div>}
-                  <div className="clear-both mb-2 flex min-h-9 items-center justify-between gap-2 text-xs text-muted-foreground">
-                    <span className="tnum" aria-live="polite">已选 {selectedCount} / {nodes.length}{query && ` · 匹配 ${visibleNodes.length}`}</span>
+                  <div className="clear-both mb-2 flex min-h-9 flex-wrap items-center justify-between gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                    <span className="tnum" role="status">已选 {selectedCount} / {nodes.length}{query && `，匹配 ${visibleNodes.length} 个`}</span>
                     {nodes.length > 0 && (
                       <div className="flex gap-1">
                         <Button type="button" variant="ghost" size="sm" disabled={selectedVisible === visibleNodes.length} onClick={() => setVisibleSelection(true)}>{query ? "选中匹配" : "全选"}</Button>
@@ -1030,10 +1052,10 @@ function Ping({ nodes }: { nodes: Node[] }) {
                       </div>
                     )}
                   </div>
-                  <div className="grid max-h-48 gap-1 overflow-y-auto rounded-lg border bg-muted/20 p-1.5 sm:grid-cols-2">
+                  <div className="grid max-h-48 gap-1 overflow-y-auto overscroll-contain rounded-lg border bg-muted/20 p-1.5 sm:grid-cols-2">
                     {visibleNodes.map((n) => (
                       <label key={n.id} className="flex min-h-10 min-w-0 cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-sm hover:bg-accent has-checked:bg-primary/10 focus-within:ring-2 focus-within:ring-inset focus-within:ring-ring">
-                        <input type="checkbox" checked={editing.nodes?.includes(n.id) ?? false} onChange={() => toggle(n.id)} className="size-4 shrink-0 accent-primary" />
+                        <input type="checkbox" name="running-nodes" value={n.id} checked={selectedIds.has(n.id)} onChange={() => toggle(n.id)} className="size-4 shrink-0 accent-primary" />
                         <span className="[overflow-wrap:anywhere]">{n.name}</span>
                       </label>
                     ))}
@@ -1045,7 +1067,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
                 </fieldset>
               </div>
               <div className="shrink-0 border-t px-5 py-3">
-                {saveError && <p role="alert" className="mb-2 max-h-20 overflow-auto text-sm text-destructive [overflow-wrap:anywhere]">{saveError}</p>}
+                {saveError && !saveError.field && <p role="alert" className="mb-2 max-h-20 overflow-auto text-sm text-destructive [overflow-wrap:anywhere]">{saveError.message}</p>}
                 <DialogFooter className="flex-row justify-end">
                   <Button type="button" variant="ghost" onClick={closeEditor} disabled={saving}>取消</Button>
                   <Button type="submit" disabled={saving}>{saving ? "保存中…" : "保存"}</Button>
@@ -1086,8 +1108,10 @@ function Themes() {
   const [themes, setThemes] = useState<Theme[] | null>(null)
   const [busy, setBusy] = useState("")
   const [doomed, setDoomed] = useState<Theme | null>(null)
-  const [zoomed, setZoomed] = useState<Theme | null>(null)
+  const [zoomed, setZoomed] = useState<{ theme: Theme; width: number; height: number } | null>(null)
+  const [previewRevision, setPreviewRevision] = useState(0)
   const picker = useRef<HTMLInputElement>(null)
+  const previewTrigger = useRef<HTMLButtonElement>(null)
 
   const [error, setError] = useState("")
   const load = () => { setError(""); return api<{ themes: Theme[] }>("/themes").then((data) => setThemes(data.themes)).catch((e: Error) => setError(e.message || "网络错误")) }
@@ -1115,6 +1139,7 @@ function Themes() {
       // reloading the list only brings this page up to date.
       toast.success(`已安装 ${theme.name} ${theme.version}`)
       dispatchEvent(new Event("cmonitor:site-updated"))
+      setPreviewRevision(revision => revision + 1)
       await load()
     } catch (e) {
       toast.error((e as Error).message)
@@ -1137,6 +1162,7 @@ function Themes() {
       toast.success(updated ? `${theme.name} 已更新到 ${version}` : `${theme.name} 已是最新版本 ${version}`)
       if (updated) {
         dispatchEvent(new Event("cmonitor:site-updated"))
+        setPreviewRevision(revision => revision + 1)
         await load()
       }
     } catch (e) {
@@ -1161,116 +1187,134 @@ function Themes() {
     }
   }
 
-  if (!themes) return <LoadState error={error} retry={load} />
+  const sortedThemes = themes?.slice().sort((a, b) => Number(b.selected) - Number(a.selected)) ?? []
   return (
     <div className="space-y-4">
-      <h1 className="text-2xl font-semibold tracking-tight">主题</h1>
-      {error && <LoadState error={error} retry={load} />}
-      <Card className="gap-3 p-4 sm:flex-row sm:items-center sm:justify-between sm:gap-6 sm:p-5">
-        <div className="min-w-0">
-          <h2 className="text-sm font-semibold">安装主题</h2>
-          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            上传可信来源的 <code>theme.tar.gz</code>。同名主题会被替换，主题代码将在访客浏览器中执行。
+      <header className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0 max-w-prose">
+          <h1 className="text-2xl font-semibold tracking-tight">主题</h1>
+          <p id="theme-upload-help" className="mt-1 text-sm leading-relaxed text-muted-foreground">
+            上传 <code translate="no">theme.tar.gz</code> 会替换同名主题。主题代码会在访客的浏览器中运行，请使用可信来源的主题包。
           </p>
         </div>
-        <div className="shrink-0">
-          <Button size="sm" disabled={!!busy} onClick={() => picker.current?.click()}>
-            <Upload /> {busy === "upload" ? "安装中…" : "上传主题包"}
-          </Button>
-          <input
-            ref={picker}
-            type="file"
-            accept=".gz,.tgz,application/gzip"
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0]
-              e.target.value = ""
-              if (file) install(file)
-            }}
-          />
-        </div>
-      </Card>
+        <Button disabled={!themes || !!busy || !!error} onClick={() => picker.current?.click()} aria-describedby="theme-upload-help">
+          <Upload aria-hidden="true" />{busy === "upload" ? "安装中…" : "上传主题包"}
+        </Button>
+        <input
+          ref={picker}
+          type="file"
+          name="theme-package"
+          aria-label="选择主题包"
+          accept=".gz,.tgz,application/gzip"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0]
+            e.target.value = ""
+            if (file) void install(file)
+          }}
+        />
+        <span role="status" className="sr-only">{busy === "upload" ? "正在安装主题…" : ""}</span>
+      </header>
+      {(!themes || error) && <LoadState error={error} retry={load} />}
 
-      {/* items-start：有预览图和没有的卡片不该为了等高而留白 */}
-      <div className="grid items-start gap-3 sm:grid-cols-2">
-        {themes.map((theme) => (
-          <Card key={theme.short} className={`min-w-0 gap-3 p-4 sm:p-5 ${theme.selected ? "border-primary/35" : ""}`}>
-            {/* 主题包里可选的 preview.png，所以后端不用告诉前端有没有这张图：
-                没有就是 404，图一直不显示。hidden 挂在 <a> 上而不是 <img> 上——
-                隐藏的是整个链接，否则卡片里留着一个高度为 0 却照样吃 gap-4 的空
-                链接。必须从 hidden 开始：带边框的 aspect-video 空盒子会在响应回
-                来之前就画出来，闪一下再消失。
-                缩略图被压到卡片那点宽度，比例不是 16:9 的还会被 object-cover
-                裁掉边，所以图本身要能点开看原尺寸——就地开一个对话框，不跳走。 */}
-            <button
-              type="button"
-              title="查看完整预览图"
-              hidden
-              className="cursor-zoom-in"
-              onClick={() => setZoomed(theme)}
-            >
-              <img
-                src={`/api/themes/${theme.short}/preview`}
-                alt={`${theme.name} 预览图`}
-                onLoad={(e) => { e.currentTarget.parentElement!.hidden = false }}
-                className="aspect-video w-full rounded-md border object-cover object-top"
-              />
-            </button>
-            <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <h2 className="min-w-0 break-words font-semibold">{theme.name}</h2>
-                {theme.selected && <Badge>当前</Badge>}
-                {theme.builtin && <Badge variant="secondary" className="font-normal">内置</Badge>}
-              </div>
-              {theme.description && <p className="mt-2 break-words text-sm leading-relaxed">{theme.description}</p>}
-              <p className="mt-1.5 break-words text-xs text-muted-foreground">
-                {[theme.author, theme.version].filter(Boolean).join(" · ")}
-              </p>
-            </div>
-            <div className="flex flex-wrap items-center gap-2 border-t pt-3">
-              <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected || !!busy || !!error} onClick={() => select(theme.short)}>
-                {busy === `select:${theme.short}` ? "切换中…" : theme.selected ? "使用中" : "使用"}
-              </Button>
-              {updatable(theme) && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  title="从 GitHub 的最新 Release 检查更新"
-                  aria-label={`从 GitHub 更新 ${theme.name}`}
-                  disabled={!!busy || !!error}
-                  onClick={() => update(theme)}
+      {themes && <section aria-labelledby="installed-themes" className="space-y-3">
+        <h2 id="installed-themes" className="text-sm font-semibold">已安装主题 <span className="tnum ml-1.5 font-normal text-muted-foreground">{themes.length}</span></h2>
+        {!themes.length && <Card className="gap-1.5 p-5">
+          <p className="font-medium">暂无可用主题</p>
+          <p className="text-sm text-muted-foreground">上传主题包后即可为状态页启用。</p>
+        </Card>}
+        <div className="grid items-start gap-3 sm:grid-cols-2">
+          {sortedThemes.map((theme) => {
+            const canUpdate = updatable(theme)
+            const sourceUrl = /^https?:\/\//i.test(theme.url) ? theme.url : undefined
+            return (
+              <Card key={theme.short} className={`min-w-0 gap-3 p-4 sm:p-5 ${theme.selected ? "border-primary/35" : ""}`}>
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="min-w-0 font-semibold [overflow-wrap:anywhere]">{theme.name}</h3>
+                    {theme.selected && <Badge className="border-(--control-selection-edge) bg-(--control-selection) text-(--control-accent)">当前使用</Badge>}
+                    {theme.builtin && <Badge variant="secondary" className="font-normal">内置</Badge>}
+                  </div>
+                  {theme.description && <p className="mt-2 text-sm leading-relaxed [overflow-wrap:anywhere]">{theme.description}</p>}
+                  {(theme.author || theme.version) && <p translate="no" className="tnum mt-1.5 text-xs text-muted-foreground [overflow-wrap:anywhere]">
+                    {[theme.author, theme.version].filter(Boolean).join(" · ")}
+                  </p>}
+                </div>
+                {/* Optional preview.png returns 404. Keep the button out of the layout until it loads. */}
+                <button
+                  key={previewRevision}
+                  type="button"
+                  aria-label={`查看预览：${theme.name}`}
+                  hidden
+                  className="group relative cursor-zoom-in rounded-md focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                  onClick={(event) => {
+                    const image = event.currentTarget.querySelector("img")
+                    if (!image) return
+                    previewTrigger.current = event.currentTarget
+                    setZoomed({ theme, width: image.naturalWidth, height: image.naturalHeight })
+                  }}
                 >
-                  <RefreshCw className={busy === `update:${theme.short}` ? "animate-spin" : ""} />
-                  {busy === `update:${theme.short}` ? "检查中…" : "检查更新"}
-                </Button>
-              )}
-              {/* The built-in theme is served from the binary and has no
-                  directory to delete -- it is also the fallback everything
-                  else lands on. */}
-              {!theme.builtin && (
-                <Button size="icon" variant="ghost" title={`删除 ${theme.name}`} aria-label={`删除 ${theme.name}`} disabled={!!busy || !!error} onClick={() => setDoomed(theme)}>
-                  <Trash2 />
-                </Button>
-              )}
-              {theme.url && <a className="ml-auto py-2 text-xs text-muted-foreground underline underline-offset-4 hover:text-foreground" href={theme.url} target="_blank" rel="noreferrer">源码</a>}
-            </div>
-          </Card>
-        ))}
-      </div>
+                  <img
+                    src={`/api/themes/${theme.short}/preview?rev=${previewRevision}`}
+                    alt=""
+                    width={640}
+                    height={360}
+                    decoding="async"
+                    onLoad={(event) => { if (event.currentTarget.parentElement) event.currentTarget.parentElement.hidden = false }}
+                    className="aspect-video h-auto w-full rounded-md border object-cover object-top"
+                  />
+                  <span className="absolute right-2 bottom-2 rounded-sm border bg-popover px-2 py-1 text-xs text-foreground group-hover:bg-accent">查看预览</span>
+                </button>
+                {(!theme.selected || canUpdate || !theme.builtin || sourceUrl) && <div className="flex flex-wrap items-center gap-1 border-t pt-3 sm:gap-2">
+                  {!theme.selected && <Button size="sm" variant="outline" disabled={!!busy || !!error} onClick={() => select(theme.short)}>
+                    {busy === `select:${theme.short}` ? "切换中…" : "启用主题"}
+                  </Button>}
+                  {canUpdate && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      title="从 GitHub 的最新 Release 检查更新"
+                      aria-label={`检查更新：${theme.name}`}
+                      disabled={!!busy || !!error}
+                      onClick={() => update(theme)}
+                    >
+                      <RefreshCw aria-hidden="true" className={busy === `update:${theme.short}` ? "motion-safe:animate-spin" : undefined} />
+                      {busy === `update:${theme.short}` ? "检查中…" : "检查更新"}
+                    </Button>
+                  )}
+                  {/* The built-in theme is served from the binary and has no
+                      directory to delete -- it is also the fallback everything
+                      else lands on. */}
+                  {!theme.builtin && (
+                    <Button size="icon" variant="ghost" title={`删除 ${theme.name}`} aria-label={`删除 ${theme.name}`} disabled={!!busy || !!error} onClick={() => setDoomed(theme)}>
+                      <Trash2 aria-hidden="true" />
+                    </Button>
+                  )}
+                  {sourceUrl && <Button asChild variant="link" size="sm" className="ml-auto px-1.5 text-xs">
+                    <a href={sourceUrl} target="_blank" rel="noreferrer" aria-label={`在新标签页查看 ${theme.name} 源码`}>源码</a>
+                  </Button>}
+                </div>}
+              </Card>
+            )
+          })}
+        </div>
+      </section>}
 
       {/* 原图，不是卡片上那张裁过的：宽度给到 4xl，高度让 80vh 兜住，
           object-contain 保证整张都在框里而不是被切一刀。 */}
       {zoomed && (
         <Dialog open onOpenChange={(open) => !open && setZoomed(null)}>
-          <DialogContent className="sm:max-w-4xl">
+          <DialogContent className="overscroll-contain sm:max-w-4xl" onCloseAutoFocus={event => { event.preventDefault(); previewTrigger.current?.focus() }}>
             <DialogHeader>
-              <DialogTitle>{zoomed.name} 预览图</DialogTitle>
-              <DialogDescription>{zoomed.author} · {zoomed.version}</DialogDescription>
+              <DialogTitle>{zoomed.theme.name} 预览图</DialogTitle>
+              <DialogDescription>公开状态页的主题预览</DialogDescription>
             </DialogHeader>
             <img
-              src={`/api/themes/${zoomed.short}/preview`}
-              alt={`${zoomed.name} 预览图`}
-              className="max-h-[80vh] w-full rounded-md border object-contain"
+              src={`/api/themes/${zoomed.theme.short}/preview?rev=${previewRevision}`}
+              alt={`${zoomed.theme.name} 预览图`}
+              width={zoomed.width}
+              height={zoomed.height}
+              className="max-h-[75dvh] w-full rounded-md border object-contain"
             />
           </DialogContent>
         </Dialog>
@@ -1386,26 +1430,28 @@ function useSettings() {
 
 function SettingsTab() {
   const { s, set, save, saving, dirty, dirtyKeys, error, load } = useSettings()
-  if (!s) return <LoadState error={error} retry={load} />
 
   return (
     <div className="space-y-4">
       <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
+      {!s ? <LoadState error={error} retry={load} /> : (
       <Card className="gap-0 overflow-hidden p-0">
         <form onSubmit={event => {
           event.preventDefault()
           const patch = Object.fromEntries([...dirtyKeys].map(key => [key, String(s[key] ?? "").trim()]))
-          if (dirty) void save(patch)
+          if (dirty && !saving) void save(patch)
         }}>
-        <div className="grid divide-y lg:grid-cols-2 lg:divide-x lg:divide-y-0">
+        <div className="grid divide-y xl:grid-cols-2 xl:divide-x xl:divide-y-0">
           <section aria-labelledby="public-settings-title" className="min-w-0 space-y-5 p-4 sm:p-5">
-            <h2 id="public-settings-title" className="text-sm font-semibold">公开状态页</h2>
+            <h2 id="public-settings-title" className="text-base font-semibold">公开状态页</h2>
             <Field label="站点名称">
-              <Input value={String(s.site_name ?? "")} onChange={(e) => set("site_name", e.target.value)} placeholder="Monitor" />
+              <Input name="site-name" autoComplete="off" value={String(s.site_name ?? "")} onChange={(e) => set("site_name", e.target.value)} placeholder="Monitor" />
             </Field>
-            <Field label="预设筛选标签" hint="每行一个，也可用中英文分号分隔。最多 12 个，每个 32 字，重复项自动合并。按钮按填写顺序显示在国别之前，精确匹配标签文字。留空隐藏。">
+            <Field label="预设筛选标签" hint="每行一个，也可用分号分隔。最多 12 个，每个不超过 32 字。状态页按填写顺序显示，重复项自动合并，留空隐藏。">
               <textarea
                 rows={3}
+                name="preset-tags"
+                autoComplete="off"
                 className={TEXTAREA}
                 value={String(s.preset_tag ?? "")}
                 onChange={(e) => set("preset_tag", e.target.value)}
@@ -1413,22 +1459,22 @@ function SettingsTab() {
               />
             </Field>
             <div className="divide-y border-y">
-              <div className="flex items-center justify-between gap-4 py-3">
+              <div className="flex min-h-11 items-center justify-between gap-4 py-2.5">
                 <div>
-                  <div id="public-page-label" className="text-sm">开放公开状态页</div>
+                  <Label htmlFor="public-page-switch" className="cursor-pointer leading-snug">开放公开状态页</Label>
                   <p id="public-page-hint" className="mt-0.5 text-xs text-muted-foreground">关闭后，所有页面均需登录才能访问。</p>
                 </div>
                 <Switch
-                  aria-labelledby="public-page-label"
+                  id="public-page-switch"
                   aria-describedby="public-page-hint"
                   checked={s.public_page !== "off"}
                   onCheckedChange={(v) => set("public_page", v ? "on" : "off")}
                 />
               </div>
-              <div className="flex items-center justify-between gap-4 py-3">
-                <span id="visitor-card-label" className="text-sm">在状态页底部显示访客信息</span>
+              <div className="flex min-h-11 items-center justify-between gap-4 py-2.5">
+                <Label htmlFor="visitor-card-switch" className="cursor-pointer leading-snug">在状态页显示访客信息</Label>
                 <Switch
-                  aria-labelledby="visitor-card-label"
+                  id="visitor-card-switch"
                   checked={s.visitor_card !== "off"}
                   onCheckedChange={(v) => set("visitor_card", v ? "on" : "off")}
                 />
@@ -1436,10 +1482,12 @@ function SettingsTab() {
             </div>
           </section>
           <section aria-labelledby="hub-settings-title" className="min-w-0 space-y-5 p-4 sm:p-5">
-            <h2 id="hub-settings-title" className="text-sm font-semibold">Hub 运行设置</h2>
+            <h2 id="hub-settings-title" className="text-base font-semibold">Hub 运行设置</h2>
             <Field label="历史数据保留天数" hint="可保留 1–3650 天。超期明细自动清理，累计流量不受影响。">
               <Input
                 type="number"
+                name="retention-days"
+                autoComplete="off"
                 min={1} max={3650} step={1} required
                 value={String(s.retention_days ?? "")}
                 onChange={(e) => set("retention_days", e.target.value)}
@@ -1448,10 +1496,13 @@ function SettingsTab() {
             </Field>
             <Field
               label="GitHub 代理"
-              hint="留空直连。仅在 hub 自己拉不到 GitHub Release 时填。这个地址返回的字节会被安装到每一台节点上，只填信得过的镜像"
+              hint="Hub 无法直连 GitHub 下载发布包时，可填写可信镜像。Agent 安装和升级会使用这个来源，留空则直连。"
             >
               <Input
                 type="url" pattern="https://.+" title="请输入以 https:// 开头的地址，或留空以直连 GitHub"
+                name="github-proxy"
+                autoComplete="off"
+                spellCheck={false}
                 value={String(s.github_proxy ?? "")}
                 onChange={(e) => set("github_proxy", e.target.value)}
                 placeholder="https://ghfast.top"
@@ -1459,20 +1510,21 @@ function SettingsTab() {
             </Field>
           </section>
         </div>
-        <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-2 border-t bg-muted/20 px-4 py-3 sm:px-5">
-          {dirty && <span className="text-xs text-muted-foreground">有未保存的修改</span>}
-          <Button size="sm" type="submit" disabled={saving || !dirty}>
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t bg-muted/20 px-4 py-3 sm:px-5">
+          <span role="status" className="text-xs text-muted-foreground">{saving ? "正在保存修改…" : dirty ? "有未保存的修改" : ""}</span>
+          <Button size="sm" type="submit" className="ml-auto" disabled={saving || !dirty}>
             {saving ? "保存中…" : "保存站点设置"}
           </Button>
         </div>
         </form>
       </Card>
+      )}
     </div>
   )
 }
 
 const TEXTAREA =
-  "w-full min-w-0 rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+  "w-full min-w-0 rounded-md border border-input bg-transparent px-3 py-2 text-base shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30 md:text-sm"
 
 // One offline alert, filled in the way the hub fills a template: in a single pass,
 // JSON-escaped for the webhook body. Previews only; nothing here is sent.
@@ -1497,7 +1549,7 @@ function TemplatePreview({ template, site, json = false }: { template: string; s
       out = JSON.stringify(JSON.parse(out), null, 2)
     } catch {
       return (
-        <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+        <p role="status" className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
           代入后不是合法 JSON，保存会被拒绝。占位符要写在引号里，例如 "text": "{"{{title}}"}"
         </p>
       )
@@ -1515,14 +1567,14 @@ function TemplatePreview({ template, site, json = false }: { template: string; s
 // channel is configured, so the closed card still answers the common question.
 function ChannelCard({ title, configured, dirty, children }: { title: string; configured: boolean; dirty: boolean; children: React.ReactNode }) {
   return (
-    <Card className="p-5">
-      <details className="group">
+    <Card className="p-4 sm:p-5">
+      <details className="group/channel">
         <summary className="flex min-h-9 cursor-pointer list-none items-center justify-between gap-3 rounded-md outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
           <span className="flex items-center gap-2 text-sm font-medium">
-            <ChevronRight className="size-4 text-muted-foreground transition-transform group-open:rotate-90" />
+            <ChevronRight aria-hidden="true" className="size-4 text-muted-foreground transition-transform group-open/channel:rotate-90 motion-reduce:transition-none" />
             {title}
           </span>
-          <Badge variant={configured ? "secondary" : "outline"}>{dirty ? "待保存" : configured ? "已配置" : "未配置"}</Badge>
+          <Badge variant={configured ? "secondary" : "outline"} role="status">{dirty ? "待保存" : configured ? "已配置" : "未配置"}</Badge>
         </summary>
         <div className="mt-4 space-y-4">{children}</div>
       </details>
@@ -1560,22 +1612,22 @@ function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }
 
   const enabled = nodes.filter((n) => n.notify).length
   return (
-    <Card className="gap-4 p-5">
+    <Card className="gap-4 p-4 sm:p-5" aria-labelledby="offline-notify-title">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 flex-1">
-          <h2 className="text-sm font-medium">离线通知</h2>
-          <p className="mt-1 text-xs text-muted-foreground">{nodes.length ? `已打开 ${enabled} / ${nodes.length} 台，开关立即生效。` : "添加节点后，可在这里开启离线通知。"}</p>
+          <h2 id="offline-notify-title" className="text-base font-semibold">离线通知</h2>
+          <p className="mt-1 text-xs text-muted-foreground" role="status">{busy ? "正在更新离线通知…" : nodes.length ? `已开启 ${enabled} / ${nodes.length} 台，开关立即生效。` : "添加节点后，可在这里开启离线通知。"}</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <Button size="sm" variant="secondary" disabled={busy || enabled === nodes.length} onClick={() => apply(nodes, true)}>全部打开</Button>
           <Button size="sm" variant="ghost" disabled={busy || enabled === 0} onClick={() => apply(nodes, false)}>全部关闭</Button>
         </div>
       </div>
       {nodes.length > 0 && (
-        <div className="grid max-h-64 grid-cols-1 gap-x-6 gap-y-1 overflow-y-auto sm:grid-cols-2">
+        <div className="grid max-h-64 grid-cols-1 gap-x-6 overflow-y-auto border-t @xl:grid-cols-2">
           {nodes.map((node) => (
-            <label key={node.id} htmlFor={`notify-node-${node.id}`} className="flex min-h-10 min-w-0 cursor-pointer items-center justify-between gap-3 text-sm">
-              <span className="truncate" title={node.name}>{node.name}</span>
+            <label key={node.id} htmlFor={`notify-node-${node.id}`} className="flex min-h-11 min-w-0 cursor-pointer items-center justify-between gap-3 border-b px-1 py-1.5 text-sm has-disabled:cursor-default">
+              <span className="min-w-0 [overflow-wrap:anywhere]">{node.name}</span>
               <Switch id={`notify-node-${node.id}`} checked={!!node.notify} disabled={busy} onCheckedChange={(v) => apply([node], v)} />
             </label>
           ))}
@@ -1620,21 +1672,21 @@ function NotificationHistory() {
     } catch (e) { toast.error((e as Error).message) }
     finally { setBusy("") }
   }
-  return <Card className="gap-3 p-5">
-    <div className="flex items-center justify-between gap-3">
-      <h2 className="text-sm font-medium">最近投递记录</h2>
-      <Button size="sm" variant="ghost" disabled={loading} onClick={load}>{loading ? "刷新中…" : "刷新"}</Button>
+  return <Card className="gap-3 p-4 sm:p-5" aria-labelledby="notification-history-title">
+    <div className="flex flex-wrap items-center justify-between gap-3">
+      <h2 id="notification-history-title" className="text-base font-semibold">最近投递记录</h2>
+      <Button size="sm" variant="ghost" disabled={loading} onClick={load} aria-label="刷新投递记录"><RefreshCw aria-hidden="true" />{loading ? "刷新中…" : "刷新"}</Button>
     </div>
     {(error || !items) && <LoadState error={error} retry={load} />}
-    {items?.length === 0 && !error && <p className="text-sm text-muted-foreground">还没有投递记录。通知送往渠道后，可在这里查看结果。</p>}
-    {!!items?.length && <ul className="max-h-96 divide-y overflow-y-auto">
+    {items?.length === 0 && !error && <p className="rounded-lg bg-muted/40 px-3 py-2.5 text-sm text-muted-foreground">还没有投递记录。通知送往渠道后，可在这里查看结果。</p>}
+    {!!items?.length && <ul aria-label="通知投递记录" className="max-h-96 divide-y overflow-y-auto">
       {items.map((item, index) => {
         const failed = item.status === "failed"
         const status = failed ? "投递失败" : item.status === "delivered" ? "接收端已接受" :
           item.status === "pending" ? (item.attempts ? "等待重试" : "等待投递") : item.status
         // The Hub retries all failed channels for an event in one request.
         const canRetry = failed && !items.slice(0, index).some(row => row.id === item.id && row.status === "failed")
-        return <li key={`${item.id}:${item.channel}`} className="space-y-1.5 py-3 text-sm">
+        return <li key={`${item.id}:${item.channel}`} className="space-y-1.5 py-3 text-sm [contain-intrinsic-block-size:auto_4rem] [content-visibility:auto]">
           <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
             <span className="min-w-0 [overflow-wrap:anywhere]">{item.title}</span>
             <span className={`text-xs ${failed ? "text-destructive" : "text-muted-foreground"}`}>{status}</span>
@@ -1652,7 +1704,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
   const { s, set, save, saving, baseline, dirtyKeys, error, load } = useSettings()
   const [testing, setTesting] = useState(false)
   const [clear, setClear] = useState<"telegram" | "webhook" | "headers" | null>(null)
-  if (!s) return <LoadState error={error} retry={load} />
+  if (!s) return <section className="space-y-4"><h1 className="text-2xl font-semibold tracking-tight">通知</h1><LoadState error={error} retry={load} /></section>
   const text = (k: string) => String(s[k] ?? "")
   // A credential is sent only when something was typed: the field starts empty
   // because the hub never returns the stored value.
@@ -1687,31 +1739,36 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
 
   return (
     <section className="@container space-y-4">
-        <div className="flex items-center justify-between gap-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
           <h1 className="text-2xl font-semibold tracking-tight">通知</h1>
-          <Button size="sm" variant="outline" disabled={testing || saving || !!testHint} aria-describedby={testHint ? "notify-test-hint" : undefined} onClick={test}>
-            <Send /> {testing ? "发送中…" : "发送测试"}
-          </Button>
+          <p id="notify-test-hint" role="status" className="mt-1 text-sm text-muted-foreground">{testHint || "测试通知会发送到所有已配置的渠道。"}</p>
         </div>
-      {testHint && <p id="notify-test-hint" role="status" className="rounded-lg border px-4 py-3 text-sm text-muted-foreground">{testHint}</p>}
+        <Button size="sm" variant="outline" disabled={testing || saving || !!testHint} aria-describedby="notify-test-hint" onClick={test}>
+          <Send aria-hidden="true" />{testing ? "发送中…" : "发送测试"}
+        </Button>
+      </div>
       <div className="grid items-start gap-4 @4xl:grid-cols-2">
       <ChannelCard title="Telegram" configured={telegramReady} dirty={telegramDirty}>
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="grid gap-4 @2xl:grid-cols-2">
           <Field label="Bot Token" hint={secretHint("notify_telegram_token")}>
             <Input
               type="password"
+              name="telegram-bot-token"
               autoComplete="off"
+              autoCapitalize="none"
+              spellCheck={false}
               placeholder={s.notify_telegram_token_set ? "••••••••" : "123456:ABC-DEF…"}
               value={text("notify_telegram_token")}
               onChange={(e) => set("notify_telegram_token", e.target.value)}
             />
           </Field>
           <Field label="Chat ID" hint="数字 ID，群组是负数；公开频道可填 @频道名">
-            <Input value={text("notify_telegram_chat")} onChange={(e) => set("notify_telegram_chat", e.target.value)} placeholder="-1001234567890" />
+            <Input name="telegram-chat-id" autoComplete="off" value={text("notify_telegram_chat")} autoCapitalize="none" spellCheck={false} onChange={(e) => set("notify_telegram_chat", e.target.value)} placeholder="-1001234567890" />
           </Field>
         </div>
         <Field label="消息模板" hint={`纯文本。占位符 ${PLACEHOLDERS}`}>
-          <textarea rows={3} className={TEXTAREA} value={text("notify_telegram_text")} onChange={(e) => set("notify_telegram_text", e.target.value)} />
+          <textarea rows={3} name="telegram-template" autoComplete="off" className={TEXTAREA} value={text("notify_telegram_text")} onChange={(e) => set("notify_telegram_text", e.target.value)} />
         </Field>
         <TemplatePreview template={text("notify_telegram_text")} site={text("site_name") || "Monitor"} />
         <div className="flex flex-wrap gap-2">
@@ -1738,38 +1795,58 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
 
       <ChannelCard title="Webhook" configured={webhookReady} dirty={webhookDirty}>
         <Field label="接收渠道" hint="自动识别官方域名；自建中转请明确选择渠道。通用 HTTP 仅确认接收端返回成功。">
-          <select className="w-full rounded-md border bg-background px-3 py-2 text-sm" value={text("notify_webhook_kind") || "auto"} onChange={e => set("notify_webhook_kind", e.target.value)}>
+          <select name="webhook-kind" className="min-h-9 w-full rounded-md border bg-background px-3 py-2 text-base text-foreground focus-visible:outline-2 focus-visible:outline-ring md:text-sm" value={text("notify_webhook_kind") || "auto"} onChange={e => set("notify_webhook_kind", e.target.value)}>
             <option value="auto">自动识别</option><option value="http">通用 HTTP</option><option value="wecom">企业微信</option><option value="dingtalk">钉钉</option><option value="feishu">飞书 / Lark</option>
           </select>
-        </Field>
-        <Field label="自定义成功字段" hint="可选，JSON Pointer，例如 /code；设置后必须匹配预期值。">
-          <Input value={text("notify_webhook_success_path")} onChange={e => set("notify_webhook_success_path", e.target.value)} placeholder="/code" />
-        </Field>
-        <Field label="预期 JSON 值" hint='例如 0、true 或 "ok"'>
-          <Input value={text("notify_webhook_success_value")} placeholder="0" onChange={e => set("notify_webhook_success_value", e.target.value)} />
         </Field>
         <Field label="URL" hint={secretHint("notify_webhook_url")}>
           <Input
             type="password"
+            name="webhook-url"
             autoComplete="off"
+            autoCapitalize="none"
+            spellCheck={false}
+            inputMode="url"
             placeholder={s.notify_webhook_url_set ? "••••••••" : "https://…"}
             value={text("notify_webhook_url")}
             onChange={(e) => set("notify_webhook_url", e.target.value)}
           />
         </Field>
-        <Field label="请求头" hint={`可选，一行一个。${s.notify_webhook_headers_set ? "已设置，留空不变" : ""}`}>
-          <textarea
-            rows={2}
-            className={TEXTAREA}
-            placeholder={s.notify_webhook_headers_set ? "••••••••" : "Authorization: Bearer xxx"}
-            value={text("notify_webhook_headers")}
-            onChange={(e) => set("notify_webhook_headers", e.target.value)}
-          />
-        </Field>
         <Field label="请求体" hint={`以 POST 发送，Content-Type 为 application/json。占位符 ${PLACEHOLDERS}，须写在引号内`}>
-          <textarea rows={4} className={TEXTAREA} value={text("notify_webhook_body")} onChange={(e) => set("notify_webhook_body", e.target.value)} />
+          <textarea rows={4} name="webhook-body" autoComplete="off" className={`${TEXTAREA} font-mono`} spellCheck={false} value={text("notify_webhook_body")} onChange={(e) => set("notify_webhook_body", e.target.value)} />
         </Field>
         <TemplatePreview template={text("notify_webhook_body")} site={text("site_name") || "Monitor"} json />
+        <details className="group/advanced rounded-lg border">
+          <summary className="flex min-h-10 cursor-pointer list-none items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+            <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground transition-transform group-open/advanced:rotate-90 motion-reduce:transition-none" />
+            高级请求设置
+          </summary>
+          <div className="space-y-4 border-t p-3">
+            <Field label="请求头" hint={`每行一个。${s.notify_webhook_headers_set ? "已设置，留空不变。" : "可留空。"}`}>
+              <textarea
+                rows={2}
+                name="webhook-headers"
+                autoComplete="off"
+                className={`${TEXTAREA} font-mono`}
+                spellCheck={false}
+                placeholder={s.notify_webhook_headers_set ? "••••••••" : "Authorization: Bearer xxx"}
+                value={text("notify_webhook_headers")}
+                onChange={(e) => set("notify_webhook_headers", e.target.value)}
+              />
+            </Field>
+            {s.notify_webhook_headers_set && (
+              <Button size="sm" variant="ghost" disabled={saving || testing} onClick={() => setClear("headers")}>清除请求头</Button>
+            )}
+            <div className="grid gap-4 @2xl:grid-cols-2">
+              <Field label="自定义成功字段" hint="可选，使用 JSON Pointer，例如 /code。">
+                <Input name="webhook-success-path" autoComplete="off" value={text("notify_webhook_success_path")} spellCheck={false} onChange={e => set("notify_webhook_success_path", e.target.value)} placeholder="/code" />
+              </Field>
+              <Field label="预期 JSON 值" hint='设置成功字段后，响应必须匹配此值，例如 0、true 或 "ok"。'>
+                <Input name="webhook-success-value" autoComplete="off" value={text("notify_webhook_success_value")} spellCheck={false} placeholder="0" onChange={e => set("notify_webhook_success_value", e.target.value)} />
+              </Field>
+            </div>
+          </div>
+        </details>
         <div className="flex flex-wrap gap-2">
           <Button
             size="sm"
@@ -1778,11 +1855,6 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
           >
             保存 Webhook
           </Button>
-          {s.notify_webhook_headers_set && (
-            <Button size="sm" variant="ghost" disabled={saving || testing} onClick={() => setClear("headers")}>
-              清除请求头
-            </Button>
-          )}
           {s.notify_webhook_url_set && (
             <Button size="sm" variant="ghost" disabled={saving || testing} onClick={() => setClear("webhook")}>
               清除渠道
@@ -1794,36 +1866,37 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
       </div>
       <OfflineNodes nodes={nodes} refresh={refresh} />
 
-      <Card className="gap-4 p-5">
-        <form className="space-y-4" onSubmit={event => {
+      <Card className="gap-4 p-4 sm:p-5">
+        <form className="space-y-4" autoComplete="off" onSubmit={event => {
           event.preventDefault()
-          if (ruleKeys.length) void save(Object.fromEntries(ruleKeys.map(key => [key,text(key)])))
+          if (ruleKeys.length && !saving) void save(Object.fromEntries(ruleKeys.map(key => [key,text(key)])))
         }}>
-        <h2 className="font-semibold">提醒规则</h2>
-        <div className="grid gap-4 sm:grid-cols-3">
+        <h2 className="text-base font-semibold">提醒规则</h2>
+        <div className="grid gap-4 @xl:grid-cols-3">
           <Field label="离线宽限期（分钟）" hint="断开超过这么久才算离线，1–30">
-            <Input type="number" required min={1} max={30} value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
+            <Input name="notify_grace" type="number" required min={1} max={30} value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
           </Field>
           <Field label="流量提醒（%）" hint="本期用量达到该比例和 100% 时各提醒一次，0 关闭">
-            <Input type="number" required min={0} max={100} value={text("notify_traffic")} onChange={(e) => set("notify_traffic", e.target.value)} />
+            <Input name="notify_traffic" type="number" required min={0} max={100} value={text("notify_traffic")} onChange={(e) => set("notify_traffic", e.target.value)} />
           </Field>
           <Field label="到期提醒（天）" hint="每天 9 点汇总这么多天内到期的节点，0 关闭">
-            <Input type="number" required min={0} max={365} value={text("notify_expiry")} onChange={(e) => set("notify_expiry", e.target.value)} />
+            <Input name="notify_expiry" type="number" required min={0} max={365} value={text("notify_expiry")} onChange={(e) => set("notify_expiry", e.target.value)} />
           </Field>
         </div>
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="grid gap-4 @xl:grid-cols-2">
           {([
             ["notify_disk_percent","磁盘告警阈值（%）","0 关闭；恢复阈值低 5 个百分点",0,100],
             ["notify_disk_minutes","磁盘持续时间（分钟）","达到阈值并持续 1–120 分钟才提醒",1,120],
             ["notify_ping_failures","TCP 连续失败次数","最多 20 次，0 关闭；成功后发恢复通知",0,20],
             ["notify_cooldown","重复告警冷却（分钟）","恢复后再次提醒的间隔，1–1440 分钟",1,1440],
-          ] as const).map(([key,label,hint,min,max]) => <Field key={key} label={label} hint={hint}><Input type="number" required min={min} max={max} value={text(key)} onChange={e => set(key,e.target.value)} /></Field>)}
+          ] as const).map(([key,label,hint,min,max]) => <Field key={key} label={label} hint={hint}><Input name={key} type="number" required min={min} max={max} value={text(key)} onChange={e => set(key,e.target.value)} /></Field>)}
         </div>
-        <div className="flex items-center gap-2 text-sm">
-          <Switch aria-labelledby="notify-login-label" checked={s.notify_login !== "off"} onCheckedChange={(v) => set("notify_login", v ? "on" : "off")} />
-          <span id="notify-login-label">登录后台时提醒</span>
+        <div className="flex min-h-11 items-center justify-between gap-3 border-y text-sm">
+          <Label htmlFor="notify-login-switch" className="cursor-pointer leading-snug">登录后台时提醒</Label>
+          <Switch id="notify-login-switch" checked={s.notify_login !== "off"} onCheckedChange={(v) => set("notify_login", v ? "on" : "off")} />
         </div>
-        <div>
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          {ruleKeys.length > 0 && <span role="status" className="mr-auto text-xs text-muted-foreground">提醒规则有未保存的修改</span>}
           <Button size="sm" type="submit" disabled={saving || !ruleKeys.length}>保存提醒规则</Button>
         </div>
         </form>
@@ -1868,20 +1941,22 @@ function TerminalHistory() {
     return () => controller.abort()
   }, [request])
   return (
-    <Card className="min-w-0 gap-3 p-4 sm:p-5">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold">终端访问审计</h2>
-        <Button size="sm" variant="ghost" disabled={loading} onClick={load} aria-label="刷新终端访问审计">{loading ? "刷新中…" : "刷新"}</Button>
+    <Card className="min-w-0 gap-3 p-4 sm:p-5" aria-labelledby="terminal-history-title">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h2 id="terminal-history-title" className="text-base font-semibold">终端访问审计</h2>
+          <p className="mt-1 text-xs text-muted-foreground">最近 100 条访问记录，不记录命令和终端内容。</p>
+        </div>
+        <Button size="sm" variant="ghost" disabled={loading} onClick={load} aria-label="刷新终端访问审计"><RefreshCw aria-hidden="true" />{loading ? "刷新中…" : "刷新"}</Button>
       </div>
-      <p className="text-xs text-muted-foreground">最近 100 条访问记录，不记录命令和终端内容。</p>
       {(error || !items) && <LoadState error={error} retry={load} />}
-      {!error && items?.length === 0 && <p className="text-sm text-muted-foreground">暂无终端访问记录</p>}
+      {!error && items?.length === 0 && <p className="rounded-lg bg-muted/40 px-3 py-2.5 text-sm text-muted-foreground">暂无终端访问记录</p>}
       {!!items?.length && <ul aria-label="终端访问记录" className="max-h-80 divide-y overflow-y-auto">
         {items.map((item, i) => (
-          <li key={i} className="space-y-1 py-2.5 text-xs first:pt-0 last:pb-0 [overflow-wrap:anywhere]">
+          <li key={i} className="space-y-1 py-2.5 text-xs first:pt-0 last:pb-0 [contain-intrinsic-block-size:auto_3.5rem] [content-visibility:auto] [overflow-wrap:anywhere]">
             <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
               <span className="text-sm font-medium">节点 {item.node_id} · {TERMINAL_ACTIONS[item.action] ?? item.action}</span>
-              <time className="tnum text-muted-foreground">{new Date(item.ts * 1000).toLocaleString("zh-CN")}</time>
+              <time dateTime={new Date(item.ts * 1000).toISOString()} className="tnum text-muted-foreground">{new Date(item.ts * 1000).toLocaleString("zh-CN")}</time>
             </div>
             <p className="text-muted-foreground">操作者 {item.actor}{item.correlation && <> · 关联 ID <code>{item.correlation}</code></>}</p>
           </li>
@@ -1926,18 +2001,18 @@ function Sessions() {
   }
 
   return (
-    <Card className="min-w-0 gap-4 p-4 sm:p-5">
+    <Card className="min-w-0 gap-4 p-4 sm:p-5" aria-labelledby="sessions-title">
       <div>
-        <h2 className="text-sm font-semibold">登录会话</h2>
+        <h2 id="sessions-title" className="text-base font-semibold">登录会话</h2>
         <p className="mt-1 text-xs text-muted-foreground">每次登录保留 14 天。撤销会话后，对应设备需要重新登录。</p>
       </div>
       {(error || !rows) && <LoadState error={error} retry={load} />}
-      {rows?.length === 0 && <p className="text-sm text-muted-foreground">暂无有效登录会话</p>}
+      {!error && rows?.length === 0 && <p className="rounded-lg bg-muted/40 px-3 py-2.5 text-sm text-muted-foreground">暂无有效登录会话</p>}
       {!!rows?.length && <ul className="max-h-80 divide-y overflow-y-auto">
         {rows.map(session => {
           const time = new Date(session.created_at * 1000).toLocaleString("zh-CN")
           return <li key={session.id} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 py-2.5 first:pt-0 last:pb-0">
-            <time className="tnum text-sm">{time}</time>
+            <time dateTime={new Date(session.created_at * 1000).toISOString()} className="tnum text-sm">{time}</time>
             {session.current ? <Badge variant="secondary">当前会话</Badge> :
               <Button size="sm" variant="outline" disabled={busy} onClick={() => setSelected(session)} aria-label={`撤销 ${time} 的会话`}>撤销</Button>}
           </li>
@@ -1962,76 +2037,82 @@ function Security({ site }: { site: string }) {
   else if (verified) passwordHint = "关闭后仅允许 GitHub 登录，密码登录的设备会退出。"
   const callback = `${site.replace(/\/$/, "")}/api/auth/github/callback`
 
+  async function saveGitHub(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!s || !githubDirty || !passwordEnabled || saving) return
+    const patch: Record<string, string> = {
+      github_client_id: String(s.github_client_id ?? ""),
+      github_allowed_users: String(s.github_allowed_users ?? ""),
+    }
+    if (typeof s.github_client_secret === "string" && s.github_client_secret) {
+      patch.github_client_secret = s.github_client_secret
+    }
+    if (await save(patch)) setSessionRevision(n => n + 1)
+  }
+
   return (
     <section className="@container space-y-4">
       <h1 className="text-2xl font-semibold tracking-tight">安全</h1>
       {!s ? <LoadState error={error} retry={load} /> : <div className="grid items-start gap-4 @4xl:grid-cols-2">
-      <Card className="min-w-0 gap-4 p-4 sm:p-5">
-        <div>
-          <h2 className="text-sm font-semibold">GitHub 单点登录</h2>
-          <p className="mt-1 text-xs text-muted-foreground">
-            OAuth App 回调地址 <code className="rounded bg-muted px-1 [overflow-wrap:anywhere]">{callback}</code>
-          </p>
+      <Card className="min-w-0 gap-4 p-4 sm:p-5" aria-labelledby="github-login-title">
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+          <h2 id="github-login-title" className="text-base font-semibold">GitHub 单点登录</h2>
+          <Badge variant={verified ? "secondary" : "outline"} role="status">{githubDirty ? "有未保存的修改" : verified ? "已验证" : s.github_status_unknown ? "验证状态待确认" : s.github_ready ? "待登录验证" : "未配置完整"}</Badge>
         </div>
-        <div className="grid gap-4 min-[600px]:grid-cols-2">
+        <div className="flex flex-wrap items-start justify-between gap-2 rounded-lg bg-muted/40 p-3">
+          <div className="min-w-0 space-y-1">
+            <p className="text-xs font-medium text-muted-foreground">OAuth App 回调地址</p>
+            <code translate="no" className="block text-xs [overflow-wrap:anywhere]">{callback}</code>
+          </div>
+          <Button variant="outline" size="sm" onClick={() => copy(callback)}><Copy aria-hidden="true" />复制回调地址</Button>
+        </div>
+        <form className="space-y-4" onSubmit={saveGitHub}>
+        <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Client ID">
-            <Input disabled={!passwordEnabled || saving} value={String(s.github_client_id ?? "")} onChange={(e) => set("github_client_id", e.target.value)} />
+            <Input name="github-client-id" autoComplete="off" disabled={!passwordEnabled || saving} autoCapitalize="none" spellCheck={false} value={String(s.github_client_id ?? "")} onChange={(e) => set("github_client_id", e.target.value)} />
           </Field>
           <Field label="Client Secret" hint={s.github_secret_set ? "已设置，留空不变" : "未设置"}>
-            <Input disabled={!passwordEnabled || saving} type="password" autoComplete="off" value={String(s.github_client_secret ?? "")} placeholder={s.github_secret_set ? "••••••••" : ""} onChange={(e) => set("github_client_secret", e.target.value)} />
+            <Input name="github-client-secret" disabled={!passwordEnabled || saving} type="password" autoComplete="off" value={String(s.github_client_secret ?? "")} placeholder={s.github_secret_set ? "••••••••" : ""} onChange={(e) => set("github_client_secret", e.target.value)} />
           </Field>
         </div>
         {String(s.github_client_id ?? "") !== "" && String(s.github_allowed_users ?? "").trim() === "" && (
-          <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive" role="status">
             白名单为空，GitHub 登录拒绝所有人。填入用户名并保存后生效。
           </p>
         )}
         <Field label="允许登录的 GitHub 用户名" hint="多个用户名用逗号分隔。保存空名单会拒绝所有 GitHub 登录。">
-          <Input disabled={!passwordEnabled || saving} value={String(s.github_allowed_users ?? "")} onChange={(e) => set("github_allowed_users", e.target.value)} placeholder="GitHub 用户名" />
+          <Input name="github-allowed-users" autoComplete="off" disabled={!passwordEnabled || saving} autoCapitalize="none" spellCheck={false} value={String(s.github_allowed_users ?? "")} onChange={(e) => set("github_allowed_users", e.target.value)} placeholder="GitHub 用户名" />
         </Field>
-        <div className="flex flex-wrap items-center gap-3">
-          <Button
-            size="sm"
-            disabled={!githubDirty || !passwordEnabled || saving}
-            onClick={async () => {
-              const patch: Record<string, string> = {
-                github_client_id: String(s.github_client_id ?? ""),
-                github_allowed_users: String(s.github_allowed_users ?? ""),
-              }
-              if (typeof s.github_client_secret === "string" && s.github_client_secret) {
-                patch.github_client_secret = s.github_client_secret
-              }
-              if (await save(patch)) setSessionRevision(n => n + 1)
-            }}
-          >
+        {githubDirty && <p className="text-xs text-muted-foreground">更改 GitHub 登录配置后，已有 GitHub 会话将退出，需要重新验证。</p>}
+        {!passwordEnabled && <p className="text-sm text-muted-foreground">修改 GitHub 配置前，请先开启应急密码。</p>}
+        <div className="flex flex-wrap items-center gap-2 border-t pt-3">
+          <Button type="submit" size="sm" disabled={!githubDirty || !passwordEnabled || saving}>
             {saving ? "保存中…" : "保存 GitHub 设置"}
           </Button>
           {!!s.github_ready && !verified && !githubDirty && <Button size="sm" variant="outline" asChild><a href="/api/auth/github">验证 GitHub 登录</a></Button>}
-          <Badge variant={verified ? "secondary" : "outline"}>{githubDirty ? "有未保存的修改" : verified ? "已验证" : s.github_status_unknown ? "验证状态待确认" : s.github_ready ? "待登录验证" : "未配置完整"}</Badge>
         </div>
-        {githubDirty && <p className="text-xs text-muted-foreground">更改 GitHub 登录配置后，已有 GitHub 会话将退出，需要重新验证。</p>}
-        {!passwordEnabled && <p className="text-sm text-muted-foreground">修改 GitHub 配置前，请先开启应急密码。</p>}
+        </form>
       </Card>
 
-      <Card className="min-w-0 gap-4 p-4 sm:p-5">
+      <Card className="min-w-0 gap-4 p-4 sm:p-5" aria-labelledby="password-login-title">
         <div>
-          <h2 className="text-sm font-semibold">应急密码</h2>
+          <h2 id="password-login-title" className="text-base font-semibold">应急密码</h2>
           <p className="mt-1 text-xs text-muted-foreground">
             GitHub 不可用时的备用入口。修改后其它设备登录立即失效，当前设备不受影响。
           </p>
         </div>
-        <div className="flex items-start justify-between gap-4">
+        <div className="flex min-h-11 items-center justify-between gap-4 rounded-lg bg-muted/40 p-3">
           <div className="space-y-1">
-            <Label id="password-login-label">允许应急密码登录</Label>
-            <p id="password-login-hint" className="text-sm text-muted-foreground">
+            <Label htmlFor="password-login-switch" className="cursor-pointer leading-snug">允许应急密码登录</Label>
+            <p id="password-login-hint" className="text-xs leading-relaxed text-muted-foreground">
               {passwordHint}
             </p>
           </div>
-          <Switch aria-labelledby="password-login-label" aria-describedby="password-login-hint" checked={passwordEnabled} disabled={saving || (passwordEnabled && !verified)} onCheckedChange={async (enabled) => { if (await save({ password_login: enabled ? "on" : "off" })) setSessionRevision(n => n + 1) }} />
+          <Switch id="password-login-switch" aria-describedby="password-login-hint" checked={passwordEnabled} disabled={saving || (passwordEnabled && !verified)} onCheckedChange={async (enabled) => { if (await save({ password_login: enabled ? "on" : "off" })) setSessionRevision(n => n + 1) }} />
         </div>
         {!passwordEnabled && <p className="text-sm text-muted-foreground">GitHub 无法登录时，可在 Hub 服务器执行 <code className="break-all">sudo /opt/monitor/monitor-hub --db /opt/monitor/data/monitor.db --reset-password</code> 恢复。</p>}
         <Field label="新密码" hint="至少 12 位；修改密码不会自动开启密码登录">
-          <Input type="password" disabled={saving} value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
+          <Input name="new-password" type="password" disabled={saving} value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
         </Field>
         <div>
           <Button
@@ -2162,40 +2243,42 @@ function Data() {
   )
 
   return (
-    <div className="space-y-4">
+    <div className="@container space-y-4">
       <h1 className="text-2xl font-semibold tracking-tight">数据与备份</h1>
       {error && <LoadState error={error} retry={load} />}
       <Card className="gap-4 p-4 sm:p-5" aria-labelledby="scheduled-backup-title">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <h2 id="scheduled-backup-title" className="text-sm font-semibold">自动备份</h2>
-            <Badge variant="secondary" role="status" className="whitespace-normal">{backupState}{backup?.scheduler.state === "active" && backup.scheduler.boot_enabled === false ? "（未设置开机启用）" : ""}</Badge>
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <h2 id="scheduled-backup-title" className="text-base font-semibold">自动备份</h2>
+            <Badge variant={backup?.scheduler.state === "active" && !backup.stale ? "secondary" : "outline"} role="status" className="whitespace-normal">
+              {backupState}{backup?.scheduler.state === "active" && backup.scheduler.boot_enabled === false ? "（未设置开机启用）" : ""}
+            </Badge>
           </div>
-          <Button size="sm" variant="secondary" disabled={refreshing || !!busy || !!operation} onClick={load}>
-            <RefreshCw className={refreshing ? "animate-spin" : ""} /> {refreshing ? "刷新中…" : "刷新备份状态"}
+          <Button size="sm" variant="outline" disabled={refreshing || !!busy || !!operation} onClick={load}>
+            <RefreshCw aria-hidden="true" className={refreshing ? "motion-safe:animate-spin" : ""} /> {refreshing ? "刷新中…" : "刷新备份状态"}
           </Button>
         </div>
         {info.backup_error && <p role="alert" className="rounded-md bg-destructive/10 [overflow-wrap:anywhere] px-3 py-2 text-sm text-destructive">最近备份失败：{info.backup_error}</p>}
         {backup?.stale && <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">备份状态尚未上报或已过期，请检查服务器上的状态上报任务。</p>}
-        <dl className="grid gap-4 rounded-lg bg-muted/45 p-3 sm:grid-cols-3 sm:p-4">
+        <dl className="grid gap-4 rounded-lg bg-muted/45 p-3 @xl:grid-cols-3 sm:p-4">
           {stat("最近成功（本地时间）", info.backup_success ? new Date(Number(info.backup_success) * 1000).toLocaleString("zh-CN") : "尚无成功记录")}
           {stat("下次执行（服务器时间）", (backup?.scheduler.state === "active" ? backup.scheduler.next_run : null)?.replace(/^\w+ (\d{4}-\d{2}-\d{2}) /, "$1 ") ?? "暂无下次执行时间")}
           {stat("已有备份", backup?.copies != null ? `${backup.copies} 份` : "无法读取备份目录")}
         </dl>
-        <dl className="grid gap-4 sm:grid-cols-3">
+        <dl className="grid gap-4 @xl:grid-cols-3">
           {stat("执行时间（服务器时间）", calendar ? `${daily ? `每天 ${daily}` : calendar}${delay && delay !== "0" ? `，最多延后 ${delay}` : ""}` : "暂无计划信息")}
           {stat("保留策略", backup?.policy ? `最近 ${backup.policy.keep} 份及最近 ${backup.policy.keep} 个备份日期的每日副本` : "等待备份任务上报")}
           {stat("异机复制", backup?.policy ? backup.policy.offsite ? "已配置" : "未配置，目前仅保存在本机" : "等待备份任务上报")}
         </dl>
-        {backup?.policy && <p className="break-all text-xs text-muted-foreground">备份目录：<code>{backup.policy.directory}</code></p>}
-        <p className="text-xs leading-relaxed text-muted-foreground">
-          新备份成功后才清理超出的旧备份；保留份数与历史数据保留天数分别计算。保留策略和目录来自最近一次备份任务。
-          {backup?.checked_at != null && <> {backup.timezone && <>服务器时区：{backup.timezone}。</>} 状态上报于 {new Date(backup.checked_at * 1000).toLocaleString("zh-CN")}。</>} 状态每分钟更新一次。
-        </p>
+        <div className="space-y-1.5 border-t pt-3 text-xs leading-relaxed text-muted-foreground">
+          {backup?.policy && <p className="[overflow-wrap:anywhere]">备份目录：<code translate="no">{backup.policy.directory}</code></p>}
+          <p>新备份成功后才会清理旧备份。备份份数与历史数据保留天数分别计算。</p>
+          {backup?.checked_at != null && <p>上次上报（本地时间）：<time dateTime={new Date(backup.checked_at * 1000).toISOString()}>{new Date(backup.checked_at * 1000).toLocaleString("zh-CN")}</time>{backup.timezone && <>。服务器时区：{backup.timezone}</>}</p>}
+        </div>
       </Card>
       <Card className="gap-4 p-4 sm:p-5">
-        <h2 className="text-sm font-semibold">数据库</h2>
-        <dl className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+        <h2 className="text-base font-semibold">数据库</h2>
+        <dl className="grid grid-cols-2 gap-4 @xl:grid-cols-4">
           {stat("文件大小", bytes(info.size))}
           {stat("预写日志", bytes(info.wal))}
           {stat("可回收空间", bytes(info.free))}
@@ -2205,44 +2288,28 @@ function Data() {
           {stat("历史跨度", info.oldest ? `${Math.floor((Date.now() / 1000 - info.oldest) / 86400)} 天` : "—")}
           {DB_ROWS.map(([key, label]) => stat(label, (info.rows[key] ?? 0).toLocaleString()))}
         </dl>
-        <p className="break-all border-t pt-3 text-xs text-muted-foreground">
-          数据库路径：<code>{info.path}</code>
+        <p className="border-t pt-3 text-xs text-muted-foreground [overflow-wrap:anywhere]">
+          数据库路径：<code translate="no">{info.path}</code>
         </p>
       </Card>
 
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid gap-4 @xl:grid-cols-2">
         <Card className="min-w-0 justify-between gap-4 p-4 sm:p-5">
           <div>
-            <h2 className="text-sm font-semibold">回收空间</h2>
+            <h2 className="text-base font-semibold">手动备份与恢复</h2>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              按保留天数清掉过期明细，再重建数据库文件把空出来的页还给磁盘（SQLite 的 VACUUM）。
-              重建期间需要与数据库等量的空闲磁盘，过程中面板和上报会短暂变慢。
-            </p>
-          </div>
-          <div>
-            <Button size="sm" variant="secondary" disabled={!!busy || !!operation} onClick={() => setConfirm("vacuum")}>
-              {busy === "vacuum" ? "回收中…" : "立即回收"}
-            </Button>
-          </div>
-        </Card>
-
-        <Card className="min-w-0 justify-between gap-4 p-4 sm:p-5">
-          <div>
-            <h2 className="text-sm font-semibold">手动备份与恢复</h2>
-            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              导出的数据库含节点凭证与密码哈希，请妥善保管。恢复时请选择这里导出的备份，最大 256 MiB。
+              备份包含节点凭证与密码哈希，请妥善保管。导入时请选择从此处导出的文件，最大 256 MiB。
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
-            {/* The browser's own download: the file is streamed straight from
-                the response, never held in the page. */}
+            {/* Let the browser stream the file without holding it in the page. */}
             <Button size="sm" asChild>
               <a href="/api/db/backup" download>
-                <Download /> 导出备份
+                <Download aria-hidden="true" /> 导出备份
               </a>
             </Button>
-            <Button size="sm" variant="secondary" disabled={!!busy || !!operation} onClick={() => picker.current?.click()}>
-              <Upload /> 导入备份
+            <Button size="sm" variant="outline" disabled={!!busy || !!operation} onClick={() => picker.current?.click()}>
+              <Upload aria-hidden="true" /> 导入备份
             </Button>
             <input
               ref={picker}
@@ -2263,6 +2330,20 @@ function Data() {
             />
           </div>
           {fileError && <p role="alert" className="text-sm text-destructive [overflow-wrap:anywhere]">{fileError}</p>}
+        </Card>
+
+        <Card className="min-w-0 justify-between gap-4 p-4 sm:p-5">
+          <div>
+            <h2 className="text-base font-semibold">回收空间</h2>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              清理过期的历史明细并重建数据库。请预留与数据库文件等量的磁盘空间，操作期间面板和节点上报可能短暂变慢。
+            </p>
+          </div>
+          <div>
+            <Button size="sm" variant="outline" disabled={!!busy || !!operation} onClick={() => setConfirm("vacuum")}>
+              {busy === "vacuum" ? "回收中…" : "立即回收"}
+            </Button>
+          </div>
         </Card>
       </div>
 
@@ -2325,6 +2406,13 @@ export function Admin({
 }) {
   const section = ADMIN_SECTIONS.find(item => item.path === path)
   const usesNodes = needsInventory(path)
+  const workspace = useRef<HTMLElement>(null)
+  const previousPath = useRef(path)
+  useEffect(() => {
+    if (previousPath.current === path) return
+    previousPath.current = path
+    workspace.current?.focus({ preventScroll: true })
+  }, [path])
   useEffect(() => {
     const previous = document.title
     document.title = `${section?.label ?? "页面不存在"} · Monitor 后台`
@@ -2345,9 +2433,9 @@ export function Admin({
       <Button variant="outline" onClick={() => go("/clara/nodes")}>返回节点管理</Button>
     </Card>
     if (!nodes) return <section className="space-y-4">
-      <h1 className="text-2xl font-semibold tracking-tight">{section.label}</h1>
-      <div role={nodeError ? "alert" : "status"} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border bg-card p-4 text-sm">
-        <span className="min-w-0 [overflow-wrap:anywhere]">{nodeError ? `节点列表加载失败：${nodeError}` : "正在加载节点列表…"}</span>
+      <h1>{section.path === "/clara/nodes" ? "节点管理" : section.path === "/clara/ping" ? "延迟监控" : section.label}</h1>
+      <div className="admin-load-state flex flex-wrap items-center justify-between gap-3 rounded-xl border p-4 text-sm" data-error={!!nodeError}>
+        <span role={nodeError ? "alert" : "status"} className="min-w-0 wrap-anywhere">{nodeError ? `节点列表加载失败：${nodeError}` : "正在加载节点列表…"}</span>
         {nodeError && <Button variant="outline" size="sm" onClick={refresh}>重新加载节点</Button>}
       </div>
     </section>
@@ -2358,12 +2446,12 @@ export function Admin({
 
   return (
     <div className="flex flex-col gap-5 lg:flex-row lg:gap-6">
-      <nav aria-label="后台导航" className="grid grid-cols-4 gap-1 rounded-xl border bg-card p-1.5 shadow-sm backdrop-blur-md min-[800px]:grid-cols-8 lg:sticky lg:top-20 lg:flex lg:max-h-[calc(100dvh-6rem)] lg:w-40 lg:shrink-0 lg:flex-col lg:self-start lg:overflow-y-auto lg:p-2 xl:w-44">
+      <nav aria-label="后台导航" className="admin-nav grid grid-cols-4 gap-1 rounded-xl border p-1.5 min-[800px]:grid-cols-8 lg:sticky lg:top-[5.5rem] lg:flex lg:max-h-[calc(100dvh-6.5rem)] lg:w-40 lg:shrink-0 lg:flex-col lg:self-start lg:overflow-y-auto lg:p-2 xl:w-44">
         {ADMIN_SECTIONS.map(({ path: to, label, icon: Icon }) => {
           const active = path === to
           return (
             <Button key={to} asChild variant="choice" size="sm"
-              className="min-h-10 min-w-0 rounded-lg px-1 text-xs has-[>svg]:px-1 min-[460px]:text-sm lg:justify-start lg:gap-2.5 lg:px-3 lg:has-[>svg]:px-3">
+              className="min-h-11 min-w-0 rounded-lg px-1 text-xs has-[>svg]:px-1 min-[460px]:text-sm lg:min-h-10 lg:justify-start lg:gap-2.5 lg:px-3 lg:has-[>svg]:px-3">
               <a href={to} aria-current={active ? "page" : undefined} onClick={(e) => {
                 if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return
                 e.preventDefault()
@@ -2377,13 +2465,13 @@ export function Admin({
         })}
       </nav>
 
-      <div className="min-w-0 flex-1 space-y-4">
+      <main id="admin-content" ref={workspace} aria-label={section?.label ?? "页面不存在"} tabIndex={-1} className="admin-workspace min-w-0 flex-1 space-y-4">
         {usesNodes && nodes && staleSince !== null && <div role="status" className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/40 bg-popover px-4 py-2 text-sm">
           <span>节点数据更新中断。当前显示 {new Date(staleSince).toLocaleTimeString("zh-CN")} 收到的状态。</span>
           <Button variant="outline" size="sm" onClick={refresh}>重试</Button>
         </div>}
         {renderSection()}
-      </div>
+      </main>
     </div>
   )
 }

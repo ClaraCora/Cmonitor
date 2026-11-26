@@ -154,12 +154,13 @@ function AdminApp() {
 
   return (
     <div className="min-h-svh">
-      <header className="sticky top-0 z-10 border-b bg-background/95 backdrop-blur">
+      <a href="#admin-content" className="admin-skip-link">跳转到后台内容</a>
+      <header className="admin-topbar sticky top-0 z-10 border-b backdrop-blur-md">
         <div className="mx-auto flex h-16 max-w-[1600px] items-center gap-2 px-3 sm:gap-4 sm:px-6">
-          <img src={`${import.meta.env.BASE_URL}favicon.svg`} alt="" className="size-8 shrink-0 rounded-lg" />
+          <img src={`${import.meta.env.BASE_URL}favicon.svg`} alt="" width={32} height={32} className="size-8 shrink-0 rounded-lg" />
           <div className="min-w-0 flex-1">
             <div className="flex items-baseline gap-2">
-              <a href="/" className="truncate rounded-sm font-semibold hover:underline focus-visible:outline-2" title={me.site_name || "Monitor"}>{me.site_name || "Monitor"}</a>
+              <a href="/" className="truncate rounded-sm font-semibold hover:underline focus-visible:outline-2 focus-visible:outline-ring" title={me.site_name || "Monitor"}>{me.site_name || "Monitor"}</a>
               <span title={`内置主题 ${me.embedded_theme_version ?? "未知"} · 当前主题 ${me.active_theme_version ?? "未知"}`} className="shrink-0 text-xs text-muted-foreground">
                 <span className={me.hub_version ? "hidden sm:inline" : ""}>后台</span>
                 {me.hub_version && <span className="font-mono sm:ml-2">Hub v{me.hub_version}</span>}
@@ -172,20 +173,20 @@ function AdminApp() {
             </div>}
           </div>
           <div className="flex shrink-0 items-center gap-0.5 sm:gap-1">
-            <Button variant="ghost" size="sm" className="size-10 sm:w-auto" asChild>
-              <a href="/" aria-label="状态面板" title="状态面板"><ExternalLink /><span className="hidden sm:inline">状态面板</span></a>
+            <Button variant="ghost" size="sm" className="size-11 sm:w-auto" asChild>
+              <a href="/" aria-label="状态面板" title="状态面板"><ExternalLink aria-hidden="true" /><span className="hidden sm:inline">状态面板</span></a>
             </Button>
-            <Button variant="ghost" size="icon-lg" onClick={toggleTheme} title="切换主题">
-              {dark ? <Sun /> : <Moon />}
+            <Button variant="ghost" size="icon-lg" className="size-11" onClick={toggleTheme} title="切换主题" aria-label="切换主题" aria-pressed={dark}>
+              {dark ? <Sun aria-hidden="true" /> : <Moon aria-hidden="true" />}
             </Button>
-            <Button variant="ghost" size="icon-lg" onClick={signOut} disabled={signingOut} title="退出登录">
-              <LogOut />
+            <Button variant="ghost" size="icon-lg" className="size-11" onClick={signOut} disabled={signingOut} title="退出登录" aria-label="退出登录">
+              <LogOut aria-hidden="true" />
             </Button>
           </div>
         </div>
       </header>
 
-      <main className="mx-auto max-w-[1600px] space-y-4 px-3 py-4 sm:px-6 sm:py-6">
+      <div className="mx-auto max-w-[1600px] space-y-4 px-3 py-4 sm:px-6 sm:py-6">
         <Suspense fallback={<Skeleton role="status" aria-label="正在加载后台" className="h-96" />}>
           <Admin
             path={path}
@@ -201,7 +202,7 @@ function AdminApp() {
             canProvision={me.can_provision && !!provisioningSite(location.origin) && !!provisioningSite(me.site || location.origin)}
           />
         </Suspense>
-      </main>
+      </div>
 
       <Toaster position="top-center" theme={dark ? "dark" : "light"} />
     </div>
