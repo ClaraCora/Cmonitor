@@ -950,6 +950,22 @@ const REGISTER_WINDOW: i64 = 3600;
 /// hundred is well beyond a plausible batch and well short of a problem.
 const REGISTER_LIMIT: i64 = 100;
 
+/// Read-only check for an installer's saved reporting token. This also works
+/// after the registration window closes and never opens an Agent connection.
+pub async fn registration_status(State(app): State<Shared>, headers: HeaderMap) -> Response {
+    if !provisioning_allowed(&app, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(token) = agent_ws::bearer(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match app.db.node_by_token(token) {
+        Ok(Some(_)) => "registered".into_response(),
+        Ok(None) => "unregistered".into_response(),
+        Err(e) => fail(e),
+    }
+}
+
 /// Exchanges a registration key for a node token, so a batch of machines can be
 /// installed with one command rather than one panel visit each.
 ///
@@ -3201,6 +3217,29 @@ mod tests {
         assert_eq!(close_register(Admin, State(app.clone())).await.status(), StatusCode::NO_CONTENT);
         assert_eq!(register(Some(&key), "c").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(app.db.nodes().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_registration_is_valid_only_while_the_node_exists() {
+        let app = std::sync::Arc::new(app());
+        let node = app.db.create_node(&Node::default(), "cached-report").unwrap();
+        let mut headers = domain_headers();
+        assert_eq!(
+            registration_status(State(app.clone()), headers.clone()).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        headers.insert(header::AUTHORIZATION, "Bearer cached-report".parse().unwrap());
+        let check = || registration_status(State(app.clone()), headers.clone());
+        assert_eq!(
+            axum::body::to_bytes(check().await.into_body(), 64).await.unwrap().as_ref(),
+            b"registered"
+        );
+        app.db.delete_node(node).unwrap();
+        assert_eq!(
+            axum::body::to_bytes(check().await.into_body(), 64).await.unwrap().as_ref(),
+            b"unregistered"
+        );
+        assert!(app.db.nodes().unwrap().is_empty());
     }
 
     /// The ceiling on the anonymous route: a leaked key cannot fill the table.

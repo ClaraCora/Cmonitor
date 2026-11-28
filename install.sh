@@ -155,17 +155,17 @@ if [ -d "$RECOVERY" ]; then
 	restore_previous || { echo "recovery incomplete; inspect $RECOVERY" >&2; exit 1; }
 fi
 if [ -f "$SYSTEM_UNIT" ]; then EXISTING=$SYSTEM_UNIT; else EXISTING=$OPENRC_UNIT; fi
-# Existing installs keep the administrator's maintenance policy, including
-# an updater timer that was deliberately stopped.
-if [ -f "$BIN" ] || [ -f "$EXISTING" ] || [ -f "$ENV_FILE" ]; then SKIP_UPDATER=1; fi
+existing_install=""
+if [ -f "$BIN" ] || [ -f "$EXISTING" ] || [ -f "$ENV_FILE" ]; then existing_install=1; fi
 if [ -n "$UPDATER_ONLY" ] && { [ ! -f "$EXISTING" ] || [ ! -f "$BIN" ] || [ ! -r "$ENV_FILE" ]; }; then
 	echo "--updater-only requires an installed Agent" >&2; exit 1
 fi
 saved_server=$(sed -n 's/^MONITOR_SERVER=//p' "$ENV_FILE" 2>/dev/null || true)
+saved_token=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
 keep_unit=""
 if [ -z "$SERVER$TOKEN$REGISTER$INTERVAL$INSECURE" ] && [ -f "$EXISTING" ] && [ -f "$BIN" ]; then
 	keep_unit=1; SERVER=$saved_server
-	TOKEN=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE")
+	TOKEN=$saved_token
 fi
 if [ "$SERVER" = "$saved_server" ] && [ -z "$INTERVAL$INSECURE" ] && [ -f "$EXISTING" ] && [ -f "$BIN" ]; then preserve_definition=1; else preserve_definition=""; fi
 if [ -z "$INTERVAL" ] && [ -f "$EXISTING" ]; then
@@ -312,36 +312,54 @@ GOT=$(sha256sum "$TMP" | cut -d ' ' -f1)
 # --register exchanges a key for this node's own token, which is what allows one
 # command to provision a batch of machines. The key is valid only within the
 # window the panel opened and never becomes the credential the agent runs with.
-if [ -z "$TOKEN" ]; then
-	# Re-running the same command must not add a second node. This machine's
-	# token is already present and outlives the window that issued it, so the env
-	# file answers before the hub is consulted.
-	#
-	# Only for the same hub: a token issued by hub A means nothing to hub B, and
-	# retaining it would leave the agent authenticating indefinitely against a
-	# node that was never created, with this installer reporting success.
-	CACHED=$(sed -n 's/^MONITOR_SERVER=//p' "$ENV_FILE" 2>/dev/null || true)
-	if [ "${CACHED%/}" = "${SERVER%/}" ]; then
-		TOKEN=$(sed -n 's/^MONITOR_TOKEN=//p' "$ENV_FILE" 2>/dev/null || true)
-		if [ -n "$TOKEN" ]; then
-			echo "this machine is already registered; keeping its token"
-		fi
+registration_status() {
+	valid_credential "$1" || { echo "invalid saved reporting credential" >&2; return 1; }
+	status=$(printf 'Authorization: Bearer %s\n' "$1" |
+		curl -q --proto '=https' -fsS --connect-timeout 10 --max-time 30 --max-filesize 64 \
+			-H @- "${SERVER%/}/api/agent/register") || return 1
+	case "$status" in registered|unregistered) printf '%s\n' "$status" ;; *) return 1 ;; esac
+}
+if [ -z "$TOKEN" ] && [ "${saved_server%/}" = "${SERVER%/}" ] && [ -n "$saved_token" ]; then
+	if [ -n "$OFFLINE" ]; then
+		TOKEN=$saved_token
+	else
+		status=$(registration_status "$saved_token") || {
+			echo "could not verify the saved reporting token with the Hub; retry the same command" >&2; exit 1
+		}
+		case "$status" in
+		registered) TOKEN=$saved_token; echo "Hub confirmed the existing registration" ;;
+		unregistered) echo "Hub no longer recognises this node; registering again" ;;
+		esac
 	fi
 fi
 if [ -z "$TOKEN" ]; then
 	[ -z "$OFFLINE" ] || { echo "offline installs need an existing identity or --token" >&2; exit 2; }
 	accept='text/plain'
 	if [ -z "$SKIP_UPDATER$INSECURE" ]; then accept='application/vnd.cmonitor.agent-registration+text'; fi
-	# A retry after a service/install failure must reuse this registration. Only
-	# the same Hub, window key and enrollment policy may consume a saved response.
+	# A failed install may outlive its registration window. Never send a
+	# pending token to another origin, even when the next command has a new key.
 	binding=$(printf '%s\n' "${SERVER%/}" "$REGISTER" "$accept" | sha256sum | cut -d ' ' -f 1)
 	if [ -d "$REG_PENDING" ]; then
-		[ "$(cat "$REG_PENDING/binding")" = "$binding" ] || { echo "another registration is pending; inspect $REG_PENDING" >&2; exit 1; }
-	else
+		if [ "$(cat "$REG_PENDING/binding")" != "$binding" ] &&
+			[ "$(cat "$REG_PENDING/server" 2>/dev/null || true)" != "${SERVER%/}" ]; then
+			echo "cannot verify the origin of the pending registration; retry its original command" >&2; exit 1
+		fi
+		pending_status=$(registration_status "$(sed -n '1p' "$REG_PENDING/response")") || {
+			echo "could not verify the pending registration with the Hub; retry the same command" >&2; exit 1
+		}
+		if [ "$pending_status" = unregistered ]; then
+			rm -rf "$REG_PENDING"
+		elif [ -f "$REG_PENDING/accept" ] && [ "$(cat "$REG_PENDING/accept")" != "$accept" ]; then
+			echo "retry with the updater option from the pending registration" >&2; exit 1
+		fi
+	fi
+	if [ ! -d "$REG_PENDING" ]; then
 		reg_stage=$(mktemp -d "$ROOT/.agent-register.XXXXXX")
 		trap 'rm -f "$TMP"; rm -rf "$reg_stage"' EXIT
 		NAME=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-64)
 		printf '%s\n' "$binding" > "$reg_stage/binding"
+		printf '%s\n' "${SERVER%/}" > "$reg_stage/server"
+		printf '%s\n' "$accept" > "$reg_stage/accept"
 		(umask 077; printf 'Authorization: Bearer %s\n' "$REGISTER" > "$reg_stage/header")
 		echo "registering $NAME with the hub"
 		(umask 077; curl -q --proto '=https' -fsSL --max-redirs 0 --max-time 30 --max-filesize 8192 \
@@ -362,6 +380,9 @@ if [ -z "$TOKEN" ]; then
 	PAIRED=$(sed -n '2p' "$REG_PENDING/response")
 	USED_REG=1
 fi
+# Ordinary reinstalls preserve the local worker policy. A newly registered
+# node follows the enrollment options of the current batch command.
+if [ -n "$existing_install" ] && [ -z "$USED_REG" ]; then SKIP_UPDATER=1; fi
 
 valid_credential "$TOKEN" || { echo "invalid node token" >&2; exit 2; }
 
@@ -461,6 +482,9 @@ mv -f "$ENV_TMP" "$ENV_FILE"
 if [ -n "$PAIRED" ]; then
 	(umask 077; printf '%s\n' "$PAIRED" > "$UPGRADE_BACKUP/new-maintenance")
 	mv -f "$UPGRADE_BACKUP/new-maintenance" "$MAINT_FILE"
+elif [ "$TOKEN" != "$saved_token" ] || [ "${SERVER%/}" != "${saved_server%/}" ]; then
+	# The recovery journal restores the old grant if the service fails to start.
+	rm -f "$MAINT_FILE"
 fi
 
 if [ -n "$preserve_definition" ]; then

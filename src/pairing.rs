@@ -78,12 +78,21 @@ fn shell_command(server: &str, node: i64, ticket: &str) -> String {
     format!(
         r#"sh <<'CMONITOR_PAIR_SETUP'
 set -eu
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+[ "$(id -u)" = 0 ] || {{ echo "run as root on the selected node" >&2; exit 1; }}
 umask 077
 work=$(mktemp -d /tmp/cmonitor-pair.XXXXXXXX)
 trap 'rm -rf -- "$work"' EXIT
 cd "$work"
 curl -q --fail --silent --show-error --proto '=https' --connect-timeout 15 --max-time 90 --output agent-pair.py '{server}/agent-pair.py'
 printf '%s  agent-pair.py\n' '{helper_sha}' | sha256sum -c -
+if ! python3 -I -c 'import fcntl, ssl, sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then
+    if [ -f /etc/alpine-release ]; then
+        apk add --no-cache python3 || {{ echo "could not install Python 3 from the Alpine repositories; check apk connectivity and retry" >&2; exit 1; }}
+    else
+        echo "pairing requires Python 3.8 or newer with SSL support" >&2; exit 1
+    fi
+fi
 python3 -I ./agent-pair.py --server '{server}' --node {node} --installer-sha256 '{installer_sha}' <<'CMONITOR_PAIR_TICKET'
 {ticket}
 CMONITOR_PAIR_TICKET

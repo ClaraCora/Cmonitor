@@ -163,6 +163,22 @@ class Pairing(unittest.TestCase):
         self.run_pair()
         self.assertNotEqual(self.key.read_bytes(), old)
 
+    def test_manual_reinstall_over_deleted_node_recovers_with_new_ticket(self):
+        self.run_pair()
+        old = self.key.read_bytes()
+        self.report = 'new-node-report'
+        self.configure()
+        self.remote_hash = None
+        self.authorized_node = 22
+        with self.assertRaises(urllib.error.HTTPError):
+            self.run_pair(node=21)
+        self.assertEqual(self.key.read_bytes(), old)
+        self.run_pair(node=22)
+        new = json.loads(self.key.read_bytes())
+        self.assertEqual(new['node'], 22)
+        self.assertEqual(new['report_identity'], p.digest(self.report.encode()))
+        self.assertTrue(p.confirm(SERVER, new))
+
     def test_unused_ticket_and_no_private_writes_on_wrong_hub_or_bad_digest(self):
         with self.assertRaisesRegex(p.PairError, 'different Hub'):
             self.run_pair(server='https://another.example')

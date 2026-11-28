@@ -122,10 +122,25 @@ class Installers(unittest.TestCase):
         self.stub('curl', '''
 out=""
 url=""
+method=GET
 while [ "$#" -gt 0 ]; do
-  case "$1" in -o|--output) shift; out=$1;; http://*|https://*) url=$1;; esac
+  case "$1" in
+    -o|--output) shift; out=$1;;
+    --data-binary) method=POST;;
+    http://*|https://*) url=$1;;
+  esac
   shift
 done
+if [ "$url" = https://hub.example/api/agent/register ] && [ "$method" = GET ]; then
+  echo "check registration" >> "$CALLS"
+  IFS= read -r header || exit 1
+  case "$header" in "Authorization: Bearer "?*) ;; *) exit 1;; esac
+  if [ -e "$FIXTURE/status-error" ]; then exit 22; fi
+  if [ -e "$FIXTURE/deleted" ] && [ "$header" = "Authorization: Bearer fixture-token" ]; then
+    echo unregistered
+  else echo registered; fi
+  exit 0
+fi
 echo "fetch $url" >> "$CALLS"
 case "$url" in
   */agent/x86_64) cp "$FIXTURE/monitor-agent-x86_64-unknown-linux-musl" "$out";;
@@ -302,10 +317,60 @@ esac''')
         self.assertNotEqual(self.installer('install.sh', self.edits, args).returncode, 0)
         self.assertTrue((self.root / '.agent-registration.pending').is_dir())
         self.stub('systemctl', ':')
+        args[-1] = 'reopened-window'
         proc = self.installer('install.sh', self.edits, args)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.calls.read_text().count('/api/agent/register'), 1)
         self.assertFalse((self.root / '.agent-registration.pending').exists())
+
+    def test_deleted_openrc_node_reenrolls_then_reuses_new_report_and_grant(self):
+        self.online_fixture(openrc=True)
+        self.install_online()
+        key = self.root / 'agent-maintenance.json'
+        key.write_text('old node credential')
+        (self.base / 'deleted').touch()
+        new_grant = '{"credential":"new-node-key"}'
+        (self.base / 'registration').write_text(f'{1:064d}\n{new_grant}\n')
+        self.calls.write_text('')
+        calls, _ = self.install_online(register=True)
+        self.assertEqual(key.read_text(), new_grant + '\n')
+        self.assertEqual(calls.count('enable'), 1)
+        calls, _ = self.install_online(register=True)
+        self.assertEqual(calls.count('fetch https://hub.example/api/agent/register'), 1)
+        self.assertEqual(calls.count('check registration'), 2)
+        self.assertEqual(calls.count('enable'), 1)
+
+    def test_registration_check_failure_preserves_current_install(self):
+        self.online_fixture(openrc=True)
+        self.install_online()
+        config = self.root / 'agent.env'
+        before = config.read_bytes()
+        self.calls.write_text('')
+        (self.base / 'status-error').touch()
+        proc = self.installer('install.sh', self.edits, ['--server', 'https://hub.example', '--register', 'enroll'])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('could not verify', proc.stderr)
+        self.assertEqual(config.read_bytes(), before)
+        self.assertNotIn('service ', self.calls.read_text())
+        self.assertNotIn('fetch https://hub.example/api/agent/register', self.calls.read_text())
+
+    def test_manual_rebind_retires_old_grant_only_after_recoverable_service_change(self):
+        self.online_fixture(openrc=True)
+        self.install_online()
+        config = self.root / 'agent.env'
+        old_env = config.read_bytes()
+        key = self.root / 'agent-maintenance.json'
+        key.write_text('old grant')
+        args = ['--server', 'https://hub.example', '--token', 'replacement']
+        self.stub('rc-service', f'if [ "$2" = restart ]; then grep -q fixture-token "{config}"; fi')
+        self.assertNotEqual(self.installer('install.sh', self.edits, args).returncode, 0)
+        self.assertEqual(config.read_bytes(), old_env)
+        self.assertEqual(key.read_text(), 'old grant')
+        self.stub('rc-service', ':')
+        proc = self.installer('install.sh', self.edits, args)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('MONITOR_TOKEN=replacement\n', config.read_text())
+        self.assertFalse(key.exists())
 
     def test_shared_worker_lock_and_journal_block_replacement(self):
         self.online_fixture()

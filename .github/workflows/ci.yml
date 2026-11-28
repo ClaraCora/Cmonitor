@@ -72,6 +72,13 @@ jobs:
         run: cargo build --locked
       - name: Check offline upgrade and rollback on both init systems
         run: python3 scripts/test-installers.py
+      - name: Check Alpine reinstallation and maintenance pairing with BusyBox
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src alpine:3.22 sh -ec '
+            apk add --no-cache python3
+            python3 scripts/test-installers.py -k openrc
+            python3 scripts/test-installers.py Installers.test_registration_check_failure_preserves_current_install Installers.test_manual_rebind_retires_old_grant_only_after_recoverable_service_change
+            python3 scripts/test-agent-pair.py'
       - name: Test authenticated rollout worker and rollback
         run: python3 scripts/test-rollout-worker.py
       - name: Verify one-time pairing and interrupted enrollment recovery

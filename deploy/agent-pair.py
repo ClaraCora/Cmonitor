@@ -118,16 +118,21 @@ def save_candidate(path, grant):
             stage.unlink(missing_ok=True)
 
 
-def load_grant(path, binding, allow_previous_report=False):
+def load_grant(path, binding, *, active=False):
     try:
         grant = json.loads(read_private(path, 4096))
     except FileNotFoundError:
         return None
-    fields = {k: v for k, v in binding.items() if not allow_previous_report or k != 'report_identity'}
-    require(isinstance(grant, dict) and all(type(grant.get(k)) is type(v) and grant[k] == v for k, v in fields.items())
+    require(isinstance(grant, dict) and type(grant.get('format')) is int and grant['format'] == 1
+            and type(grant.get('node')) is int and grant['node'] > 0 and isinstance(grant.get('server'), str)
             and isinstance(grant.get('report_identity'), str) and re.fullmatch(DIGEST, grant['report_identity'])
             and isinstance(grant.get('credential'), str) and re.fullmatch('cmu_' + DIGEST, grant['credential']),
             'local maintenance file belongs to another identity or is invalid')
+    # Older installers replaced agent.env but kept the deleted node's grant.
+    # Leave it in place until the Hub authorizes the new ticket and local token.
+    if active and grant['report_identity'] != binding['report_identity']:
+        return None
+    require(all(grant[k] == v for k, v in binding.items()), 'local maintenance file belongs to another identity')
     return grant
 
 
@@ -171,8 +176,8 @@ def pair(server, node, report, ticket):
     # the correct command, including when the Hub's response was lost.
     scope = digest((server + '\0' + str(node) + '\0' + binding['report_identity']).encode())
     pending = ROOT / ('.agent-pair-' + scope + '.pending')
-    previous = load_grant(active, binding, allow_previous_report=True)
-    if previous and previous['report_identity'] == binding['report_identity'] and confirm(server, previous):
+    previous = load_grant(active, binding, active=True)
+    if previous and confirm(server, previous):
         return
     candidate = load_grant(pending, binding)
     # Persist before redeeming: a dropped response or interrupted disk write can

@@ -527,7 +527,7 @@ async fn main() -> Result<()> {
     let router = Router::new()
         // Agents.
         .route("/api/agent/ws", get(agent_ws::handler))
-        .route("/api/agent/register", post(api::agent_register))
+        .route("/api/agent/register", get(api::registration_status).post(api::agent_register))
         .route("/install.sh", get(install_script))
         .route(
             "/agent-updater.py",
